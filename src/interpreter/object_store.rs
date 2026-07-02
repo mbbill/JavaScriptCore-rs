@@ -3221,47 +3221,66 @@ impl CoreObjectStore {
         Some(unsafe { arena_cell_kind_at(cp.addr()) })
     }
 
-    /// gc-r4-completion SD-2/U0+U1/U4 — the LEAF-cell `visitChildren` body (the `Leaf` branch
-    /// of the marker's type dispatch). A FLAT String / Symbol / HeapBigInt cell holds NO
-    /// outgoing cell edges, so this appends nothing. The ONE leaf-typed cell WITH an edge is a
-    /// ROPE JSString, whose fiber base string MUST be marked so it is not swept under a live
-    /// rope (the #1 UAF landmine). Faithful to `JSRopeString::visitChildrenImpl`
-    /// (runtime/JSString.cpp:104): visit the fiber. The port keeps the rope's base fiber inline
-    /// on the cell (`CoreStringCell::base`, the `JSRopeString::m_fibers` analog); a flat/empty
-    /// string carries the 0 sentinel, so `string_cell_rope_base` returns `None` (no edge).
+    /// gc-r4-completion SD-2/U0+U1/U2/U3/U4 — the LEAF-cell `visitChildren` body (the `Leaf`
+    /// branch of the marker's type dispatch), SUB-DISPATCHED by the cell's header `js_type`
+    /// (the same `methodTable()->visitChildren` selection, one level down):
     ///
-    /// U3: arena leaf cells are String OR HeapBigInt, so this sub-dispatches by the header
-    /// `js_type` BEFORE reading the string-only rope-fiber layout; a HeapBigInt cell appends
-    /// nothing (C++ JSBigInt declares NO visitChildren — runtime/JSBigInt.{h,cpp} — and the
-    /// base JSCell visit adds no cell edges).
+    ///  - STRING (U1): the ONE leaf-typed cell WITH an edge is a ROPE JSString, whose fiber
+    ///    base string MUST be marked so it is not swept under a live rope (the #1 UAF
+    ///    landmine). Faithful to `JSRopeString::visitChildrenImpl` (runtime/JSString.cpp:104):
+    ///    visit the fiber. The port keeps the rope's base fiber inline on the cell
+    ///    (`CoreStringCell::base`, the `JSRopeString::m_fibers` analog); a flat/empty string
+    ///    carries the 0 sentinel, so `string_cell_rope_base` returns `None` (no edge).
+    ///  - SYMBOL (U2): NO edges appended — a representation divergence, commented honestly:
+    ///    C++ `Symbol::visitChildrenImpl` (runtime/Symbol.cpp:112-121) visits Base plus TWO
+    ///    lazily-created `WriteBarrier<JSString>` caches (`m_description` runtime/Symbol.h:93,
+    ///    `m_string` :94); the port keeps the description as owned Rust text in the
+    ///    `symbol_records` slab and materializes no JSString cache cells, so the port's
+    ///    Symbol cell genuinely has no cell edges.
+    ///  - HeapBigInt (U3): NO edges appended — faithful: C++ JSBigInt declares NO
+    ///    visitChildren (runtime/JSBigInt.{h,cpp}; its digit words are raw, not cells) and
+    ///    the base JSCell visit adds no cell edges.
+    ///  - anything else: debug-unreachable — an admitted-but-untraced leaf kind would
+    ///    silently strand its edges (swept under a live referrer).
     fn trace_leaf_cell(&self, cp: CellPtr, visitor: &mut SlotVisitor) {
         debug_assert!(
             // SAFETY: `cp` was membership-admitted + classified Leaf by the header read.
             unsafe { arena_cell_kind_at(cp.addr()) } == ArenaCellKind::Leaf,
             "trace_leaf_cell entered for a non-leaf cell"
         );
-        // gc-r4-completion U2/U3 — the LEAF half of the `methodTable()->visitChildren` type
-        // dispatch: only a String cell may carry the rope fiber edge; every other leaf kind
-        // is a pure leaf with NO outgoing edges.
+        // gc-r4-completion U1/U2/U3 — the LEAF half of the `methodTable()->visitChildren`
+        // type dispatch: only a String cell may carry the rope fiber edge; every other
+        // admitted leaf kind is a pure leaf with NO outgoing edges.
         // SAFETY: `cp` is a byte-intact arena leaf cell (membership-gated + Leaf-classified);
         // `js_type` sits at the fixed common offset on EVERY cell kind (const-asserted at
         // each struct def). The read copies a `u8` and forms no reference.
         let type_byte = unsafe {
             core::ptr::with_exposed_provenance::<u8>(cp.addr() + ARENA_CELL_JS_TYPE_OFFSET).read()
         };
-        if type_byte != JsType::String as u8 {
-            return; // HeapBigInt (U3) and future non-String leaves: no outgoing edges.
-        }
-        // SAFETY: the header just proved StringType, so it is a `CoreStringCell` and its
-        // `base` fiber sits at the const-asserted offset. The read copies a `u64` and forms
-        // no reference.
-        let base = unsafe { super::string_store::string_cell_rope_base(cp.addr()) };
-        if let Some(base_addr) = base {
-            // Membership-gate the base fiber (NOT the liveness `find`) and append it — the rope
-            // cell's single outgoing edge. `append_unbarriered` marks white→grey→push.
-            if let Some(base_cp) = self.space.is_arena_cell(base_addr) {
-                visitor.append_unbarriered(base_cp);
+        match type_byte {
+            t if t == JsType::String as u8 => {
+                // SAFETY: the header just proved StringType, so the cell is a
+                // `CoreStringCell` and its `base` fiber sits at the const-asserted offset.
+                // The read copies a `u64` and forms no reference.
+                let base = unsafe { super::string_store::string_cell_rope_base(cp.addr()) };
+                if let Some(base_addr) = base {
+                    // Membership-gate the base fiber (NOT the liveness `find`) and append it
+                    // — the rope cell's single outgoing edge. `append_unbarriered` marks
+                    // white→grey→push.
+                    if let Some(base_cp) = self.space.is_arena_cell(base_addr) {
+                        visitor.append_unbarriered(base_cp);
+                    }
+                }
             }
+            t if t == JsType::Symbol as u8 || t == JsType::HeapBigInt as u8 => {
+                // No outgoing cell edges (see the doc comment: Symbol = commented
+                // representation divergence; HeapBigInt = faithful no-visitChildren).
+            }
+            _ => debug_assert!(
+                false,
+                "trace_leaf_cell: js_type {type_byte} is not an admitted leaf kind \
+                 (String=U1, Symbol=U2, HeapBigInt=U3); an untraced leaf's edges would be swept"
+            ),
         }
     }
 
@@ -3564,7 +3583,40 @@ impl CoreObjectStore {
         if let Some(addr) = payload(RuntimeValue::from_encoded(exceptions.jit_pending())) {
             roots.push(addr);
         }
+        // gc-r4-completion U2 — symbol PROPERTY-KEY roots (the store owns `property_uids`,
+        // so it gathers these itself; the symbol store's OWN roots flow in as host_roots).
+        roots.extend(self.gather_symbol_property_key_roots());
         roots
+    }
+
+    /// gc-r4-completion U2 — SYMBOL PROPERTY-KEY roots. Every `CorePropertyKey::Symbol`
+    /// interned in `property_uids` (`intern_property_uid`) holds a symbol cell's raw
+    /// ENCODED value bits for the STORE lifetime: Structure PropertyTables key on the
+    /// interned `AtomId`, and `property_key_value` (interpreter/mod.rs, the
+    /// `CorePropertyKey::Symbol(encoded)` arm) RESURRECTS the `RuntimeValue` straight
+    /// from those raw bits. A symbol reachable ONLY as a property key must therefore be
+    /// rooted — a swept + recycled arena address would corrupt property identity (a later
+    /// cell minted at the same address would alias the interned key).
+    ///
+    /// FAITHFUL PROJECTION: a C++ PropertyTable entry holds a strong
+    /// `Ref<UniquedStringImpl>` key (runtime/PropertyMapHashTable.h), so a property
+    /// name's uid stays alive as long as any Structure references it; the port has no
+    /// SymbolImpl layer (the CELL is the uid), so strong-rooting the cell is the same
+    /// guarantee. The one delta: JSC keeps only the UID immortal — the 8-byte Symbol
+    /// CELL is weak (vm.symbolImplToSymbolMap, runtime/VM.h:754) and re-minted around
+    /// the uid on demand (runtime/Symbol.cpp:166-174); the port keeps cell+record alive.
+    pub(crate) fn gather_symbol_property_key_roots(&self) -> Vec<usize> {
+        self.property_uids
+            .keys()
+            .filter_map(|key| match key {
+                CorePropertyKey::Symbol(encoded) => {
+                    RuntimeValue::from_encoded(EncodedJsValue(*encoded))
+                        .as_cell()
+                        .map(|cell| cell.pointer_payload_bits())
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -3715,19 +3767,24 @@ impl CoreObjectStore {
                         });
                     }
                     ArenaCellKind::Leaf => {
-                        // gc-r4-completion U1 — DEAD LEAF (String) cell. Its reclaimable state
-                        // (the `string_records` slot + the weak interning entry) lives in the
-                        // LEAF store (`CoreStringStore`), which this collector does not own, so
-                        // we only RECORD the dead address here. The HOST drains the list after
-                        // the collection and drives `CoreStringStore::reconcile_dead_string`
-                        // (free the slot + weak-remove the interning entry by identity — the
-                        // `~StringImpl -> AtomStringImpl::remove` analog, WTF/wtf/text/StringImpl
-                        // .cpp:118-129). Unlike the object arm, the leaf reclaim reads ONLY the
-                        // store's own slab (which survives the sweep), never the dead cell's
-                        // soon-clobbered bytes, so it is correct AFTER the sweep too — provided
-                        // it runs before the mutator resumes and recycles the address, which the
-                        // synchronous safepoint guarantees (no allocation between collect+drain).
-                        // U2/U3 sub-dispatch this arm by `js_type` (Symbol / HeapBigInt).
+                        // gc-r4-completion U1/U2/U3 — DEAD LEAF (String/Symbol/HeapBigInt)
+                        // cell. Its reclaimable state (the `string_records`/`symbol_records`/
+                        // `bigint_records` slot + any weak interning entry) lives in the LEAF
+                        // store, which this collector does not own, so we only RECORD the
+                        // dead address here. The HOST drains the list after the collection
+                        // and drives EACH leaf store's own reclaim
+                        // (`CoreStringStore::reconcile_dead_string` — the `~StringImpl ->
+                        // AtomStringImpl::remove` analog, WTF/wtf/text/StringImpl.cpp:118-129
+                        // — `CoreSymbolStore::reconcile_dead_symbol`, the `Symbol::destroy`
+                        // payload release, runtime/Symbol.cpp:107-110 — and
+                        // `CoreBigIntStore::reconcile_dead_bigint`; each is a no-op on a
+                        // foreign address, so no per-kind sub-dispatch is needed here).
+                        // Unlike the object arm, the leaf reclaim reads ONLY the store's own
+                        // slab (which survives the sweep), never the dead cell's
+                        // soon-clobbered bytes, so it is correct AFTER the sweep too —
+                        // provided it runs before the mutator resumes and recycles the
+                        // address, which the synchronous safepoint guarantees (no allocation
+                        // between collect+drain).
                         dead_leaf.push(addr);
                     }
                 }
@@ -4013,14 +4070,18 @@ impl CoreObjectStore {
     }
 
     /// Convenience: `force_collect` over `RuntimeValue` roots, folding in the store's own
-    /// intrinsic roots (like `mark_live_set`). The natural form for tests + a direct driver.
+    /// intrinsic roots (like `mark_live_set`) plus the symbol PROPERTY-KEY roots (U2 —
+    /// mirroring `gather_all_gc_roots`, so a test/driver collection through this entry
+    /// cannot sweep a symbol that is still interned as a Structure property key).
+    /// The natural form for tests + a direct driver.
     pub(crate) fn force_collect_values(&mut self, extra_roots: &[RuntimeValue]) -> CollectStats {
-        let addrs: Vec<usize> = self
+        let mut addrs: Vec<usize> = self
             .gather_intrinsic_roots()
             .iter()
             .chain(extra_roots.iter())
             .filter_map(|v| v.as_cell().map(|c| c.pointer_payload_bits()))
             .collect();
+        addrs.extend(self.gather_symbol_property_key_roots());
         self.force_collect(&addrs)
     }
 
@@ -5119,7 +5180,7 @@ impl CoreObjectStore {
             proxy,
             standard_attributes,
         )?;
-        let iterator = symbols.well_known_untracked("Symbol.iterator");
+        let iterator = symbols.well_known_untracked(self, "Symbol.iterator");
         let symbol = self.allocate_symbol_constructor_with_write_barrier(heap, iterator)?;
         self.install_standard_global_data_property(
             heap,
@@ -13663,5 +13724,266 @@ mod bigint_cell_gc_u3_tests {
             objects.space.is_arena_cell(addr(b)).is_some(),
             "the bigint cell IS a member of the shared arena"
         );
+    }
+}
+
+// gc-r4-completion U2 — SYMBOL-CELL GC end-to-end on the SHARED arena: symbols allocate via
+// the leaf-cell chokepoint (`CoreSymbolStore -> admit_leaf_cell_blob`), are marked through
+// object->symbol edges, kept alive by the STRONG registry/well-known roots (the faithful
+// projection of VM::m_symbolRegistry + the SymbolConstructor's ReadOnly well-known
+// properties) and by the symbol PROPERTY-KEY roots (`gather_symbol_property_key_roots` — the
+// Ref<UniquedStringImpl> PropertyTable-key projection), and dead symbols are swept +
+// reconciled (slab freed). The `collect` helper replicates the host safepoint (symbol-store
+// roots as host_roots -> force_collect_values -> take_reclaimed_leaf_addrs drain).
+#[cfg(test)]
+mod symbol_cell_gc_u2_tests {
+    use super::symbol_store::{CoreSymbolCell, CoreSymbolStore};
+    use super::*;
+
+    fn ident(n: u32) -> CorePropertyKey {
+        CorePropertyKey::Identifier(n)
+    }
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+    /// Run ONE collection then drive the leaf-store reclaim exactly as the host safepoint
+    /// does: the symbol store's OWN strong roots (well-known + registry) travel the
+    /// host_roots channel; `force_collect_values` folds the intrinsics + the symbol
+    /// PROPERTY-KEY roots itself.
+    fn collect(
+        objects: &mut CoreObjectStore,
+        symbols: &mut CoreSymbolStore,
+        roots: &[RuntimeValue],
+    ) -> CollectStats {
+        let mut all_roots = roots.to_vec();
+        all_roots.extend(symbols.gather_symbol_roots());
+        let stats = objects.force_collect_values(&all_roots);
+        for dead in objects.take_reclaimed_leaf_addrs() {
+            symbols.reconcile_dead_symbol(dead);
+        }
+        stats
+    }
+
+    // (e) The POD 8-byte header contract (compile-time asserted at the struct def; mirrored
+    // here so a layout regression fails a named test, matching the U1 test shape).
+    #[test]
+    fn symbol_cell_is_a_pod_8_byte_header() {
+        assert_eq!(std::mem::offset_of!(CoreSymbolCell, structure_id), 0);
+        assert_eq!(std::mem::offset_of!(CoreSymbolCell, js_type), 4);
+        assert_eq!(std::mem::size_of::<CoreSymbolCell>(), 8);
+        assert!(!std::mem::needs_drop::<CoreSymbolCell>());
+    }
+
+    // (b) A symbol reachable ONLY from a live object survives >=2 collections with its
+    // description intact (the object->symbol mark edge; #2 is the old-gen-survivor landmine).
+    #[test]
+    fn symbol_held_by_live_object_survives_two_collections() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let s = symbols.allocate_untracked(&mut objects, Some("held-by-object".to_owned()));
+        let s_addr = addr(s);
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), s).unwrap(); // holder -> s (butterfly edge)
+
+        collect(&mut objects, &mut symbols, &[holder]);
+        assert!(
+            objects.is_value_marked(s),
+            "symbol marked via object edge (#1)"
+        );
+        assert!(
+            objects.live_object_addrs.contains(&s_addr),
+            "symbol retained in the live set (#1)"
+        );
+        assert_eq!(
+            symbols.description(s),
+            Some(Some("held-by-object".to_owned()))
+        );
+
+        collect(&mut objects, &mut symbols, &[holder]); // #2 — the survivor landmine
+        assert!(
+            objects.is_value_marked(s),
+            "symbol still marked via object edge (#2)"
+        );
+        assert_eq!(
+            symbols.description(s),
+            Some(Some("held-by-object".to_owned()))
+        );
+        assert_eq!(
+            symbols.symbol_to_string(s),
+            Some("Symbol(held-by-object)".to_owned())
+        );
+    }
+
+    // (a) Micro-probe: a batch of unrooted symbols returns the live-cell count to BASELINE
+    // after collection (no symbol leak — the leak this unit exists to close), and reclaims
+    // their slab records for reuse.
+    #[test]
+    fn unrooted_symbol_batch_returns_to_baseline_no_leak() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let keep = objects.allocate();
+        collect(&mut objects, &mut symbols, &[keep]); // warm up to a stable baseline
+        let baseline = objects.live_object_addrs.len();
+        let live_records_baseline =
+            symbols.symbol_records.len() - symbols.symbol_record_free_list.len();
+
+        let mut batch = Vec::new();
+        for i in 0..16 {
+            batch.push(symbols.allocate_untracked(&mut objects, Some(format!("tmp-{i}"))));
+        }
+        assert!(
+            objects.live_object_addrs.len() > baseline,
+            "symbol cells added to the live set"
+        );
+
+        collect(&mut objects, &mut symbols, &[keep]); // all 16 unrooted -> reclaimed
+        assert_eq!(
+            objects.live_object_addrs.len(),
+            baseline,
+            "symbol cells reclaimed back to baseline (no leak)"
+        );
+        let live_records_after =
+            symbols.symbol_records.len() - symbols.symbol_record_free_list.len();
+        assert_eq!(
+            live_records_after, live_records_baseline,
+            "symbol slab records reclaimed back to baseline"
+        );
+        for dead in batch {
+            assert_eq!(
+                symbols.description(dead),
+                None,
+                "dead symbol's resolution entry removed (no dangle)"
+            );
+        }
+    }
+
+    // (c) `Symbol.for` identity is preserved across collections: the registry value is a
+    // STRONG root (the VM::m_symbolRegistry strong-uid projection), so the SAME cell comes
+    // back after a GC in which nothing else roots it.
+    #[test]
+    fn symbol_for_identity_preserved_across_collections() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let mut heap = Heap::new();
+        let s1 = symbols.for_key(&mut objects, &mut heap, "app.key").unwrap();
+
+        // No explicit root holds s1 — only the registry (host_roots channel) does.
+        collect(&mut objects, &mut symbols, &[]);
+        assert!(
+            objects.is_value_marked(s1),
+            "registered symbol survives via the strong registry root"
+        );
+        assert_eq!(symbols.key_for(s1), Some("app.key".to_owned()));
+
+        collect(&mut objects, &mut symbols, &[]); // #2
+        let s2 = symbols.for_key(&mut objects, &mut heap, "app.key").unwrap();
+        assert_eq!(
+            s2, s1,
+            "Symbol.for returns the SAME cell across collections (registry identity)"
+        );
+        assert_eq!(
+            symbols.description(s1),
+            Some(Some("app.key".to_owned())),
+            "registered symbol's record intact after GC"
+        );
+    }
+
+    // (d) Well-known symbols survive collections with no explicit roots — the
+    // SymbolConstructor ReadOnly-property projection (SymbolConstructor.cpp:64-75).
+    #[test]
+    fn well_known_symbols_survive_collections() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let iterator = symbols.well_known_untracked(&mut objects, "Symbol.iterator");
+
+        collect(&mut objects, &mut symbols, &[]);
+        collect(&mut objects, &mut symbols, &[]);
+        assert!(
+            objects.is_value_marked(iterator),
+            "well-known symbol survives with no explicit roots"
+        );
+        assert_eq!(
+            symbols.description(iterator),
+            Some(Some("Symbol.iterator".to_owned()))
+        );
+        let again = symbols.well_known_untracked(&mut objects, "Symbol.iterator");
+        assert_eq!(
+            again, iterator,
+            "well-known lookup returns the same cell (identity preserved)"
+        );
+    }
+
+    // (f) THE FINDING-4 REGRESSION (soundness-critical): a symbol reachable ONLY as an
+    // interned PROPERTY KEY survives, via `gather_symbol_property_key_roots`. The key's
+    // raw encoded bits live in `property_uids` for the store lifetime and
+    // `property_key_value` resurrects the RuntimeValue from them (interpreter/mod.rs), so
+    // sweeping the cell would let a recycled address alias the interned key and corrupt
+    // property identity. LOAD-BEARING: verified to FAIL when the
+    // `gather_symbol_property_key_roots` fold in `force_collect_values` is disabled.
+    #[test]
+    fn property_key_only_symbol_survives_via_property_uid_roots() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let s = symbols.allocate_untracked(&mut objects, Some("key-only".to_owned()));
+        let skey = CorePropertyKey::Symbol(s.encoded().0);
+        let holder = objects.allocate();
+        // Using the symbol as a NAMED KEY interns it into `property_uids` (the Structure
+        // PropertyTable path); the stored VALUE is a primitive, so the butterfly holds NO
+        // edge to the symbol cell — the property-key root is its ONLY tether.
+        objects
+            .put_data_own(holder, &skey, RuntimeValue::from_i32(7))
+            .unwrap();
+        assert!(
+            objects
+                .gather_symbol_property_key_roots()
+                .contains(&addr(s)),
+            "the interned symbol key is gathered as a property-key root"
+        );
+
+        collect(&mut objects, &mut symbols, &[holder]);
+        assert!(
+            objects.is_value_marked(s),
+            "property-key-only symbol survives via the property_uids roots"
+        );
+        assert_eq!(
+            symbols.description(s),
+            Some(Some("key-only".to_owned())),
+            "its record is intact"
+        );
+
+        collect(&mut objects, &mut symbols, &[holder]); // #2 — the survivor landmine
+        assert_eq!(
+            objects
+                .get_own_property(holder, &skey)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CorePropertyKind::Data(RuntimeValue::from_i32(7)),
+            "the symbol-keyed property still resolves after two collections"
+        );
+    }
+
+    // (g) (U0b regression) A symbol value is NOT misclassified as an object: the mutator
+    // deref islands (`find` / `with_cell_mut`) apply the JSCell::isObject() gate and return
+    // None for a symbol cell, even though it shares the arena and membership admits it.
+    #[test]
+    fn u0b_symbol_value_is_not_resolved_as_an_object() {
+        let mut objects = CoreObjectStore::default();
+        let mut symbols = CoreSymbolStore::default();
+        let s = symbols.allocate_untracked(&mut objects, Some("not-an-object".to_owned()));
+
+        assert!(
+            objects.find(s).is_none(),
+            "U0b: a symbol value is NOT resolved as an object cell"
+        );
+        assert!(
+            objects.with_cell_mut(s, |_| ()).is_none(),
+            "U0b: with_cell_mut rejects a symbol (leaf) cell"
+        );
+        assert!(
+            objects.space.is_arena_cell(addr(s)).is_some(),
+            "the symbol cell IS a member of the shared arena"
+        );
+        assert!(symbols.is_symbol(s), "the symbol store's gate resolves it");
     }
 }

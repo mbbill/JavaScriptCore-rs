@@ -21,7 +21,6 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -6037,28 +6036,15 @@ impl CoreOpcodeDispatchHost {
     }
 }
 
-// Generic primitive-cell allocation helpers, shared by the string/bigint/symbol
-// cell stores (the object store owns its own allocator in object_store.rs). Kept in the dispatch host until a dedicated shared
-// cell-alloc submodule is warranted; the two generic helpers are pub(super) so
-// the extracted store submodules (Phase E) can call them.
-
-pub(super) fn allocate_primitive_interpreter_cell<T>(
-    heap: &mut Heap,
-    cell_type: CellType,
-    make_cell: impl FnOnce(CellId) -> T,
-) -> Result<(Pin<Box<T>>, RuntimeValue), ExecutionError> {
-    let cell_id =
-        allocate_primitive_interpreter_cell_id(heap, cell_type, std::mem::size_of::<T>().max(1))?;
-    let cell = Box::pin(make_cell(cell_id));
-    let ptr = NonNull::from(cell.as_ref().get_ref());
-    let payload = ptr.as_ptr() as *mut () as usize;
-    heap.bind_cell_payload(cell_id, payload)?;
-    heap.publish_cell(cell_id)?;
-    // SAFETY: The host owns the boxed primitive cell for the lifetime of the
-    // dispatch run and never moves the pinned allocation after publishing it.
-    let value = RuntimeValue::from_cell(unsafe { GcRef::from_non_null(ptr) });
-    Ok((cell, value))
-}
+// Generic primitive-cell heap-id allocation helper, shared by the string/bigint/symbol
+// cell stores' `bind_index_to_heap` (the object store owns its own allocator in
+// object_store.rs). Kept in the dispatch host until a dedicated shared cell-alloc
+// submodule is warranted; pub(super) so the extracted store submodules (Phase E) call it.
+//
+// gc-r4-completion U1/U2/U3: the former `allocate_primitive_interpreter_cell<T>` (the
+// `Pin<Box<T>>` leaf-cell allocator — the leaking pre-arena divergence) is DELETED with its
+// last caller; every leaf cell now allocates into the shared arena via
+// `CoreObjectStore::admit_leaf_cell_blob`.
 
 pub(super) fn allocate_primitive_interpreter_cell_id(
     heap: &mut Heap,
@@ -6185,6 +6171,19 @@ impl DispatchHost for CoreOpcodeDispatchHost {
     ) {
         let mut host_roots = self.gather_global_lexical_roots();
         host_roots.extend(self.gather_code_block_constant_roots());
+        // gc-r4-completion U2 — the SYMBOL store's own strong roots (well-known symbols +
+        // the `Symbol.for` registry), which the arena owner cannot reach. Faithful
+        // projection: JSC's well-known symbols are ReadOnly SymbolConstructor properties
+        // (runtime/SymbolConstructor.cpp:64-75) and registered uids are held strongly by
+        // VM::m_symbolRegistry (runtime/VM.h:599, wtf/text/SymbolRegistry.h:52) — see
+        // `CoreSymbolStore::gather_symbol_roots`. (Symbol PROPERTY-KEY roots are gathered
+        // by the store itself in `gather_all_gc_roots`.)
+        host_roots.extend(
+            self.symbols
+                .gather_symbol_roots()
+                .into_iter()
+                .filter_map(|value| value.as_cell().map(|cell| cell.pointer_payload_bits())),
+        );
         let collected = self.objects.poll_collection_at_safepoint(
             registers,
             stack,
@@ -6192,16 +6191,20 @@ impl DispatchHost for CoreOpcodeDispatchHost {
             heap,
             &host_roots,
         );
-        // gc-r4-completion U1 — if a collection ran, drive each LEAF store's own reclaim over
-        // the dead leaf addresses the reconcile recorded (free its `string_records` slot + weak-
-        // remove its interning entry by identity — the `~StringImpl -> AtomStringImpl::remove`
-        // analog). Runs in the SAME synchronous safepoint, before the mutator resumes and could
-        // recycle a freed arena address, so reading the store's (sweep-surviving) slab is sound.
+        // gc-r4-completion U1/U2/U3 — if a collection ran, drive each LEAF store's own
+        // reclaim over the dead leaf addresses the reconcile recorded (strings: free the
+        // `string_records` slot + weak-remove the interning entry by identity — the
+        // `~StringImpl -> AtomStringImpl::remove` analog; symbols: free the `symbol_records`
+        // slot — the `Symbol::destroy` payload release; bigints: free the limb slab slot +
+        // weak-remove the intern entry). Runs in the SAME synchronous safepoint, before the
+        // mutator resumes and could recycle a freed arena address, so reading the store's
+        // (sweep-surviving) slab is sound.
         if collected.is_some() {
             for addr in self.objects.take_reclaimed_leaf_addrs() {
-                // Each leaf store's reconcile is a no-op for a foreign address, so every
-                // dead leaf addr is offered to every leaf store (String U1, BigInt U3).
+                // Each leaf store's reconcile is a no-op for a foreign address, so every dead
+                // leaf addr is offered to every leaf store (String U1, Symbol U2, BigInt U3).
                 self.strings.reconcile_dead_string(addr);
+                self.symbols.reconcile_dead_symbol(addr);
                 self.bigints.reconcile_dead_bigint(addr);
             }
         }
@@ -7111,10 +7114,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(register) => register,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
-                let iterator = match self.symbols.well_known(state.heap, "Symbol.iterator") {
-                    Ok(value) => value,
-                    Err(error) => return DispatchOutcome::Fail(error),
-                };
+                let iterator =
+                    match self
+                        .symbols
+                        .well_known(&mut self.objects, state.heap, "Symbol.iterator")
+                    {
+                        Ok(value) => value,
+                        Err(error) => return DispatchOutcome::Fail(error),
+                    };
                 let function = match self
                     .objects
                     .allocate_symbol_constructor_with_write_barrier(state.heap, iterator)
@@ -16947,7 +16954,7 @@ impl CoreOpcodeDispatchHost {
     ) -> Result<RuntimeValue, DispatchOutcome> {
         let description = self.symbol_description_argument(arguments)?;
         self.symbols
-            .allocate(heap, description)
+            .allocate(&mut self.objects, heap, description)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -16966,7 +16973,7 @@ impl CoreOpcodeDispatchHost {
             )
             .ok_or(DispatchOutcome::Fail(ExecutionError::InvalidCallCompletion))?;
         self.symbols
-            .for_key(heap, &key)
+            .for_key(&mut self.objects, heap, &key)
             .map_err(DispatchOutcome::Fail)
     }
 
@@ -27375,15 +27382,20 @@ mod tests {
         assert_eq!(strings.text(string_value), Some("route-b-s1"));
         assert!(objects.find(string_value).is_none());
 
-        // Symbol: resolve via CoreSymbolStore::find (payload scan gate).
+        // Symbol: resolve via CoreSymbolStore's resolution map (payload gate).
         let mut symbols = CoreSymbolStore::default();
-        let symbol_value = symbols.allocate_untracked(Some("route-b-s1".to_owned()));
-        let symbol = symbols
-            .find(symbol_value)
-            .expect("symbol resolves via gate");
-        assert_eq!(symbol.js_type, JsType::Symbol);
-        assert!(!symbol.js_type.is_object());
-        assert_eq!(symbol.js_type.cell_type(), CellType::Symbol);
+        let symbol_value = symbols.allocate_untracked(&mut objects, Some("route-b-s1".to_owned()));
+        // U2: the cell is now a SHARED-arena Symbol cell (CoreObjectStore::space). It resolves
+        // via the symbol store's gate, carries its description, and the U0b `isObject()` gate
+        // rejects it as an object (SymbolType < ObjectType) — leaf/object discrimination.
+        assert!(symbols.find(symbol_value).is_some());
+        assert_eq!(
+            symbols.description(symbol_value),
+            Some(Some("route-b-s1".to_owned()))
+        );
+        assert!(objects.find(symbol_value).is_none());
+        assert!(!JsType::Symbol.is_object());
+        assert_eq!(JsType::Symbol.cell_type(), CellType::Symbol);
 
         // BigInt: allocate through the heap-backed store, resolve via value().
         // U3: the cell is now a SHARED-arena HeapBigInt cell (CoreObjectStore::space). It
