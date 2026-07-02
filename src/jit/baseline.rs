@@ -4037,7 +4037,22 @@ fn execute_int32_arithmetic(
     let Some(result) = (match opcode {
         CoreOpcode::AddInt32 => left.checked_add(right),
         CoreOpcode::SubInt32 => left.checked_sub(right),
-        CoreOpcode::MulInt32 => left.checked_mul(right),
+        // C++ jsMul's int32 fast path (`binaryOpCustomStore(mul, ...)`,
+        // LowLevelInterpreter64.asm:1289-1300) bails to the double slow path
+        // — here, the interpreter fallback this instruction routes to on
+        // `None` (execute_baseline_fallback_deferring_ordinary_calls_with_
+        // dispatch_budget -> interpreter/mod.rs's numeric_binary_result,
+        // which already carries this exact guard, see 055bc07) — not only on
+        // overflow but also when the product is exactly zero AND either
+        // operand is negative (`btinz t3, .done` / `bilt rhs, 0, slow` /
+        // `bilt lhs, 0, slow`, asm:1292-1296): int32 has no negative zero, so
+        // -3*0 / 0*-3 must produce the double -0.0. checked_mul alone cannot
+        // distinguish +0 from -0, so replicate that exact guard (mirrors the
+        // fix already landed in interpreter/mod.rs's numeric_binary_result).
+        CoreOpcode::MulInt32 => match left.checked_mul(right) {
+            Some(0) if left < 0 || right < 0 => None,
+            other => other,
+        },
         _ => None,
     }) else {
         return Ok(BaselineInstructionOutcome::Fallback(
@@ -4083,7 +4098,16 @@ fn pure_number_arithmetic_result(
         let checked = match opcode {
             CoreOpcode::AddInt32 => left.checked_add(right),
             CoreOpcode::SubInt32 => left.checked_sub(right),
-            CoreOpcode::MulInt32 => left.checked_mul(right),
+            // Same C++ jsMul int32-fast-path neg-zero guard as
+            // `execute_int32_arithmetic` above (LowLevelInterpreter64.asm:
+            // 1289-1300 / interpreter/mod.rs's numeric_binary_result,
+            // 055bc07): a zero product with a negative operand must bail to
+            // the f64 path below, which computes the correctly-signed -0.0
+            // natively via IEEE 754 multiplication.
+            CoreOpcode::MulInt32 => match left.checked_mul(right) {
+                Some(0) if left < 0 || right < 0 => None,
+                other => other,
+            },
             _ => None,
         };
         if let Some(result) = checked {
@@ -4158,7 +4182,22 @@ fn execute_number_arithmetic(
     if let (CoreOpcode::ModNumber, NumberValue::Int32(left), NumberValue::Int32(right)) =
         (opcode, left, right)
     {
-        if let Some(result) = left.checked_rem(right) {
+        // C++ op_mod's int32 fast path (LowLevelInterpreter64.asm:1324-1352)
+        // takes the `.needsNegZeroCheck` branch whenever the DIVIDEND (left)
+        // is negative (`bilt t0, 0, .needsNegZeroCheck`, asm:1337) and, on
+        // that branch, bails to the double slow path if the remainder is
+        // exactly zero (`btiz r1, .slow`, asm:1345) — e.g. -3%3 must yield
+        // -0.0, matching IEEE fmod's "result takes the sign of the dividend"
+        // rule (jsRemainder -> Math::fmodDouble, OperationsInlines.h:
+        // 643-654). Only the dividend's sign matters, not the divisor's
+        // (interpreter/mod.rs's numeric_binary_result carries the identical
+        // guard, 055bc07). Falling through below to the f64 `%` computes the
+        // correctly-signed -0.0 natively.
+        let checked = match left.checked_rem(right) {
+            Some(0) if left < 0 => None,
+            other => other,
+        };
+        if let Some(result) = checked {
             return write_register_or_outcome(
                 execution,
                 window,
@@ -4888,6 +4927,7 @@ mod tests {
         CellId, CellType, Heap, HeapAllocationRequest, StructureId,
     };
     use crate::interpreter::{
+        execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget,
         execute_code_block, CoreOpcodeDispatchHost, DispatchConfig, DispatchInstruction,
         DispatchOutcome, DispatchState, ExecutionContextStack, ExecutionEntryRecord,
         FramePushRequest, ProgramExecutionEntry, RegisterFile,
@@ -11284,6 +11324,66 @@ mod tests {
         (result, stack, registers)
     }
 
+    /// Like [`execute_generated_with_initial_locals`], but when the generated
+    /// body reports a [`BaselineGeneratedExecutionResult::Fallback`] this
+    /// drives it to completion the same way `VmState::execute_baseline_
+    /// fallback_in_current_region` (vm/mod.rs) does — via `execute_baseline_
+    /// fallback_deferring_ordinary_calls_with_dispatch_budget`, which resumes
+    /// bytecode execution at the fallback's `bytecode_index` through the
+    /// interpreter (`CoreOpcodeDispatchHost`) on the SAME stack/registers.
+    /// Used to prove END-TO-END, not just "did the fast path correctly
+    /// refuse the value", that a baseline-JIT neg-zero fallback resolves to
+    /// the interpreter's `numeric_binary_result` double, not a re-derived
+    /// +0.
+    fn execute_generated_resolving_fallback_with_initial_locals(
+        owner: CodeBlockId,
+        code_block: &CodeBlock,
+        artifact: &BaselineGeneratedCodeArtifact,
+        initial_locals: &[(VirtualRegister, RuntimeValue)],
+    ) -> ExecutionCompletion {
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let frame = enter_program_frame(&mut stack, &mut registers, owner, code_block);
+        let window = stack.top_frame().unwrap().register_window;
+        for (register, value) in initial_locals {
+            registers.write(window, *register, *value).unwrap();
+        }
+        let result = execute_baseline_generated_code(BaselineGeneratedExecutionRequest {
+            artifact,
+            owner,
+            code_block,
+            expected_frame: frame,
+            execution: InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+        });
+        match result {
+            Ok(BaselineGeneratedExecutionResult::Completed(completion)) => completion,
+            Ok(BaselineGeneratedExecutionResult::Fallback(fallback)) => {
+                let mut host = CoreOpcodeDispatchHost::new();
+                let mut dispatch_budget = DispatchBudget::unbounded();
+                execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget(
+                    InterpreterExecutionState {
+                        stack: &mut stack,
+                        registers: &mut registers,
+                        exceptions: &mut exceptions,
+                        heap: &mut heap,
+                    },
+                    fallback.request,
+                    code_block,
+                    &mut host,
+                    &mut dispatch_budget,
+                )
+            }
+            other => panic!("unexpected generated result: {other:?}"),
+        }
+    }
+
     fn execute_generated_with_frame_callee(
         owner: CodeBlockId,
         code_block: &CodeBlock,
@@ -12919,6 +13019,125 @@ mod tests {
         );
     }
 
+    // Same C++ jsMul negative-zero guard as `mul_zero_product_negative_operand_
+    // yields_double_neg_zero` (interpreter/mod.rs, 055bc07), now covering the
+    // baseline-JIT-interpreted int32-only fast path (`execute_int32_arithmetic`,
+    // subset `P6ConstantsMovesReturnInt32ArithmeticBitwise`, no PureNumberBinary):
+    // LowLevelInterpreter64.asm:1289-1300 bails to the double slow path whenever
+    // the product is zero AND either operand is negative, since int32 has no
+    // negative zero. `checked_mul` alone cannot distinguish +0 from -0, so
+    // `execute_int32_arithmetic`'s MulInt32 arm now bails (`None`) for that
+    // case. Unlike `pure_number_arithmetic_result`, this site's `None` does
+    // NOT compute the double inline: it returns
+    // `BaselineGeneratedExecutionResult::Fallback` with cause `Int32Overflow`
+    // (this file's existing convention for the int32-only subset, see
+    // `int32_overflow_falls_back_at_current_bytecode_index`), which the VM
+    // driver (vm/mod.rs's `execute_baseline_fallback_in_current_region`)
+    // resolves by resuming the SAME bytecode index through the interpreter
+    // (`execute_baseline_fallback_deferring_ordinary_calls_with_dispatch_budget`
+    // -> interpreter/mod.rs's already-fixed `numeric_binary_result`). This test
+    // proves BOTH halves: the fast path correctly refuses the value (Fallback
+    // shape), AND resolving that fallback end-to-end
+    // (`execute_generated_resolving_fallback_with_initial_locals`) lands on
+    // the interpreter's double -0.0, not a re-derived +0.
+    #[test]
+    fn int32_arithmetic_mul_negative_zero_matches_interpreter() {
+        let cases = [
+            (
+                "negative * zero",
+                -3,
+                0,
+                RuntimeValue::from_double(-0.0),
+                true,
+            ),
+            (
+                "zero * negative",
+                0,
+                -3,
+                RuntimeValue::from_double(-0.0),
+                true,
+            ),
+            (
+                "positive * zero stays int32",
+                3,
+                0,
+                RuntimeValue::from_i32(0),
+                false,
+            ),
+        ];
+
+        for (case_index, (name, left, right, expected, expect_fallback)) in
+            cases.into_iter().enumerate()
+        {
+            let block = code_block(vec![
+                core_typed(
+                    0,
+                    CoreOpcode::MulInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+            ]);
+            let artifact = artifact_for_block(owner(), &block);
+            let initial_locals = [
+                (local(0), RuntimeValue::from_i32(left)),
+                (local(1), RuntimeValue::from_i32(right)),
+            ];
+
+            let (interpreter_result, _, _) =
+                execute_interpreter_with_initial_locals(owner(), &block, &initial_locals);
+            assert_eq!(
+                interpreter_result,
+                ExecutionCompletion::Returned(expected),
+                "case {case_index}: {name}"
+            );
+
+            let (generated_result, stack, _) =
+                execute_generated_with_initial_locals(owner(), &block, &artifact, &initial_locals);
+            let frame = stack.top_frame().unwrap().id;
+            let bytecode_index = BytecodeIndex::from_offset(0);
+
+            if expect_fallback {
+                assert_generated_fallback(
+                    &generated_result,
+                    BaselineFallbackRequest::new(owner(), frame, bytecode_index),
+                    core_fallback_reason(
+                        bytecode_index,
+                        CoreOpcode::MulInt32,
+                        BaselineGeneratedFallbackCause::Int32Overflow,
+                    ),
+                );
+            } else {
+                assert_eq!(
+                    generated_result,
+                    Ok(BaselineGeneratedExecutionResult::Completed(
+                        interpreter_result.clone()
+                    )),
+                    "case {case_index}: {name}"
+                );
+            }
+
+            // End-to-end: resolve the fallback (or take the already-completed
+            // fast path) and confirm the value that actually reaches the
+            // caller matches the interpreter, bit-for-bit (proves the -0.0
+            // double, not a re-derived +0, is what comes out).
+            let resolved = execute_generated_resolving_fallback_with_initial_locals(
+                owner(),
+                &block,
+                &artifact,
+                &initial_locals,
+            );
+            assert_eq!(
+                resolved,
+                ExecutionCompletion::Returned(expected),
+                "case {case_index}: {name}: end-to-end resolved value"
+            );
+        }
+    }
+
     #[test]
     fn load_double_decodes_low_high_immediates() {
         let value = -40.5f64;
@@ -13377,6 +13596,80 @@ mod tests {
         }
     }
 
+    // C++ op_mod's int32 fast path (LowLevelInterpreter64.asm:1324-1352) takes
+    // the `.needsNegZeroCheck` branch whenever the DIVIDEND (left) is negative
+    // and bails to the double slow path if the remainder is exactly zero —
+    // e.g. -3%3 must yield -0.0 (IEEE fmod's "result takes the sign of the
+    // dividend" rule, jsRemainder -> Math::fmodDouble,
+    // OperationsInlines.h:643-654); only the dividend's sign matters, not the
+    // divisor's. `execute_number_arithmetic`'s ModNumber fast path (this is the
+    // ONE routing target for ModNumber regardless of opcode subset, see the
+    // dispatch match arm above) now carries the identical guard as
+    // interpreter/mod.rs's `numeric_binary_result` (055bc07's
+    // `mod_negative_dividend_zero_remainder_yields_double_neg_zero`), so the
+    // baseline path and the interpreter path must agree bit-for-bit.
+    #[test]
+    fn number_arithmetic_mod_negative_dividend_zero_remainder_matches_interpreter() {
+        let cases = [
+            (
+                "negative dividend, zero remainder",
+                -3,
+                3,
+                RuntimeValue::from_double(-0.0),
+            ),
+            (
+                "non-negative dividend stays int32",
+                3,
+                3,
+                RuntimeValue::from_i32(0),
+            ),
+            (
+                "negative divisor, non-negative dividend stays int32",
+                3,
+                -3,
+                RuntimeValue::from_i32(0),
+            ),
+        ];
+
+        for (case_index, (name, left, right, expected)) in cases.into_iter().enumerate() {
+            let block = code_block(vec![
+                core_typed(
+                    0,
+                    CoreOpcode::ModNumber,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+            ]);
+            let artifact = primitive_number_artifact(&block);
+            let initial_locals = [
+                (local(0), RuntimeValue::from_i32(left)),
+                (local(1), RuntimeValue::from_i32(right)),
+            ];
+
+            let (interpreter_result, _, _) =
+                execute_interpreter_with_initial_locals(owner(), &block, &initial_locals);
+            let (generated_result, _, _) =
+                execute_generated_with_initial_locals(owner(), &block, &artifact, &initial_locals);
+
+            assert_eq!(
+                generated_result,
+                Ok(BaselineGeneratedExecutionResult::Completed(
+                    interpreter_result.clone()
+                )),
+                "case {case_index}: {name}"
+            );
+            assert_eq!(
+                interpreter_result,
+                ExecutionCompletion::Returned(expected),
+                "case {case_index}: {name}"
+            );
+        }
+    }
+
     #[test]
     fn pure_number_binary_add_sub_mul_write_double_for_double_and_overflow_inputs() {
         let cases = [
@@ -13548,6 +13841,76 @@ mod tests {
                     "case {case_index}: {name}: expected generated double NaN"
                 );
             }
+        }
+    }
+
+    // Same C++ jsMul negative-zero guard as `int32_arithmetic_mul_negative_zero_
+    // matches_interpreter` above and interpreter/mod.rs's
+    // `mul_zero_product_negative_operand_yields_double_neg_zero` (055bc07), now
+    // covering the OTHER baseline-JIT-interpreted MulInt32 path:
+    // `pure_number_arithmetic_result` (reached via `execute_pure_number_arithmetic`
+    // when the opcode subset is PureNumberBinary). Unlike
+    // `execute_int32_arithmetic`, this path bails to `pure_number_arithmetic_
+    // f64_result` INLINE (not via the fallback dispatcher), which computes the
+    // f64 product natively — IEEE 754 multiplication already signs -3.0*0.0 as
+    // -0.0, so the guard only has to force the int32 fast path to skip that
+    // product, not recompute the sign itself.
+    #[test]
+    fn pure_number_binary_mul_negative_zero_matches_interpreter() {
+        let cases = [
+            (
+                "negative * zero",
+                RuntimeValue::from_i32(-3),
+                RuntimeValue::from_i32(0),
+                RuntimeValue::from_double(-0.0),
+            ),
+            (
+                "zero * negative",
+                RuntimeValue::from_i32(0),
+                RuntimeValue::from_i32(-3),
+                RuntimeValue::from_double(-0.0),
+            ),
+            (
+                "positive * zero stays int32",
+                RuntimeValue::from_i32(3),
+                RuntimeValue::from_i32(0),
+                RuntimeValue::from_i32(0),
+            ),
+        ];
+
+        for (case_index, (name, left, right, expected)) in cases.into_iter().enumerate() {
+            let block = code_block(vec![
+                core_typed(
+                    0,
+                    CoreOpcode::MulInt32,
+                    vec![
+                        Operand::Register(local(2)),
+                        Operand::Register(local(0)),
+                        Operand::Register(local(1)),
+                    ],
+                ),
+                core_typed(1, CoreOpcode::Return, vec![Operand::Register(local(2))]),
+            ]);
+            let artifact = pure_number_binary_artifact(&block);
+            let initial_locals = [(local(0), left), (local(1), right)];
+
+            let (interpreter_result, _, _) =
+                execute_interpreter_with_initial_locals(owner(), &block, &initial_locals);
+            let (generated_result, _, _) =
+                execute_generated_with_initial_locals(owner(), &block, &artifact, &initial_locals);
+
+            assert_eq!(
+                generated_result,
+                Ok(BaselineGeneratedExecutionResult::Completed(
+                    interpreter_result.clone()
+                )),
+                "case {case_index}: {name}"
+            );
+            assert_eq!(
+                interpreter_result,
+                ExecutionCompletion::Returned(expected),
+                "case {case_index}: {name}"
+            );
         }
     }
 
