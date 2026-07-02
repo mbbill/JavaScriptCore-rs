@@ -13,6 +13,22 @@
 //! inline here (the proven prototype likewise fused the bump cursor into the
 //! directory). R2/R3 split the LocalAllocator out when a concurrent collector or
 //! thread-local allocation lands.
+//!
+//! DIVERGENCE (gc-r4 leak-fix C3, combined FreeList forces sweep/shrink to fuse):
+//! JSC sweeps each block LAZILY, one at a time, on demand (`BlockDirectory::
+//! findBlockForAllocation`), so `emptyBits` (computed once at `endMarking`,
+//! heap/BlockDirectory.cpp:279-299) and `shrink()` (:380-403, deletes the block
+//! object outright) can run as two fully independent passes. R1's `sweep_all_blocks`
+//! instead threads EVERY block's reclaimed space into ONE combined per-directory
+//! FreeList in a single pass (the DIVERGENCE two paragraphs up). Decommitting a
+//! block's pages while its interval is still reachable through that shared FreeList
+//! chain would corrupt the next cross-block `advance()` that walks into it, so this
+//! port classifies each block (any mark left? heap/MarkedBlockInlines.h:288's own
+//! `header.m_marks.isEmpty()` check, ported as `block_has_no_marks`) BEFORE
+//! threading, excludes fully-empty blocks from the chain entirely, and lets
+//! `shrink()` — called immediately after, mirroring `Heap::sweepSynchronously`'s
+//! `sweepBlocks(); shrink();` adjacency, heap/Heap.cpp:1250-1251 — decommit exactly
+//! the blocks this sweep never wired into the allocator.
 
 #![allow(dead_code)]
 
@@ -21,9 +37,11 @@ use std::alloc::{alloc_zeroed, dealloc};
 
 use super::free_list::{FreeList, NewlyAllocatedMode, SweepResult};
 use super::marked_block::{
-    block_layout, cell_ptr, set_newly_allocated, Cell, CellPtr, MarkedBlock, ATOM_SIZE, END_ATOM,
-    FIRST_PAYLOAD_ATOM, HALF_ALIGNMENT,
+    block_atoms_per_cell, block_has_no_marks, block_layout, block_start_atom, cell_ptr,
+    clear_marks_block, clear_newly_allocated_block, set_newly_allocated, Cell, CellPtr,
+    MarkedBlock, ATOM_SIZE, BLOCK_SIZE, END_ATOM, FIRST_PAYLOAD_ATOM, HALF_ALIGNMENT,
 };
+use super::page_decommit;
 
 /// FreeCell link obfuscation secret. JSC draws a fresh `vm.heapRandom().getUint64()`
 /// per sweep (heap/MarkedBlockInlines.h:263) as exploit-hardening entropy against
@@ -65,6 +83,21 @@ pub(crate) struct BlockDirectory {
     pages: Vec<*mut u8>,
     /// per-block once-exposed base address (== the page pointer's address).
     pub(crate) block_base_addr: Vec<usize>,
+    /// gc-r4 leak-fix C3 — per-block decommit state, index-aligned with `pages`/
+    /// `block_base_addr` (mirrors JSC's index-based per-block BitSets on
+    /// BlockDirectory, e.g. `emptyBits`/`inUseBits`, heap/BlockDirectory.h). `true`
+    /// once `shrink()` has returned this block's physical pages to the OS
+    /// (page_decommit::decommit); cleared by `acquire_block`'s reactivate path
+    /// before the block is handed back to the FreeList.
+    decommitted: Vec<bool>,
+    /// gc-r4 leak-fix C3 diagnostic — count of `acquire_block` calls that reactivated
+    /// a decommitted block rather than paging in a fresh one (`reactivate_block`'s
+    /// only caller). No JSC counterpart (JSC's real `shrink()` frees the block object
+    /// outright, so it has no reactivate-vs-fresh-add distinction to count); exists
+    /// so a test can prove the reuse path — not merely a fresh page — actually ran,
+    /// something `committed_block_bytes()` alone cannot distinguish (both raise it by
+    /// exactly one block).
+    reactivated_block_count: usize,
     /// LocalAllocator-style FreeList over this directory's exposed pages
     /// (heap/LocalAllocator.h:72 `m_freeList`). Replaces the prior raw `next_atom`
     /// bump cursor with the faithful FreeCell-interval fast path.
@@ -79,6 +112,8 @@ impl BlockDirectory {
             cell_size,
             pages: Vec::new(),
             block_base_addr: Vec::new(),
+            decommitted: Vec::new(),
+            reactivated_block_count: 0,
             // A fresh FreeList is in the always-fail state, so the first allocate
             // takes the slow path and adds a block (heap/FreeList.h:117-122).
             free_list: FreeList::new(cell_size as u32),
@@ -112,6 +147,7 @@ impl BlockDirectory {
         let base_addr = raw.expose_provenance();
         self.pages.push(raw); // may realloc the Vec buffer; pages never move
         self.block_base_addr.push(base_addr);
+        self.decommitted.push(false);
 
         // Sweep the fresh empty block to the FreeList: ONE interval spanning
         // [startAtom, endAtom) (heap/MarkedBlockInlines.h:313-318, IsEmpty quick
@@ -127,6 +163,66 @@ impl BlockDirectory {
                 .initialize_empty_block(payload_begin, payload_end, FREELIST_SECRET);
         }
         base_addr
+    }
+
+    /// `LocalAllocator::allocateSlowCase` / `BlockDirectory::findBlockForAllocation`
+    /// (heap/LocalAllocator.cpp; heap/BlockDirectory.cpp:100-172): prefer a block
+    /// already on hand over paging in a fresh OS allocation — JSC gives `emptyBits`
+    /// blocks (an `m_emptyCursor` bit scan) first refusal before `tryAllocateBlock`.
+    /// gc-r4 leak-fix C3's analog of that preference: reactivate a SHRUNK
+    /// (decommitted) block before calling `add_block`. Always leaves this
+    /// directory's FreeList holding exactly the returned block's one fresh interval
+    /// (same post-condition as `add_block`).
+    fn acquire_block(&mut self) -> usize {
+        match self.decommitted.iter().position(|&d| d) {
+            Some(idx) => self.reactivate_block(idx),
+            None => self.add_block(),
+        }
+    }
+
+    /// Recommit and reinitialize a previously-`shrink()`-decommitted block so it can
+    /// re-enter this directory's FreeList — the inverse of the decommit half of
+    /// leak-fix C3 (see page_decommit.rs's module doc for the C++ citation).
+    ///
+    /// SAFETY (contract C1-C4, marked_block.rs): `self.block_base_addr[idx]` is a
+    /// block this directory has owned since `add_block` and never freed (only its
+    /// physical pages were returned to the OS); `self.decommitted[idx]` is set ONLY
+    /// by `shrink()` after `block_has_no_marks` proved zero live cells remain in it,
+    /// so rewriting its header and payload aliases no live `Cell`.
+    fn reactivate_block(&mut self, idx: usize) -> usize {
+        let base = self.block_base_addr[idx];
+        // SAFETY: `base..base+BLOCK_SIZE` is exactly the range `shrink()` decommitted
+        // for this block and nothing has touched it since (contract above).
+        unsafe { page_decommit::recommit(base, BLOCK_SIZE) };
+        let start_atom = start_atom_for(self.cell_size_atoms);
+        // Recover this block's header through its once-exposed provenance (contract
+        // C3 — exposed ONCE at `add_block` time; this is the documented RECOVER step,
+        // not a second expose) and unconditionally rewrite the size-class fields:
+        // `MADV_FREE_REUSABLE` gives no guarantee the old header bytes survived the
+        // decommit, so nothing here may assume stale header content is valid.
+        let bp: *mut MarkedBlock = ptr::with_exposed_provenance_mut::<u8>(base).cast();
+        // SAFETY: `base` is a registered, once-exposed, directory-owned block (as
+        // above); these offsets are in-bounds; no `&MarkedBlock` is formed.
+        unsafe {
+            ptr::addr_of_mut!((*bp).header.atoms_per_cell).write(self.cell_size_atoms as u16);
+            ptr::addr_of_mut!((*bp).header.start_atom).write(start_atom as u16);
+        }
+        clear_marks_block(base);
+        clear_newly_allocated_block(base);
+
+        // Sweep the reactivated block to the FreeList exactly like a fresh one: ONE
+        // interval spanning [startAtom, endAtom) (mirrors `add_block`'s tail).
+        let payload_begin = base + start_atom * ATOM_SIZE;
+        let payload_end = base + END_ATOM * ATOM_SIZE;
+        // SAFETY (C2/C3): payload lies inside the once-exposed page; no cell has been
+        // handed out of this block since `shrink()` decommitted it.
+        unsafe {
+            self.free_list
+                .initialize_empty_block(payload_begin, payload_end, FREELIST_SECRET);
+        }
+        self.decommitted[idx] = false;
+        self.reactivated_block_count += 1;
+        base
     }
 
     /// LocalAllocator::allocate (heap/LocalAllocatorInlines.h:33-43): the FreeList
@@ -145,15 +241,18 @@ impl BlockDirectory {
         let cell_addr = match unsafe { self.free_list.allocate() } {
             Some(addr) => addr,
             None => {
-                // allocateSlowCase: the FreeList is exhausted -> add a fresh block
-                // (which sweeps it to a new FreeList), then retry.
-                let base = self.add_block();
+                // allocateSlowCase: the FreeList is exhausted -> acquire a block
+                // (reactivating a decommitted one, or adding a fresh one — either way
+                // it sweeps to a new FreeList), then retry. Both cases register with
+                // MarkedSpace via `new_base` (didAddBlock for a truly new page;
+                // re-`m_blocks.add` for a reactivated one that `shrink()` removed).
+                let base = self.acquire_block();
                 new_base = Some(base);
-                // The fresh block has a non-empty interval, so this always succeeds
-                // (FreeList "we don't create empty intervals" invariant,
+                // The (re)freshened block has a non-empty interval, so this always
+                // succeeds (FreeList "we don't create empty intervals" invariant,
                 // heap/FreeListInlines.h:50-51).
                 // SAFETY: as the fast path above; the FreeList was just initialized
-                // over the freshly exposed block.
+                // over the freshly exposed/reactivated block.
                 unsafe { self.free_list.allocate() }
                     .expect("fresh-block FreeList must yield a cell")
             }
@@ -211,7 +310,9 @@ impl BlockDirectory {
         let cell_addr = match unsafe { self.free_list.allocate() } {
             Some(addr) => addr,
             None => {
-                let base = self.add_block();
+                // See `allocate`'s slow path — reactivate a decommitted block before
+                // paging in a fresh one.
+                let base = self.acquire_block();
                 new_base = Some(base);
                 // SAFETY: the freshly-swept block's FreeList always yields one cell.
                 unsafe { self.free_list.allocate() }
@@ -250,18 +351,129 @@ impl BlockDirectory {
     /// dead cells (clobbering the butterfly slot at offset 8) — see `MarkedSpace::
     /// sweep_all_object_blocks`.
     pub(crate) fn sweep_all_blocks(&mut self) -> SweepResult {
-        // Descending base order keeps every cross-block link offset positive (see
-        // `FreeList::sweep_blocks`). Clone the bases so `&mut self.free_list` is free.
-        let mut bases = self.block_base_addr.clone();
-        bases.sort_unstable_by(|a, b| b.cmp(a));
-        // SAFETY (contract C1-C6): each base is a registered, once-exposed, directory-owned
-        // block; the collector is stopped (single mutator); FreeCell records land only in
-        // dead cells. FREELIST_SECRET keys the rebuild — the SAME constant the directory
-        // always uses (`add_block`), so the FreeList descrambles its own records.
-        unsafe {
-            self.free_list
-                .sweep_blocks(&bases, FREELIST_SECRET, NewlyAllocatedMode::DoesNotHave)
+        let mut total = SweepResult::default();
+        // gc-r4 leak-fix C3 CLASSIFICATION PASS (this port's `endMarking`-equivalent
+        // timing — see the block_directory.rs top-of-file DIVERGENCE): decide, PER
+        // BLOCK and BEFORE any FreeList is built, whether it has a single marked
+        // cell. A block with none is COMPLETELY EMPTY; excluding it from `to_thread`
+        // here (not threading its interval into the shared FreeList at all) is what
+        // lets `shrink()` safely decommit it right after — a block whose cells are
+        // still reachable through the live FreeList chain must never be decommitted
+        // out from under an in-flight allocation. Already-decommitted blocks are
+        // skipped entirely: they hold no live content and `shrink()`/`acquire_block`
+        // own their lifecycle exclusively.
+        //
+        // SOUNDNESS INVARIANT (`block_has_no_marks` reads ONLY mark bits): NO
+        // ALLOCATION occurs between mark-phase end and `shrink()` completing within
+        // the single-STW `force_collect`. An allocation in that window would set
+        // `newlyAllocated` but no mark bit, so its block could classify "empty" here
+        // yet hold a LIVE cell — the newlyAllocated race JSC's `isLive` covers via
+        // `m_newlyAllocatedVersion` (heap/MarkedBlockInlines.h:101-190), machinery
+        // this single-STW port intentionally omits. The invariant holds today (the
+        // only phases in the window — `finalize_unconditional_finalizers`,
+        // `reconcile_dead_cells_before_sweep` — allocate nothing) and is PINNED by
+        // the debug guard in `MarkedSpace::allocate/allocate_blob`
+        // (`no_alloc_until_shrink_completes`): a future finalizer-callback feature
+        // that allocates trips that assertion instead of silently reintroducing
+        // the race.
+        let mut to_thread: Vec<usize> = Vec::new();
+        for (idx, &base) in self.block_base_addr.iter().enumerate() {
+            if self.decommitted[idx] {
+                continue;
+            }
+            if block_has_no_marks(base) {
+                let atoms_per_cell = block_atoms_per_cell(base);
+                let start_atom = block_start_atom(base);
+                let cell_count = (END_ATOM - start_atom) / atoms_per_cell;
+                total.freed_cells += cell_count;
+                total.freed_bytes += (cell_count * atoms_per_cell * ATOM_SIZE) as u32;
+                // STATE FLIP (mirrors `sweep_block_threading`'s `DoesNotHave` clear) —
+                // moot once `shrink()` decommits this block, but keeps the directory's
+                // bookkeeping consistent if a caller sweeps without following up with
+                // `shrink()`.
+                clear_newly_allocated_block(base);
+            } else {
+                to_thread.push(base);
+            }
         }
+
+        // Descending base order keeps every cross-block link offset positive (see
+        // `FreeList::sweep_blocks`).
+        to_thread.sort_unstable_by(|a, b| b.cmp(a));
+        // SAFETY (contract C1-C6): each base is a registered, once-exposed, directory-owned,
+        // NON-empty block; the collector is stopped (single mutator); FreeCell records land
+        // only in dead cells. FREELIST_SECRET keys the rebuild — the SAME constant the
+        // directory always uses (`add_block`), so the FreeList descrambles its own records.
+        let threaded = unsafe {
+            self.free_list.sweep_blocks(
+                &to_thread,
+                FREELIST_SECRET,
+                NewlyAllocatedMode::DoesNotHave,
+            )
+        };
+        total.freed_cells += threaded.freed_cells;
+        total.freed_bytes += threaded.freed_bytes;
+        total.retained_cells += threaded.retained_cells;
+        total
+    }
+
+    /// `BlockDirectory::shrink()` (heap/BlockDirectory.cpp:380-403): return every
+    /// COMPLETELY EMPTY block's physical pages to the OS (page_decommit::decommit),
+    /// keeping the virtual reservation so `acquire_block` can recommit it before
+    /// reuse. EMPTY-block granularity only (ratified; JSC's finer-grained
+    /// destructible/partial variants are a follow-up — this port has no destructible
+    /// cell kind yet, so `shrink`'s `~destructibleBits()` term is vacuously true).
+    ///
+    /// CALLER CONTRACT: run immediately after `sweep_all_blocks()` in the SAME
+    /// collection pass (mirrors `Heap::sweepSynchronously`'s `sweepBlocks();
+    /// shrink();` adjacency, heap/Heap.cpp:1250-1251) — see the top-of-file
+    /// DIVERGENCE on why this port's combined FreeList makes that adjacency load-
+    /// bearing rather than merely conventional. Returns the bases just decommitted so
+    /// `MarkedSpace::shrink` can drop them from its block registry (`m_blocks`) —
+    /// mirrors `MarkedSpace::freeBlock`'s `m_blocks.remove`, adapted for decommit
+    /// instead of free (heap/MarkedSpace.cpp:401-406).
+    pub(crate) fn shrink(&mut self) -> Vec<usize> {
+        let mut newly_decommitted = Vec::new();
+        // SOUNDNESS INVARIANT (same as `sweep_all_blocks`' classification pass, and
+        // for the same reason — `block_has_no_marks` reads ONLY mark bits): NO
+        // ALLOCATION occurs between mark-phase end and this shrink completing
+        // within the single-STW `force_collect`; otherwise a window-allocated cell
+        // (newlyAllocated set, no mark) could sit in a block this loop decommits.
+        // Holds today (nothing in the window allocates) and is PINNED by the debug
+        // guard in `MarkedSpace::allocate/allocate_blob`
+        // (`no_alloc_until_shrink_completes`), which `MarkedSpace::shrink` clears
+        // only after this returns.
+        for (idx, &base) in self.block_base_addr.iter().enumerate() {
+            if self.decommitted[idx] {
+                continue;
+            }
+            if block_has_no_marks(base) {
+                // SAFETY (contract C1/C2): `base` is a registered, once-exposed,
+                // directory-owned block with zero live cells (`block_has_no_marks`
+                // under the no-alloc invariant above) and — because
+                // `sweep_all_blocks` never threads an empty block's interval into
+                // the FreeList — no reachable allocator path into it.
+                unsafe { page_decommit::decommit(base, BLOCK_SIZE) };
+                self.decommitted[idx] = true;
+                newly_decommitted.push(base);
+            }
+        }
+        newly_decommitted
+    }
+
+    /// gc-r4 leak-fix C3 — bytes of this directory's blocks that are currently
+    /// physically committed. Falls when `shrink()` decommits an empty block, rises
+    /// when `acquire_block` reactivates one (or pages in a fresh one). No direct JSC
+    /// counterpart by this name (real JSC reads OS `phys_footprint` for the
+    /// equivalent signal); this is the in-process substitute the leak-fix C3 test
+    /// contract asserts against.
+    pub(crate) fn committed_block_bytes(&self) -> usize {
+        self.decommitted.iter().filter(|&&d| !d).count() * BLOCK_SIZE
+    }
+
+    /// See the `reactivated_block_count` field doc.
+    pub(crate) fn reactivated_block_count(&self) -> usize {
+        self.reactivated_block_count
     }
 }
 
@@ -270,6 +482,9 @@ impl Drop for BlockDirectory {
         for &raw in &self.pages {
             // SAFETY: each `raw` came from alloc_zeroed(block_layout()) and is freed
             // exactly once here; no live pointer into the page outlives the arena.
+            // Deallocating a page whose pages were `page_decommit::decommit`-ed is
+            // sound: madvise never unmaps or invalidates the allocation, it only
+            // advises the kernel about physical backing.
             unsafe { dealloc(raw, block_layout()) };
         }
     }

@@ -378,6 +378,28 @@ pub(crate) fn is_marked(cell_addr: usize) -> bool {
     (cur & mask) != 0
 }
 
+/// `header.m_marks.isEmpty()` (heap/MarkedBlock.h:313, `WTF::BitSet`; the same
+/// direct-mark-scan JSC itself uses as a sanity check, heap/MarkedBlockInlines.h:288
+/// `!header.m_marks.isEmpty()`). True iff NO cell in this block is currently marked.
+///
+/// gc-r4 leak-fix C3: this is the per-block emptiness test `BlockDirectory::shrink`
+/// consumes. Real JSC computes an equivalent `emptyBits` BitSet once at
+/// `endMarking()` (`liveBits() & ~markingNotEmptyBits()`, heap/BlockDirectory.cpp
+/// :279-299) from a bit set incrementally DURING marking (`MarkedBlock::noteMarked`,
+/// heap/MarkedBlock.h:695-703) — a HeapVersion/incremental-marking mechanism this R1
+/// single-STW port has not built (see the marked_block.rs top-of-file DIVERGENCE on
+/// HeapVersion staleness). A direct post-mark-phase scan of the mark words is the
+/// faithful equivalent for a port where marking is always a single stop-the-world
+/// pass with no incremental staleness to track: it answers the exact same question
+/// ("did any cell in this block get marked THIS cycle?") the JSC bit answers.
+pub(crate) fn block_has_no_marks(base: usize) -> bool {
+    let bp: *const MarkedBlock = ptr::with_exposed_provenance::<u8>(base).cast();
+    // SAFETY (C3): `base` is a registered, once-exposed page; atomic reads via
+    // addr_of! form no reference.
+    (0..MARK_WORDS)
+        .all(|w| unsafe { (*ptr::addr_of!((*bp).header.marks[w])).load(Ordering::Relaxed) == 0 })
+}
+
 /// MarkedBlock::isNewlyAllocated (heap/MarkedBlock.h:357-363): the per-block alloc
 /// bitmap bit for this cell — the mutator-phase liveness `is_live_cell` also reads.
 /// The sweep consults it as one of the two liveness sources (heap/MarkedBlockInlines

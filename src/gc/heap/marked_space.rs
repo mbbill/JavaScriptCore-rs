@@ -266,7 +266,11 @@ impl MarkedBlockSet {
     /// MarkedBlockSet::remove (:57-63). JSC recomputes the filter only when set
     /// capacity shrinks a lot; we recompute on every removal. The filter is
     /// false-positive-only, so recompute can only tighten it — it can never reject
-    /// a live block. (Unused in R1: no sweep yet; kept for fidelity.)
+    /// a live block. Used by `MarkedSpace::shrink` (gc-r4 leak-fix C3): a decommitted
+    /// block must drop out of every `self.blocks`-driven walk (`find`/`is_arena_cell`/
+    /// `for_each_object_cell`/`clear_all_marks`) until it is reactivated and
+    /// re-registered, or its header/payload could be read after its physical pages
+    /// were returned to the OS.
     fn remove(&mut self, block: usize) {
         self.set.remove(&block);
         self.recompute_filter();
@@ -330,6 +334,24 @@ pub(crate) struct MarkedSpace {
     /// collection when armed. Decision 5: NEVER collect inline in `allocate_blob` —
     /// that would collect re-entrantly while a cell `&mut`/`&` is live.
     collection_request_armed: bool,
+    /// gc-r4 leak-fix C3 GUARD (debug-only) — true from MARK-PHASE END
+    /// (`note_mark_phase_end_for_shrink_guard`, called by `CoreObjectStore::
+    /// force_collect` right after marking) until `shrink()` completes. THE INVARIANT
+    /// IT PINS: no allocation occurs in that window within the single-STW
+    /// collection, because `block_has_no_marks` — the emptiness test both
+    /// `BlockDirectory::sweep_all_blocks`'s FreeList-exclusion pass and
+    /// `BlockDirectory::shrink`'s decommit pass rest on — reads ONLY mark bits. An
+    /// allocation in the window would set `newlyAllocated` but no mark, so its
+    /// block could still classify "empty" and be decommitted under a LIVE cell
+    /// (exactly the newlyAllocated race JSC's `isLive` handles via
+    /// `m_newlyAllocatedVersion`, heap/MarkedBlockInlines.h:101-190 — machinery
+    /// this single-STW port intentionally does not carry). Today the window's only
+    /// occupants (`finalize_unconditional_finalizers`,
+    /// `reconcile_dead_cells_before_sweep`) allocate nothing; a future
+    /// finalizer-callback feature that allocates MUST trip the `allocate`/
+    /// `allocate_blob` assertion, not silently reintroduce the race.
+    #[cfg(debug_assertions)]
+    no_alloc_until_shrink_completes: bool,
     _not_send_sync: PhantomData<*const ()>, // contract C6
 }
 
@@ -385,7 +407,22 @@ impl MarkedSpace {
             allocated_blob_cells: 0,
             bytes_allocated_this_cycle: 0,
             collection_request_armed: false,
+            #[cfg(debug_assertions)]
+            no_alloc_until_shrink_completes: false,
             _not_send_sync: PhantomData,
+        }
+    }
+
+    /// gc-r4 leak-fix C3 GUARD — record that the mark phase has ended and the mark
+    /// bits are now the AUTHORITATIVE liveness `block_has_no_marks` classifies
+    /// against, opening the no-allocation window that closes when `shrink()`
+    /// completes (see the `no_alloc_until_shrink_completes` field doc for the race
+    /// this pins). Called by `CoreObjectStore::force_collect` immediately after
+    /// marking; debug-only effect (release compiles to nothing).
+    pub(crate) fn note_mark_phase_end_for_shrink_guard(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.no_alloc_until_shrink_completes = true;
         }
     }
 
@@ -396,6 +433,14 @@ impl MarkedSpace {
     /// :82-123) — no longer a raw atom bump. The address is exposed ONCE and
     /// membership registered. Returns the `CellPtr` the JsValue carries.
     pub(crate) fn allocate(&mut self, js_type: u8, payload: u64) -> CellPtr {
+        // gc-r4 leak-fix C3 GUARD: no allocation between mark-phase end and
+        // shrink() completing (see the `no_alloc_until_shrink_completes` field doc).
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.no_alloc_until_shrink_completes,
+            "allocation between mark-phase end and shrink() — a fresh cell's block \
+             could classify empty (marks-only) and be decommitted under it"
+        );
         match size_route(CELL_BYTES) {
             SizeRoute::Marked(sz) => {
                 let atoms = sz / ATOM_SIZE;
@@ -439,6 +484,16 @@ impl MarkedSpace {
     /// SAFETY: `src..src+len` is `len` readable bytes of an initialized POD value
     /// (`needs_drop == false`); single mutator thread (contract C5/C6).
     pub(crate) unsafe fn allocate_blob(&mut self, src: *const u8, len: usize) -> CellPtr {
+        // gc-r4 leak-fix C3 GUARD: no allocation between mark-phase end and
+        // shrink() completing (see the `no_alloc_until_shrink_completes` field doc).
+        // A future finalizer-callback feature that allocates during the end phase
+        // must trip this assertion, not silently reintroduce the newlyAllocated race.
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.no_alloc_until_shrink_completes,
+            "allocation between mark-phase end and shrink() — a fresh cell's block \
+             could classify empty (marks-only) and be decommitted under it"
+        );
         self.allocated_blob_cells += 1;
         // gc-r4 R4b live trigger (decision 5): ACCUMULATE bytes-this-cycle and ARM a
         // DEFERRED collection request when it crosses the threshold. Do NOT collect
@@ -925,6 +980,68 @@ impl MarkedSpace {
         total
     }
 
+    /// `MarkedSpace::shrink()` (heap/MarkedSpace.cpp:408-415): return every
+    /// COMPLETELY EMPTY block's physical pages to the OS across every directory
+    /// (gc-r4 leak-fix C3). CALLER CONTRACT: run immediately after
+    /// `sweep_all_object_blocks()` in the SAME collection pass — mirrors
+    /// `Heap::sweepSynchronously`'s `m_objectSpace.sweepBlocks();
+    /// m_objectSpace.shrink();` adjacency (heap/Heap.cpp:1250-1251); see
+    /// `BlockDirectory::shrink`'s doc for why this port's combined-FreeList
+    /// DIVERGENCE makes that adjacency load-bearing, not merely conventional.
+    pub(crate) fn shrink(&mut self) {
+        for dir in self.directories.values_mut() {
+            for base in dir.shrink() {
+                // MarkedSpace::freeBlock's `m_blocks.remove` (heap/MarkedSpace.cpp
+                // :401-406), adapted for decommit-not-free — see `MarkedBlockSet::
+                // remove`'s doc.
+                self.blocks.remove(base);
+            }
+        }
+        // gc-r4 leak-fix C3 GUARD: shrink complete — the marks-only emptiness
+        // classification is spent; allocation is safe again (see the
+        // `no_alloc_until_shrink_completes` field doc).
+        #[cfg(debug_assertions)]
+        {
+            self.no_alloc_until_shrink_completes = false;
+        }
+    }
+
+    /// gc-r4 leak-fix C3 — bytes of arena block pages currently physically
+    /// committed, summed across every directory. See `BlockDirectory::
+    /// committed_block_bytes` for the JSC-analog note (no direct counterpart by this
+    /// name; substitutes for reading OS `phys_footprint` in-process).
+    ///
+    /// TRUST BOUNDARY: this is BOOKKEEPING (the per-directory `decommitted` flags),
+    /// not an OS probe. It matches OS reality only while
+    /// [`Self::decommit_failure_count`] stays 0 — a persistently failing `madvise`
+    /// leaves pages resident that this still counts as decommitted. Any
+    /// leak/footprint claim built on this metric must check that counter first.
+    pub(crate) fn committed_block_bytes(&self) -> usize {
+        self.directories
+            .values()
+            .map(|d| d.committed_block_bytes())
+            .sum()
+    }
+
+    /// gc-r4 leak-fix C3 — release-visible count of persistent (post-EAGAIN-retry)
+    /// `madvise` decommit failures: the divergence bound on
+    /// [`Self::committed_block_bytes`] (see its TRUST BOUNDARY note). Delegates to
+    /// the module-private `page_decommit` counter (a process-wide static — every
+    /// space shares it, exact today with one live `MarkedSpace` per store).
+    pub(crate) fn decommit_failure_count(&self) -> usize {
+        super::page_decommit::decommit_failure_count()
+    }
+
+    /// See `BlockDirectory::reactivated_block_count`'s doc — summed across
+    /// directories, the leak-fix C3 test-visible proof that a `shrink()`-decommitted
+    /// block was reactivated rather than the allocator paging in a fresh one.
+    pub(crate) fn reactivated_block_count(&self) -> usize {
+        self.directories
+            .values()
+            .map(|d| d.reactivated_block_count())
+            .sum()
+    }
+
     // ---- DEBUG borrow flag (contract C: #[cfg(debug_assertions)] overlap check) ----
 
     /// On `&mut` entry, set the per-cell DEBUG borrow flag (sidecar AtomicU8 in a
@@ -972,6 +1089,32 @@ mod tests {
     /// Cells-per-block for the demo size class (after the header atoms).
     fn cells_per_block() -> usize {
         (ATOMS_PER_BLOCK - FIRST_PAYLOAD_ATOM) / ATOMS_PER_CELL
+    }
+
+    /// gc-r4 leak-fix C3 GUARD fires: allocating inside the mark-end -> shrink()
+    /// window MUST panic (debug builds; tests run with debug_assertions). This is
+    /// the tripwire pinning the `block_has_no_marks` soundness invariant — a future
+    /// finalizer-callback feature that allocates during the collection end phase
+    /// must hit this assertion, not silently reintroduce the newlyAllocated race
+    /// (see the `no_alloc_until_shrink_completes` field doc).
+    #[test]
+    #[should_panic(expected = "allocation between mark-phase end and shrink()")]
+    fn allocation_inside_mark_end_to_shrink_window_panics() {
+        let mut space = MarkedSpace::new();
+        space.note_mark_phase_end_for_shrink_guard();
+        let _ = space.allocate(0x10, 0xDEAD);
+    }
+
+    /// gc-r4 leak-fix C3 GUARD clears: `shrink()` completing closes the window, so
+    /// the same allocation succeeds afterwards — the guard gates exactly the
+    /// window, not allocation in general.
+    #[test]
+    fn allocation_after_shrink_closes_the_guard_window() {
+        let mut space = MarkedSpace::new();
+        space.note_mark_phase_end_for_shrink_guard();
+        space.shrink(); // closes the window (clears the debug flag)
+        let cp = space.allocate(0x10, 0xBEEF);
+        assert_eq!(space.find(cp.addr()), Some(cp), "post-shrink alloc is live");
     }
 
     /// gc-r4 R4b-mark THE #1 UAF LANDMINE in miniature: a live old-gen SURVIVOR has

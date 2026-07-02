@@ -4039,11 +4039,23 @@ impl CoreObjectStore {
     ///      while their bytes are still intact — BEFORE step 4 clobbers them.
     ///   4. `sweep_all_object_blocks` reclaims dead cells' atoms into the directories'
     ///      combined FreeLists (DoesNotHave; post-sweep liveness == marks alone).
+    ///   5. `shrink` (gc-r4 leak-fix C3) returns any now-COMPLETELY-EMPTY block's
+    ///      physical pages to the OS — mirrors `Heap::sweepSynchronously`'s
+    ///      `sweepBlocks(); shrink();` adjacency (heap/Heap.cpp:1250-1251); MUST run
+    ///      immediately after step 4 (see `MarkedSpace::shrink`'s doc).
     pub(crate) fn force_collect(&mut self, root_addrs: &[usize]) -> CollectStats {
         let mark = self.mark_live_set_from_addrs(root_addrs);
+        // gc-r4 leak-fix C3 GUARD: from here until `shrink()` completes, the mark
+        // bits are the AUTHORITATIVE liveness `block_has_no_marks` classifies
+        // decommittable-empty blocks against, so NO ALLOCATION may occur in the
+        // window (steps 2-3 allocate nothing today; the debug guard in
+        // `MarkedSpace::allocate/allocate_blob` trips if a future finalizer-callback
+        // feature changes that — see `no_alloc_until_shrink_completes`).
+        self.space.note_mark_phase_end_for_shrink_guard();
         self.finalize_unconditional_finalizers();
         let reconcile = self.reconcile_dead_cells_before_sweep();
         let sweep = self.space.sweep_all_object_blocks();
+        self.space.shrink();
         // Post-reconcile, the authoritative live set must be EXACTLY the marked survivors
         // (every dead entry was dropped). The side-effect-free check runs in debug only.
         debug_assert!(
@@ -12911,6 +12923,223 @@ mod r4b_sweep_tests {
             addr(anchor),
             anchor_addr,
             "the rooted anchor never moved (no compaction)"
+        );
+    }
+
+    /// gc-r4 leak-fix C3, test (a) — SWEPT MEMORY MUST RETURN TO THE OS. Pre-fix,
+    /// `BlockDirectory::sweep_all_blocks` only rebuilt free lists for in-process
+    /// reuse; the arena's high-water mark of committed block pages never fell, so a
+    /// heavy benchmark's peak footprint stayed resident (the pdfjs 16GB observation
+    /// that motivated this unit). Allocate a batch big enough to span MANY
+    /// MarkedBlocks, drop every root but an anchor, force collections until the
+    /// batch is fully swept, and prove `committed_block_bytes()` — the in-process
+    /// substitute for reading OS `phys_footprint` (`MarkedSpace::committed_block_
+    /// bytes`) — FELL: `BlockDirectory::shrink` actually `madvise`-decommitted the
+    /// now-completely-empty blocks instead of leaving their pages resident.
+    #[test]
+    fn shrink_decommits_pages_of_a_fully_emptied_batch() {
+        let mut store = CoreObjectStore::default();
+        let anchor = obj(&mut store);
+        // Establish a clean, fully-swept baseline before measuring.
+        store.force_collect_values(&[anchor]);
+        let baseline_committed = store.space.committed_block_bytes();
+
+        // A batch big enough to span MANY MarkedBlocks of the CoreObjectCell size
+        // class (a few thousand cells at ~16KB/block spans well over 100 blocks), so
+        // the EMPTY-block-granularity decommit is exercised across many blocks, not
+        // just one. Every `o` is intentionally never retained (no Vec push) — it is
+        // unrooted the instant this loop body ends, exactly like "drop all roots".
+        const BATCH: usize = 4000;
+        for i in 0..BATCH {
+            let o = obj(&mut store);
+            store
+                .put_data_own(o, &ident(0), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        let peak_committed = store.space.committed_block_bytes();
+        assert!(
+            peak_committed > baseline_committed,
+            "the batch actually grew the committed arena (peak {peak_committed} <= \
+             baseline {baseline_committed})"
+        );
+
+        // Force collections UNTIL SWEPT. Only `anchor` is rooted, so the whole batch
+        // is dead; run more than one collection (cheap and idempotent — mirrors the
+        // membership-vs-liveness landmine tests elsewhere in this module) to match
+        // the "until swept" contract defensively.
+        for _ in 0..2 {
+            store.force_collect_values(&[anchor]);
+        }
+
+        let after_committed = store.space.committed_block_bytes();
+        assert!(
+            after_committed < peak_committed,
+            "committed_block_bytes FELL after the batch was collected (peak \
+             {peak_committed}, after {after_committed}) — swept memory must return \
+             to the OS, not just rejoin the free list"
+        );
+        assert!(
+            store.find(anchor).is_some() && store.is_value_marked(anchor),
+            "the rooted anchor survived every collection"
+        );
+    }
+
+    /// gc-r4 leak-fix C3, test (b) — THE RECOMMIT (REUSE) PATH. After (a)'s `shrink`
+    /// has decommitted a batch of empty blocks, allocating again MUST prefer
+    /// reactivating a decommitted block over paging in a brand-new OS page
+    /// (`BlockDirectory::acquire_block`'s reactivate-first order), and every value
+    /// written into a reactivated block's cells must read back correctly — recommit
+    /// must not corrupt the block header (`atoms_per_cell`/`start_atom`, the FreeList
+    /// geometry) or the JSCell payload layout the reused cells depend on.
+    #[test]
+    fn decommitted_block_reactivates_and_stays_correct_on_reuse() {
+        let mut store = CoreObjectStore::default();
+        let anchor = obj(&mut store);
+        store.force_collect_values(&[anchor]);
+
+        // Grow, then fully empty, a batch — mirrors test (a) — to leave several
+        // decommitted blocks behind for this test to reactivate.
+        const BATCH: usize = 4000;
+        for i in 0..BATCH {
+            let o = obj(&mut store);
+            store
+                .put_data_own(o, &ident(0), RuntimeValue::from_i32(i as i32))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            store.force_collect_values(&[anchor]);
+        }
+        let committed_after_shrink = store.space.committed_block_bytes();
+        assert_eq!(
+            store.space.reactivated_block_count(),
+            0,
+            "nothing has been reactivated yet — only decommitted so far"
+        );
+
+        // Allocate again: a modest batch (far smaller than BATCH, so a working reuse
+        // path can satisfy it from decommitted blocks alone), each cell written and
+        // later read back.
+        const REUSE_BATCH: usize = 200;
+        let mut reused = Vec::with_capacity(REUSE_BATCH);
+        for i in 0..REUSE_BATCH {
+            let o = obj(&mut store);
+            store
+                .put_data_own(o, &ident(1), RuntimeValue::from_i32(1000 + i as i32))
+                .unwrap();
+            reused.push(o);
+        }
+
+        // THE REUSE-PATH PROOF: `committed_block_bytes()` alone cannot distinguish
+        // "reactivated a decommitted block" from "paged in a fresh one" (both raise
+        // it by exactly one block's worth) — `reactivated_block_count` is the
+        // test-visible counter that can. `acquire_block` prefers reactivation
+        // whenever ANY decommitted block exists, which the assert above just proved
+        // is the case here.
+        assert!(
+            store.space.reactivated_block_count() > 0,
+            "allocating after shrink() must reactivate a decommitted block, not \
+             only page in fresh ones"
+        );
+        let committed_after_reuse = store.space.committed_block_bytes();
+        assert!(
+            committed_after_reuse > committed_after_shrink,
+            "recommitting a block raises committed_block_bytes (before \
+             {committed_after_shrink}, after {committed_after_reuse})"
+        );
+
+        // VALUES CORRECT: every reused cell reads back exactly what was written and
+        // is still a live, membership-admitted arena object.
+        for (i, &o) in reused.iter().enumerate() {
+            assert!(
+                store.find(o).is_some(),
+                "reused cell #{i} is a live, membership-admitted arena object"
+            );
+            reads_to(&store, o, 1, RuntimeValue::from_i32(1000 + i as i32));
+        }
+
+        // A further REAL collection (rooting the whole reused batch this time)
+        // proves the reactivated blocks are fully-functioning space members, not
+        // merely readable leftovers: mark/sweep must treat them exactly like any
+        // other block.
+        let mut roots = reused.clone();
+        roots.push(anchor);
+        store.force_collect_values(&roots);
+        for (i, &o) in reused.iter().enumerate() {
+            assert!(
+                store.find(o).is_some() && store.is_value_marked(o),
+                "reused cell #{i} survives a real collection after reactivation"
+            );
+            reads_to(&store, o, 1, RuntimeValue::from_i32(1000 + i as i32));
+        }
+    }
+
+    /// gc-r4 leak-fix C3, test (c) — SPLAY-STYLE CHURN keeps `committed_block_bytes`
+    /// OSCILLATING, not monotonic. Splay's actual workload (and pdfjs's) is exactly
+    /// this shape: grow a working set, drop it, grow a new one, repeat. Each round
+    /// here allocates a batch the same size as every other round; a working
+    /// decommit/shrink makes the POST-COLLECT resting size roughly the same round to
+    /// round (bounded by the still-rooted anchor's own block), while a monotonic
+    /// leak (the pre-fix C3 bug) would keep climbing with TOTAL historical
+    /// allocation across rounds.
+    #[test]
+    fn committed_block_bytes_oscillates_across_churn_rounds_not_monotonic() {
+        // MarkedBlock::blockSize (heap/MarkedBlock.h:80) — this crate's BLOCK_SIZE is
+        // private to gc::heap; the well-known 16KiB constant is hardcoded here (as
+        // elsewhere in this file's byte-budget tests) purely to size the round-over-
+        // round slack below, not as a load-bearing layout assumption.
+        const BLOCK_SIZE_BYTES: usize = 16 * 1024;
+
+        let mut store = CoreObjectStore::default();
+        let anchor = obj(&mut store);
+        store.force_collect_values(&[anchor]);
+
+        const ROUNDS: usize = 4;
+        const PER_ROUND: usize = 1500;
+        let mut after_collect: Vec<usize> = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            let before_round = store.space.committed_block_bytes();
+            for i in 0..PER_ROUND {
+                let o = obj(&mut store);
+                store
+                    .put_data_own(o, &ident(0), RuntimeValue::from_i32(i as i32))
+                    .unwrap();
+            }
+            let peak_this_round = store.space.committed_block_bytes();
+            assert!(
+                peak_this_round > before_round,
+                "round {round}: allocation actually grew the committed arena \
+                 (before {before_round}, peak {peak_this_round})"
+            );
+
+            // Only the anchor is rooted -> the whole round's population is dead.
+            store.force_collect_values(&[anchor]);
+            let after_this_round = store.space.committed_block_bytes();
+            assert!(
+                after_this_round < peak_this_round,
+                "round {round}: committed_block_bytes fell back down after \
+                 collecting (peak {peak_this_round}, after {after_this_round}) — \
+                 the OSCILLATION the churn contract requires"
+            );
+            after_collect.push(after_this_round);
+        }
+
+        // NOT MONOTONIC / UNBOUNDED: the post-collect resting size across rounds
+        // stays within a small, bounded band instead of climbing with the TOTAL
+        // historical allocation (ROUNDS * PER_ROUND objects were allocated in all,
+        // but the arena's resting size does not scale with that total — a working
+        // decommit makes round 4's resting size look like round 1's, not 4x it).
+        let min_after = *after_collect.iter().min().unwrap();
+        let max_after = *after_collect.iter().max().unwrap();
+        assert!(
+            max_after <= min_after + 4 * BLOCK_SIZE_BYTES,
+            "post-collect committed_block_bytes stayed bounded across churn rounds \
+             (min {min_after}, max {max_after}) instead of growing with total \
+             historical allocation: {after_collect:?}"
+        );
+
+        assert!(
+            store.find(anchor).is_some(),
+            "the rooted anchor survived every churn round"
         );
     }
 

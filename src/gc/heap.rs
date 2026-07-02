@@ -24,6 +24,10 @@ mod block_directory;
 mod free_list;
 mod marked_block;
 mod marked_space;
+// gc-r4 leak-fix C3: the OS-facing decommit/recommit primitive `BlockDirectory::
+// shrink` uses to return a COMPLETELY EMPTY block's pages to the OS (bmalloc
+// decommitAlignedPhysical/commitAlignedPhysical, VMAllocate.h; see the module doc).
+mod page_decommit;
 mod precise_allocation;
 // S4 collector Batch 2: the faithful SlotVisitor marking core (mark stack,
 // visitChildren edge walk, testAndSetMarked via the per-block mark bitmap,
