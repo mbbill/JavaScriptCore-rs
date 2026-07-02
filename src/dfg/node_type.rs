@@ -25,6 +25,8 @@ macro_rules! for_each_dfg_op {
             (JSConstant, NODE_RESULT_JS),
             // Constant with a specific representation (DFGNodeType.h:40).
             (DoubleConstant, NODE_RESULT_DOUBLE),
+            // The frame's callee (DFGNodeType.h:59).
+            (GetCallee, NODE_RESULT_JS),
             // Local variable access; MustGenerate because it is the only
             // evidence that another block read the local (DFGNodeType.h:74).
             (GetLocal, NODE_RESULT_JS | NODE_MUST_GENERATE),
@@ -45,6 +47,8 @@ macro_rules! for_each_dfg_op {
             (Phi, 0),
             // (DFGNodeType.h:92)
             (Flush, NODE_MUST_GENERATE),
+            // Liveness marker without a flush requirement (DFGNodeType.h:93).
+            (PhantomLocal, NODE_MUST_GENERATE),
             // Bytecode's preferred OSR point; must survive DCE
             // (DFGNodeType.h:100).
             (LoopHint, NODE_MUST_GENERATE),
@@ -95,8 +99,8 @@ macro_rules! define_node_type {
         /// (dfg/DFGNodeType.h:682-687); exact JSC names.
         ///
         /// CAUTION: the numeric discriminants are declaration order over this
-        /// 31-op SUBSET, not JSC's build-generated NodeType ids — never
-        /// serialize or compare the raw values across engines.
+        /// SUBSET, not JSC's build-generated NodeType ids — never serialize or
+        /// compare the raw values across engines.
         #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
         #[repr(u16)]
         pub enum NodeType {

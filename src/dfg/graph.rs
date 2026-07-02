@@ -7,7 +7,7 @@
 //! (a later unit) owns a mutable working graph and appends through the `&mut`
 //! APIs below, exactly as `ByteCodeParser` mutates `Graph&`.
 
-use crate::bytecode::{Operands, VirtualRegister};
+use crate::bytecode::{ConstantValue, Operands, VirtualRegister};
 use crate::dfg::node_flags::{
     NodeFlags, NODE_HAS_VAR_ARGS, NODE_MUST_GENERATE, NODE_RESULT_BOOLEAN, NODE_RESULT_DOUBLE,
     NODE_RESULT_INT32, NODE_RESULT_INT52, NODE_RESULT_JS, NODE_RESULT_MASK, NODE_RESULT_NUMBER,
@@ -103,6 +103,13 @@ pub enum NodeOriginKind {
 }
 
 /// Source and bytecode provenance for a DFG node.
+///
+/// Mirrors C++ `DFG::NodeOrigin` (dfg/DFGNodeOrigin.h:38). C++ carries TWO
+/// `CodeOrigin`s (`semantic` and `forExit`) because code motion can move a
+/// check away from its bytecode resume point; this descriptor keeps ONE
+/// `code_origin` (the SEMANTIC origin) until a code-motion phase needs the
+/// split — the bytecode parser never separates them except for delayed
+/// SetLocals, whose recorded semantic origin is what this field stores.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeOrigin {
     pub kind: NodeOriginKind,
@@ -111,6 +118,9 @@ pub struct NodeOrigin {
     pub executable: Option<ExecutableId>,
     pub bytecode_index: Option<u32>,
     pub inline_depth: u16,
+    /// `bool exitOK` (dfg/DFGNodeOrigin.h:124): whether OSR exit state was
+    /// intact when the node was emitted.
+    pub exit_ok: bool,
 }
 
 /// Effect summary used by planning and lowering contracts.
@@ -241,6 +251,12 @@ pub struct DfgNode {
     /// the pointer in `m_opInfo`.
     pub variable_access_data: Option<DfgVariableAccessDataId>,
     pub virtual_register: Option<VirtualRegister>,
+    /// `constant()` payload for JSConstant/DoubleConstant: C++ stores a
+    /// `FrozenValue*` in `m_opInfo` (DFGNode.h `hasConstant()`/`constant()`);
+    /// the safe-Rust descriptor carries the constant-pool value directly
+    /// (`ConstantValue` is the linked pool's value representation). Freezing/
+    /// weak-vs-strong marking is GC machinery that lands with the collector.
+    pub constant: Option<ConstantValue>,
     pub structure: Option<StructureId>,
     pub property: Option<AtomId>,
     pub property_offset: Option<PropertyOffset>,
@@ -262,6 +278,7 @@ impl DfgNode {
             effects: NodeEffects::default(),
             variable_access_data: None,
             virtual_register: None,
+            constant: None,
             structure: None,
             property: None,
             property_offset: None,
@@ -330,6 +347,28 @@ impl DfgNode {
     /// `hasStorageResult()` (dfg/DFGNode.h:1785-1788).
     pub const fn has_storage_result(&self) -> bool {
         self.result() == NODE_RESULT_STORAGE
+    }
+
+    /// `mergeFlags(NodeFlags)` (dfg/DFGNode.h:458-464): bitwise-or merge,
+    /// returning whether the flags changed.
+    pub fn merge_flags(&mut self, flags: NodeFlags) -> bool {
+        let merged = self.flags | flags;
+        let changed = merged != self.flags;
+        self.flags = merged;
+        changed
+    }
+
+    /// `isTerminal()` (dfg/DFGNode.h:1873-1892), restricted to the ported
+    /// `NodeType` subset (Switch/EntrySwitch/TailCall* are not declared yet).
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self.op,
+            NodeType::Jump
+                | NodeType::Branch
+                | NodeType::Return
+                | NodeType::Unreachable
+                | NodeType::Throw
+        )
     }
 
     /// `mustGenerate()` — `NodeMustGenerate` set (dfg/DFGNodeFlags.h:46).
@@ -735,6 +774,26 @@ impl DfgGraph {
 }
 
 impl DfgBasicBlock {
+    /// `BasicBlock::findTerminal()` (dfg/DFGBasicBlock.h:94-114): scan
+    /// backwards for the terminal, skipping the liveness-marking no-ops that
+    /// legally sit after it — "most notably return blocks will have liveness
+    /// markers for all of the flushed variables right after the return"
+    /// (dfg/DFGBasicBlock.h:87-90). C++ skips Check/CheckVarargs/Phantom/
+    /// PhantomLocal/Flush; the ported subset has no CheckVarargs yet.
+    pub fn find_terminal<'a>(&self, graph: &'a DfgGraph) -> Option<&'a DfgNode> {
+        for node_id in self.nodes.iter().rev() {
+            let node = graph.nodes.iter().find(|node| node.id == *node_id)?;
+            if node.is_terminal() || node.effects.terminates_block {
+                return Some(node);
+            }
+            match node.op {
+                NodeType::Check | NodeType::Phantom | NodeType::PhantomLocal | NodeType::Flush => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
     pub fn validate(&self, graph: &DfgGraph) -> Result<(), DfgValidationError> {
         for node in &self.nodes {
             if !graph.has_node(*node) {
@@ -758,12 +817,11 @@ impl DfgBasicBlock {
                 return Err(DfgValidationError::BlockBytecodeRangeInvalid(self.id));
             }
         }
+        // A block with no successors must end in a terminal, possibly followed
+        // by the liveness no-ops findTerminal skips (dfg/DFGBasicBlock.h:94-114).
         if self.successors.is_empty()
-            && self
-                .nodes
-                .last()
-                .and_then(|node_id| graph.nodes.iter().find(|node| node.id == *node_id))
-                .is_some_and(|node| !node.effects.terminates_block)
+            && !self.nodes.is_empty()
+            && self.find_terminal(graph).is_none()
         {
             return Err(DfgValidationError::TerminatorMismatch(self.id));
         }
@@ -925,6 +983,7 @@ const DFG_FTL_HANDOFF_PHASES: &[DfgPhase] = &[
 const DFG_CORE_NODE_TYPES: &[NodeType] = &[
     NodeType::JSConstant,
     NodeType::DoubleConstant,
+    NodeType::GetCallee,
     NodeType::GetLocal,
     NodeType::SetLocal,
     NodeType::MovHint,
@@ -934,6 +993,7 @@ const DFG_CORE_NODE_TYPES: &[NodeType] = &[
     NodeType::Upsilon,
     NodeType::Phi,
     NodeType::Flush,
+    NodeType::PhantomLocal,
     NodeType::LoopHint,
     NodeType::SetArgumentDefinitely,
     NodeType::ArithAdd,
@@ -1010,6 +1070,7 @@ mod tests {
             executable: None,
             bytecode_index: None,
             inline_depth: 0,
+            exit_ok: false,
         }
     }
 

@@ -7,6 +7,8 @@
 //! `variablesAtTail`, dfg/DFGBasicBlock.h:216-217); the Rust port uses
 //! `Operands<Option<DfgNodeId>>` there.
 
+use crate::bytecode::register::{ThisArgumentOffset, VirtualRegister};
+
 /// `Operands<T>` (bytecode/Operands.h:138).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Operands<T> {
@@ -112,6 +114,46 @@ impl<T> Operands<T> {
     }
 
     pub fn at_mut(&mut self, index: usize) -> &mut T {
+        &mut self.values[index]
+    }
+
+    /// `operandIndex(VirtualRegister)` (Operands.h:313-318): an argument
+    /// register maps through `argumentIndex(operand.toArgument())`, a local
+    /// through `localIndex(operand.toLocal())`.
+    ///
+    /// FRAME-LAYOUT ASSUMPTION: C++ `VirtualRegister::toArgument()` is
+    /// `offset() - CallFrame::thisArgumentOffset()` (VirtualRegister.h), where
+    /// `CallFrameSlot::thisArgument` is a global build constant (5 on JSVALUE64,
+    /// interpreter/CallFrame.h). The Rust register namespace keeps that offset
+    /// an explicit `ThisArgumentOffset` parameter (see register.rs), so the
+    /// caller passes it — the DFG parser passes
+    /// `CallFrameSlotLayout::JSC_RUST.this_argument_offset` (== 5, the JSC
+    /// layout). Constants and header slots below `this` are not operands and
+    /// panic here exactly where C++ ASSERTs.
+    pub fn operand_index(
+        &self,
+        register: VirtualRegister,
+        this_offset: ThisArgumentOffset,
+    ) -> usize {
+        if let Some(local) = register.to_local_index() {
+            return self.local_index(local as usize);
+        }
+        assert!(register.is_argument_or_header() && register.raw() >= this_offset.0);
+        self.argument_index((register.raw() - this_offset.0) as usize)
+    }
+
+    /// `operand(VirtualRegister)` (Operands.h:327-332) over the
+    /// `VirtualRegister` namespace (checkpoint tmps are not ported yet).
+    pub fn operand(&self, register: VirtualRegister, this_offset: ThisArgumentOffset) -> &T {
+        &self.values[self.operand_index(register, this_offset)]
+    }
+
+    pub fn operand_mut(
+        &mut self,
+        register: VirtualRegister,
+        this_offset: ThisArgumentOffset,
+    ) -> &mut T {
+        let index = self.operand_index(register, this_offset);
         &mut self.values[index]
     }
 }
