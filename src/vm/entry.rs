@@ -273,7 +273,7 @@ impl VmEntryState {
             kind,
             heap,
         };
-        self.records.push(VmEntryRecord {
+        let record = VmEntryRecord {
             ordinal,
             depth: self.entry_depth,
             entry_frame: self.entry_frame,
@@ -282,10 +282,12 @@ impl VmEntryState {
             top_frame,
             kind,
             root_scope,
-        });
+        };
+        self.records.push(record);
         VmEntryGuard {
             state: self,
             ordinal,
+            record,
             root_scope,
             previous_top_frame,
             previous_kind,
@@ -440,6 +442,22 @@ impl VmEntryState {
         })
     }
 
+    /// The live GC root set contributed by open VM entries.
+    ///
+    /// `records` and `storage_backed_entries` (and their `exits`/
+    /// `storage_backed_entry_exits` counterparts) are compacted at exit-close
+    /// time (see the `Drop` impls of `VmEntryGuard` / `VmStorageBackedEntryGuard`
+    /// above): a record is removed the instant its matching exit is produced,
+    /// so for those two the `!exits.any(ordinal match)` filter below is
+    /// normally vacuous (nothing to filter) and just guards against any future
+    /// producer that pushes a record without going through those `Drop` impls.
+    /// `stack_entry_publications`/`stack_entry_publication_exits` are NOT yet
+    /// compacted: `src/vm/arm64_native_entry/stack_entry_publication.rs` and
+    /// `src/vm/native_reentry/arm64_admission.rs` (frozen ARM64 native-entry
+    /// admission work) assert positional indices/lengths into those two vecs
+    /// across a full open-then-close cycle, so pruning them here would need to
+    /// touch that frozen subsystem's tests as a side effect of this leak fix;
+    /// left as a follow-up unit (same GC-root-leak shape as the other two).
     pub fn root_scopes(&self) -> impl Iterator<Item = VmEntryRootScope> + '_ {
         let legacy_scopes =
             self.records
@@ -694,10 +712,11 @@ impl Drop for VmStorageBackedEntryGuard<'_, '_> {
         self.state.entry_frame = self.previous_top_entry_frame;
         self.state.kind = self.previous_kind;
         self.state.disallow_user_observable_work = self.previous_disallow;
+        let ordinal = self.record.ordinal;
         self.state
             .storage_backed_entry_exits
             .push(VmStorageBackedEntryExitRecord {
-                ordinal: self.record.ordinal,
+                ordinal,
                 depth_before_exit,
                 restored_top_call_frame: self.state.top_frame,
                 restored_top_entry_frame: self.state.entry_frame,
@@ -705,6 +724,24 @@ impl Drop for VmStorageBackedEntryGuard<'_, '_> {
                 closed_entry: self.record,
                 closed_root_scope: self.root_scope,
             });
+        // Same JSC stack discipline as `VmEntryGuard::drop` above (see its
+        // comment: `runtime/VMEntryScope.{h,cpp}`, `interpreter/EntryFrame.h` --
+        // JSC's `EntryFrame`/`VMEntryRecord` pair lives on the native machine
+        // stack and is popped for free on return, no heap log). This guard's
+        // nesting is enforced LIFO by the borrow checker (`enter_storage_backed`
+        // only reachable through `&mut self` on the currently-innermost live
+        // guard), so the record this exit just closed is always resolvable by
+        // ordinal; prune the matched pair now instead of letting
+        // `root_scopes()` filter it out of `storage_backed_entries` forever.
+        // This also keeps the `.rev().find(depth, top_entry_frame)` scan in
+        // `publish_native_call_frame` cheap: it only ever needs the current,
+        // still-open entry, which pruning never removes.
+        self.state
+            .storage_backed_entries
+            .retain(|entry| entry.ordinal != ordinal);
+        self.state
+            .storage_backed_entry_exits
+            .retain(|exit| exit.ordinal != ordinal);
     }
 }
 
@@ -833,14 +870,32 @@ impl Drop for VmNativeCallFramePublicationGuard<'_, '_> {
     fn drop(&mut self) {
         let depth_before_exit = self.state.entry_depth;
         self.state.top_frame = self.previous_top_frame;
+        let ordinal = self.record.ordinal;
         self.state.native_call_frame_publication_exits.push(
             VmNativeCallFramePublicationExitRecord {
-                ordinal: self.record.ordinal,
+                ordinal,
                 depth_before_exit,
                 restored_top_frame: self.state.top_frame,
                 closed_publication: self.record,
             },
         );
+        // `native_call_frame_publications` holds no `root_scope` (no GC
+        // `RootRecord`; it is not read by `root_scopes()`), so unlike
+        // records/storage_backed_entries this is not a GC-root leak. It is
+        // still a divergence from JSC's `NativeCallFrameTracer`
+        // (interpreter/StackVisitor.h family) / `SlowPathFrameTracer`, which
+        // write-through `VM::topCallFrame` on entry and rely on the caller's
+        // saved value to restore it on return -- no publication log is kept.
+        // Prune the matched pair here for the same reason as the two guards
+        // above: once this exit exists, the publication contributes nothing
+        // further (only this file's tests ever read either vec), so retaining
+        // it would just accumulate unboundedly across native reentries.
+        self.state
+            .native_call_frame_publications
+            .retain(|publication| publication.ordinal != ordinal);
+        self.state
+            .native_call_frame_publication_exits
+            .retain(|exit| exit.ordinal != ordinal);
     }
 }
 
@@ -851,6 +906,13 @@ impl Drop for VmNativeCallFramePublicationGuard<'_, '_> {
 pub struct VmEntryGuard<'vm> {
     state: &'vm mut VmEntryState,
     ordinal: u64,
+    // Only read by tests today (mirrors the sibling guards' `record` fields,
+    // e.g. `VmStorageBackedEntryGuard::record`, all `#[allow(dead_code)]` for
+    // the same reason: `Vm::enter`/`enter_rooted` has no production caller
+    // yet -- see the `VmEntryState` doc comment above, "enter_rooted remains
+    // the legacy abstract interpreter path").
+    #[allow(dead_code)]
+    record: VmEntryRecord,
     root_scope: VmEntryRootScope,
     previous_top_frame: Option<FrameAddress>,
     previous_kind: Option<EntryKind>,
@@ -861,6 +923,11 @@ pub struct VmEntryGuard<'vm> {
 impl VmEntryGuard<'_> {
     pub fn top_frame(&self) -> Option<FrameAddress> {
         self.state.top_frame
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record(&self) -> VmEntryRecord {
+        self.record
     }
 }
 
@@ -874,13 +941,33 @@ impl Drop for VmEntryGuard<'_> {
         if self.state.entry_depth == 0 {
             self.state.entry_frame = None;
         }
+        let ordinal = self.ordinal;
         self.state.exits.push(VmExitRecord {
-            ordinal: self.ordinal,
+            ordinal,
             depth_before_exit: exit_depth,
             restored_top_frame: self.state.top_frame,
             restored_kind: self.state.kind,
             closed_root_scope: self.root_scope,
         });
+        // C++ JSC's `VMEntryScope` (runtime/VMEntryScope.{h,cpp}) is a pure
+        // RAII stack discipline: `VMEntryScope::~VMEntryScope` (VMEntryScope.cpp
+        // tearDownSlow, ~line 62) just clears `vm.entryScope` and restores the
+        // native call stack; it keeps no history/log of past entries. Rust's
+        // `records`/`exits` accumulate-then-filter shape (push every entry and
+        // exit forever, let `root_scopes()` filter matched pairs on every read)
+        // is a divergence: `records` entries embed a live GC `RootRecord`, so
+        // unbounded accumulation across VM re-entries is a standing GC-root
+        // leak, not just memory growth (see `root_scopes()` below). Once this
+        // entry's exit exists, the pair contributes nothing further to
+        // `root_scopes()`'s output by that filter's own definition, so prune
+        // both sides here instead of leaving them for every future scan to
+        // filter out. This restores the effective stack discipline: after a
+        // full unwind, `records`/`exits` are empty, exactly like JSC keeps no
+        // per-entry log at all.
+        self.state
+            .records
+            .retain(|record| record.ordinal != ordinal);
+        self.state.exits.retain(|exit| exit.ordinal != ordinal);
     }
 }
 
@@ -1424,18 +1511,24 @@ mod tests {
     fn legacy_entry_guard_records_abstract_entry_and_exit_restoration() {
         let mut state = VmEntryState::default();
         {
-            let _outer = state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
+            let outer = state.enter_rooted(Some(FrameAddress(10)), EntryKind::Script, HeapId(8));
+            let record = outer.record();
+            // Legacy Rust interpreter entry has not yet been moved onto
+            // JSC-shaped EntryFrame storage, so outer entry_frame still
+            // mirrors top_frame.
+            assert_eq!(record.entry_frame, Some(FrameAddress(10)));
+            assert_eq!(record.top_frame, Some(FrameAddress(10)));
+            assert_eq!(record.root_scope.heap, HeapId(8));
         }
 
+        // Matches JSC's `VMEntryScope` stack discipline (see the
+        // `VmEntryGuard::drop` comment): once closed, the entry/exit pair is
+        // pruned rather than retained, so both accumulator vecs return to
+        // empty instead of growing across VM re-entries.
         assert_eq!(state.entry_depth(), 0);
-        assert_eq!(state.records().len(), 1);
-        assert_eq!(state.exits().len(), 1);
-        // Legacy Rust interpreter entry has not yet been moved onto JSC-shaped
-        // EntryFrame storage, so outer entry_frame still mirrors top_frame.
-        assert_eq!(state.records()[0].entry_frame, Some(FrameAddress(10)));
-        assert_eq!(state.records()[0].top_frame, Some(FrameAddress(10)));
-        assert_eq!(state.records()[0].root_scope.heap, HeapId(8));
-        assert_eq!(state.exits()[0].restored_top_frame, None);
+        assert_eq!(state.top_frame(), None);
+        assert!(state.records().is_empty());
+        assert!(state.exits().is_empty());
         assert_eq!(state.root_scopes().count(), 0);
     }
 
@@ -1470,19 +1563,14 @@ mod tests {
             assert_eq!(record.root_scope.heap, HeapId(9));
         }
 
+        // Matches JSC's `EntryFrame`/`VMEntryRecord` stack discipline (see the
+        // `VmStorageBackedEntryGuard::drop` comment): the closed pair is
+        // pruned, not retained.
         assert_eq!(state.entry_depth(), 0);
         assert_eq!(state.top_frame(), None);
         assert_eq!(state.entry_frame(), None);
-        assert_eq!(state.storage_backed_entries().len(), 1);
-        assert_eq!(state.storage_backed_entry_exits().len(), 1);
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_call_frame,
-            None
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
-            None
-        );
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
         assert_eq!(state.root_scopes().count(), 0);
     }
 
@@ -1550,28 +1638,23 @@ mod tests {
             }
             assert_eq!(outer.top_call_frame(), Some(outer_top_call_frame));
             assert_eq!(outer.top_entry_frame(), Some(outer_top_entry_frame));
+            // Inner closed above (dropped at end of its block); its matching
+            // pair is pruned immediately (`VmStorageBackedEntryGuard::drop`),
+            // so only the still-open outer entry remains live here -- proves
+            // compaction of the inner pair does not disturb the outer's own
+            // root scope / restored state.
+            assert_eq!(outer.state.storage_backed_entries.len(), 1);
+            assert!(outer.state.storage_backed_entry_exits.is_empty());
+            assert_eq!(outer.state.root_scopes().count(), 1);
         }
 
+        // Matches JSC's `EntryFrame`/`VMEntryRecord` stack discipline (see the
+        // `VmStorageBackedEntryGuard::drop` comment): both nested pairs are
+        // pruned on their own close, so after full unwind nothing is retained.
         assert_eq!(state.top_frame(), None);
         assert_eq!(state.entry_frame(), None);
-        assert_eq!(state.storage_backed_entries().len(), 2);
-        assert_eq!(state.storage_backed_entry_exits().len(), 2);
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_call_frame,
-            Some(outer_top_call_frame)
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
-            Some(outer_top_entry_frame)
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[1].restored_top_call_frame,
-            None
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[1].restored_top_entry_frame,
-            None
-        );
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
     }
 
     #[test]
@@ -1750,24 +1833,20 @@ mod tests {
             assert_eq!(entry.top_entry_frame(), Some(top_entry_frame));
         }
 
+        // Matches JSC's `NativeCallFrameTracer`/`VMEntryRecord` stack
+        // discipline (see `VmNativeCallFramePublicationGuard::drop`): the
+        // publication's matched exit pair is pruned on close, and closing the
+        // storage-backed entry prunes its own pair too -- nothing survives a
+        // full unwind. Restoration itself was already proven above via
+        // `entry.top_call_frame()`/`top_entry_frame()` while `entry` was still
+        // live.
         assert_eq!(state.entry_depth(), 0);
         assert_eq!(state.top_frame(), None);
         assert_eq!(state.entry_frame(), None);
-        assert_eq!(state.native_call_frame_publications().len(), 1);
-        assert_eq!(state.native_call_frame_publication_exits().len(), 1);
-        assert_eq!(
-            state.native_call_frame_publication_exits()[0].restored_top_frame,
-            Some(entry_top_call_frame)
-        );
-        assert_eq!(state.storage_backed_entry_exits().len(), 1);
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_call_frame,
-            None
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
-            None
-        );
+        assert!(state.native_call_frame_publications().is_empty());
+        assert!(state.native_call_frame_publication_exits().is_empty());
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
     }
 
     #[test]
@@ -1832,26 +1911,17 @@ mod tests {
             assert_eq!(entry.top_entry_frame(), Some(top_entry_frame));
         }
 
+        // Both nested publications and the entry itself are pruned on their
+        // own close (see `VmNativeCallFramePublicationGuard::drop` /
+        // `VmStorageBackedEntryGuard::drop`); restoration order (inner, then
+        // outer, then the entry) was already proven above via the guards'
+        // own `top_frame()`/`record()` accessors while each was still live.
         assert_eq!(state.top_frame(), None);
         assert_eq!(state.entry_frame(), None);
-        assert_eq!(state.native_call_frame_publications().len(), 2);
-        assert_eq!(state.native_call_frame_publication_exits().len(), 2);
-        assert_eq!(
-            state.native_call_frame_publication_exits()[0].restored_top_frame,
-            Some(outer_address)
-        );
-        assert_eq!(
-            state.native_call_frame_publication_exits()[1].restored_top_frame,
-            Some(entry_top_call_frame)
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_call_frame,
-            None
-        );
-        assert_eq!(
-            state.storage_backed_entry_exits()[0].restored_top_entry_frame,
-            None
-        );
+        assert!(state.native_call_frame_publications().is_empty());
+        assert!(state.native_call_frame_publication_exits().is_empty());
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
     }
 
     #[test]
@@ -2028,7 +2098,15 @@ mod tests {
     }
 
     #[test]
-    fn native_call_frame_publication_exit_closes_matching_record_on_drop() {
+    fn native_call_frame_publication_exit_prunes_matching_record_on_drop() {
+        // C++ evidence: JSC's `VMEntryScope`/`EntryFrame` (see the
+        // `VmNativeCallFramePublicationGuard::drop` comment) keep no
+        // publication log at all -- restoring `VM::topCallFrame` on return is
+        // the entire observable effect. This test is the load-bearing
+        // regression for that: before this fix, both vecs below grew by one
+        // entry per publication and NEVER shrank back, across the life of the
+        // `VmEntryState` (see `native_call_frame_publications_do_not_accumulate_
+        // across_many_sequential_publications` for the N-iteration form).
         let owner = CodeBlockId(CellId(21));
         let mut entry_storage = JscEntryFrameStorage::default();
         let published_entry_frame =
@@ -2044,7 +2122,6 @@ mod tests {
             20,
         );
         let mut state = VmEntryState::default();
-        let publication_ordinal;
         {
             let mut entry = state
                 .enter_storage_backed(
@@ -2061,17 +2138,340 @@ mod tests {
                         published_top_frame,
                     ))
                     .expect("native call-frame publication");
-                publication_ordinal = publication.record().ordinal;
+                // The record exists and is well-formed while the publication
+                // is live -- this is where a real consumer would read it.
+                assert!(publication.record().ordinal > 0);
+                assert_eq!(publication.state.native_call_frame_publications.len(), 1);
             }
+            // Pruned the instant the publication guard dropped, without
+            // waiting for the entry itself to close.
+            assert!(entry.state.native_call_frame_publications.is_empty());
+            assert!(entry.state.native_call_frame_publication_exits.is_empty());
         }
 
-        let exits = state.native_call_frame_publication_exits();
-        assert_eq!(exits.len(), 1);
-        assert_eq!(exits[0].ordinal, publication_ordinal);
-        assert_eq!(
-            exits[0].closed_publication,
-            state.native_call_frame_publications()[0]
+        assert!(state.native_call_frame_publications().is_empty());
+        assert!(state.native_call_frame_publication_exits().is_empty());
+    }
+
+    // ---- Leak-fix regressions: `VmEntryState` vecs bounded by compaction ---
+    //
+    // C++ evidence: JSC's `VMEntryScope` (runtime/VMEntryScope.{h,cpp},
+    // VMEntryScopeInlines.h) and its `EntryFrame`/`VMEntryRecord` pair
+    // (interpreter/EntryFrame.h) are pure RAII: entries pop on scope exit and
+    // nothing is retained. Before this fix, `records`/`exits`,
+    // `storage_backed_entries`/`storage_backed_entry_exits`, and
+    // `native_call_frame_publications`/`native_call_frame_publication_exits`
+    // each grew by one entry per VM (re-)entry and NEVER shrank, for the
+    // lifetime of the `VmEntryState` -- an unbounded, GC-root-carrying leak
+    // (see `root_scopes()`'s doc comment). These tests are the load-bearing
+    // proof that compaction, not a naive cap, is what landed: capping would
+    // have silently dropped a still-live entry's `RootRecord`, which is a GC
+    // use-after-free, not just a memory-growth fix.
+
+    #[test]
+    fn legacy_vm_entries_do_not_accumulate_across_many_sequential_entries() {
+        let mut state = VmEntryState::default();
+        for i in 0..2_000usize {
+            let guard = state.enter_rooted(Some(FrameAddress(i)), EntryKind::Script, HeapId(1));
+            // Bounded while open too: the legacy path has no nested-entry
+            // API, so at most one record can ever be live at a time.
+            assert_eq!(guard.state.records().len(), 1);
+        }
+        assert_eq!(state.records().len(), 0);
+        assert_eq!(state.exits().len(), 0);
+    }
+
+    #[test]
+    fn storage_backed_entries_do_not_accumulate_across_many_sequential_entries() {
+        let mut state = VmEntryState::default();
+        for i in 0..500u32 {
+            let mut storage = JscEntryFrameStorage::default();
+            let entry_frame = published_entry_frame(
+                &mut storage,
+                EntryFrameId(1_000 + i),
+                None,
+                None,
+                None,
+                None,
+            );
+            let top_call_frame = distinct_top_call_frame(entry_frame.address(), 100 + i as usize);
+            let guard = state
+                .enter_storage_backed(top_call_frame, entry_frame, EntryKind::Script, HeapId(2))
+                .expect("storage-backed VM entry");
+            assert_eq!(guard.state.storage_backed_entries().len(), 1);
+        }
+        assert!(state.storage_backed_entries().is_empty());
+        assert!(state.storage_backed_entry_exits().is_empty());
+    }
+
+    #[test]
+    fn native_call_frame_publications_do_not_accumulate_across_many_sequential_publications() {
+        let owner = CodeBlockId(CellId(50));
+        let mut entry_storage = JscEntryFrameStorage::default();
+        let entry_frame =
+            published_entry_frame(&mut entry_storage, EntryFrameId(1), None, None, None, None);
+        let entry_top_call_frame = distinct_top_call_frame(entry_frame.address(), 300);
+        let mut state = VmEntryState::default();
+        let mut entry = state
+            .enter_storage_backed(
+                entry_top_call_frame,
+                entry_frame,
+                EntryKind::Script,
+                HeapId(3),
+            )
+            .expect("storage-backed VM entry");
+
+        for i in 0..500u32 {
+            let mut call_storage = JscCallFrameStorage::default();
+            let published_top_frame = published_top_call_frame(
+                &mut call_storage,
+                owner,
+                CallFrameId(2),
+                Some(EntryFrameId(1)),
+                20 + i as usize,
+            );
+            let publication = entry
+                .publish_native_call_frame(native_publication_request(owner, published_top_frame))
+                .expect("native call-frame publication");
+            assert_eq!(publication.state.native_call_frame_publications.len(), 1);
+        }
+
+        assert!(entry.state.native_call_frame_publications.is_empty());
+        assert!(entry.state.native_call_frame_publication_exits.is_empty());
+    }
+
+    #[test]
+    fn root_scopes_for_live_entries_are_unaffected_by_compaction_of_closed_pairs() {
+        // `root_scopes()` is the GC read path. Compacting matched pairs must
+        // not change its output for entries that are still open. Cover both
+        // orders in which a "closed, now-compacted" entry can coexist with a
+        // "still open" one:
+        //   (1) NESTED -- inner closes while outer stays open. This is the
+        //       only order the type-safe nested API allows: the borrow
+        //       checker enforces LIFO (an inner guard's lifetime is tied to
+        //       `&mut` the outer guard), so an outer cannot close first.
+        //   (2) SEQUENTIAL -- an earlier, unrelated entry closes completely
+        //       before a later, unrelated entry opens; no nesting at all.
+        let mut storage = JscEntryFrameStorage::default();
+        let outer_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(1),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let outer_top_entry_frame = storage
+            .entry_frame_address(outer_handle)
+            .expect("outer entry-frame address");
+        let outer_top_call_frame = distinct_top_call_frame(outer_top_entry_frame, 40);
+        let inner_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(2),
+            Some(EntryFrameId(1)),
+            Some(CallFrameId(7)),
+            Some(outer_top_call_frame),
+            Some(outer_top_entry_frame),
+        ));
+        let outer_entry_frame = storage
+            .published_entry_frame(outer_handle)
+            .expect("outer published entry frame");
+        let inner_entry_frame = storage
+            .published_entry_frame(inner_handle)
+            .expect("inner published entry frame");
+        let inner_top_call_frame = distinct_top_call_frame(inner_entry_frame.address(), 41);
+
+        // Order 1: nested, inner closes while outer stays live.
+        let mut state = VmEntryState::default();
+        {
+            let mut outer = state
+                .enter_storage_backed(
+                    outer_top_call_frame,
+                    outer_entry_frame,
+                    EntryKind::Script,
+                    HeapId(20),
+                )
+                .expect("outer storage-backed VM entry");
+            let outer_root_id = outer.record().root_scope.root.id;
+            {
+                let inner = outer
+                    .enter_storage_backed(
+                        inner_top_call_frame,
+                        inner_entry_frame,
+                        EntryKind::HostCall,
+                        HeapId(21),
+                    )
+                    .expect("inner storage-backed VM entry");
+                // Both live: root_scopes() sees both root ids.
+                let live: Vec<_> = inner
+                    .state
+                    .root_scopes()
+                    .map(|scope| scope.root.id)
+                    .collect();
+                assert_eq!(live.len(), 2);
+                assert!(live.contains(&outer_root_id));
+            }
+            // Inner closed (and its pair compacted); outer alone is live, with
+            // exactly the root scope it had before the inner ever opened.
+            let live: Vec<_> = outer
+                .state
+                .root_scopes()
+                .map(|scope| scope.root.id)
+                .collect();
+            assert_eq!(live, vec![outer_root_id]);
+        }
+        assert_eq!(state.root_scopes().count(), 0);
+
+        // Order 2: sequential, an earlier entry closes completely before a
+        // later (unrelated) entry opens.
+        let mut sequential_storage = JscEntryFrameStorage::default();
+        let first_entry_frame = published_entry_frame(
+            &mut sequential_storage,
+            EntryFrameId(3),
+            None,
+            None,
+            None,
+            None,
         );
+        let first_top_call_frame = distinct_top_call_frame(first_entry_frame.address(), 42);
+        {
+            let _first = state
+                .enter_storage_backed(
+                    first_top_call_frame,
+                    first_entry_frame,
+                    EntryKind::Script,
+                    HeapId(22),
+                )
+                .expect("first storage-backed VM entry");
+        }
+        // First entry fully closed and compacted before the second ever opens.
+        assert_eq!(state.root_scopes().count(), 0);
+
+        let second_entry_frame = published_entry_frame(
+            &mut sequential_storage,
+            EntryFrameId(4),
+            None,
+            None,
+            None,
+            None,
+        );
+        let second_top_call_frame = distinct_top_call_frame(second_entry_frame.address(), 43);
+        let second = state
+            .enter_storage_backed(
+                second_top_call_frame,
+                second_entry_frame,
+                EntryKind::Script,
+                HeapId(23),
+            )
+            .expect("second storage-backed VM entry");
+        let second_root_id = second.record().root_scope.root.id;
+        let live: Vec<_> = second
+            .state
+            .root_scopes()
+            .map(|scope| scope.root.id)
+            .collect();
+        assert_eq!(live, vec![second_root_id]);
+    }
+
+    #[test]
+    fn root_scope_for_live_nested_entries_survives_compaction_of_many_earlier_closed_entries() {
+        // Stand-in for "force a GC while nested entries are live": the actual
+        // collector is not yet wired to consult `root_scopes()` at all
+        // (`Vm::heap_snapshot_hook`, `src/vm/mod.rs`, has no production
+        // caller today -- the R4 GC is still pending) so there is no
+        // `Heap::collect()` to invoke from this file. What a real collector
+        // WOULD consult is exactly `root_scopes()`'s `RootRecord` output, so
+        // this proves that payload for still-open, nested entries is
+        // untouched by compacting thousands of earlier and interleaved,
+        // unrelated closed pairs -- the exact shape of bug a naive cap (as
+        // opposed to compaction) would introduce: evicting a live entry's
+        // `RootRecord` out from under it is a GC use-after-free.
+        let mut state = VmEntryState::default();
+
+        for i in 0..1_000u32 {
+            let _closed =
+                state.enter_rooted(Some(FrameAddress(i as usize)), EntryKind::Script, HeapId(9));
+        }
+        assert!(state.records().is_empty());
+
+        let mut storage = JscEntryFrameStorage::default();
+        let outer_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(9),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let outer_top_entry_frame = storage
+            .entry_frame_address(outer_handle)
+            .expect("outer entry-frame address");
+        let outer_top_call_frame = distinct_top_call_frame(outer_top_entry_frame, 90);
+        let inner_handle = storage.register_entry_frame(entry_registration(
+            EntryFrameId(10),
+            Some(EntryFrameId(9)),
+            Some(CallFrameId(70)),
+            Some(outer_top_call_frame),
+            Some(outer_top_entry_frame),
+        ));
+        let outer_entry_frame = storage
+            .published_entry_frame(outer_handle)
+            .expect("outer published entry frame");
+        let inner_entry_frame = storage
+            .published_entry_frame(inner_handle)
+            .expect("inner published entry frame");
+        let inner_top_entry_frame = inner_entry_frame.address();
+        let inner_top_call_frame = distinct_top_call_frame(inner_top_entry_frame, 91);
+
+        let mut outer = state
+            .enter_storage_backed(
+                outer_top_call_frame,
+                outer_entry_frame,
+                EntryKind::Script,
+                HeapId(30),
+            )
+            .expect("outer storage-backed VM entry");
+        let outer_root = outer.record().root_scope.root;
+
+        {
+            let mut inner = outer
+                .enter_storage_backed(
+                    inner_top_call_frame,
+                    inner_entry_frame,
+                    EntryKind::HostCall,
+                    HeapId(31),
+                )
+                .expect("inner storage-backed VM entry");
+            let inner_root = inner.record().root_scope.root;
+
+            // Interleave many further closed-and-compacted entries directly
+            // nested inside the still-open `inner` scope.
+            for i in 0..1_000u32 {
+                let mut scratch_storage = JscEntryFrameStorage::default();
+                let scratch = published_entry_frame(
+                    &mut scratch_storage,
+                    EntryFrameId(2_000 + i),
+                    Some(EntryFrameId(10)),
+                    Some(CallFrameId(80)),
+                    Some(inner_top_call_frame),
+                    Some(inner_top_entry_frame),
+                );
+                let scratch_top = distinct_top_call_frame(scratch.address(), 200 + i as usize);
+                let _scratch_guard = inner
+                    .enter_storage_backed(scratch_top, scratch, EntryKind::Script, HeapId(32))
+                    .expect("scratch storage-backed VM entry");
+            }
+
+            // The nested pair's root records are exactly what they were at
+            // open time, and both are still visible to the GC read path.
+            assert_eq!(inner.record().root_scope.root, inner_root);
+            let live: Vec<_> = inner.state.root_scopes().map(|scope| scope.root).collect();
+            assert_eq!(live.len(), 2);
+            assert!(live.contains(&outer_root));
+            assert!(live.contains(&inner_root));
+        }
+
+        // Inner closed; outer alone is live and unaffected.
+        assert_eq!(outer.record().root_scope.root, outer_root);
+        let live: Vec<_> = outer.state.root_scopes().map(|scope| scope.root).collect();
+        assert_eq!(live, vec![outer_root]);
     }
 
     #[test]
