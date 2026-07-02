@@ -6171,8 +6171,11 @@ impl DispatchHost for CoreOpcodeDispatchHost {
     /// sweeps under the STW window. THIS host additionally owns the global LEXICAL
     /// environment (`let`/`const`/`class`), a map the store cannot reach, so it
     /// contributes those cell values as `host_roots` (gc-r4.md R4b ROOT GAP #2 —
-    /// JSC's `JSGlobalLexicalEnvironment`, visited by `JSGlobalObject::visitChildren`).
-    /// See `CoreObjectStore::poll_collection_at_safepoint`.
+    /// JSC's `JSGlobalLexicalEnvironment`, visited by `JSGlobalObject::visitChildren`),
+    /// PLUS every cell-valued constant in its live linked CodeBlocks' constant pools
+    /// (the `CodeBlock::visitChildren` constants analog — see
+    /// `gather_code_block_constant_roots`). See
+    /// `CoreObjectStore::poll_collection_at_safepoint`.
     fn poll_gc_collection_safepoint(
         &mut self,
         registers: &RegisterFile,
@@ -6180,7 +6183,8 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         exceptions: &ExceptionState,
         heap: &mut Heap,
     ) {
-        let host_roots = self.gather_global_lexical_roots();
+        let mut host_roots = self.gather_global_lexical_roots();
+        host_roots.extend(self.gather_code_block_constant_roots());
         let collected = self.objects.poll_collection_at_safepoint(
             registers,
             stack,
@@ -9447,6 +9451,65 @@ impl CoreOpcodeDispatchHost {
                     .map(|cell| cell.pointer_payload_bits())
             })
             .collect()
+    }
+
+    /// gc-r4 — CodeBlock CONSTANT-POOL roots (the `CodeBlock::visitChildren`
+    /// constants analog).
+    ///
+    /// C++ JSC divergence (ratified): in C++ JSC a CodeBlock IS a GC cell, so the
+    /// marker traces every constant slot through `CodeBlock::visitChildren` ->
+    /// `stronglyVisitStrongReferences`, whose constant-visiting loop is
+    /// `visitor.appendValues(m_constantRegisters.span().data(),
+    /// m_constantRegisters.size())` (bytecode/CodeBlock.cpp:1196-1214 + 1942,1951).
+    /// Rust CodeBlocks are NON-arena (`Rc<CodeBlock>` shared by the VM registry and
+    /// this host — gc-r4.md:307), so no cell trace ever reaches them; instead every
+    /// live CodeBlock acts as a ROOT PROVIDER: this host owns the interpreter's live
+    /// linked set (`function_blocks`, the same `Rc` instances the registry holds), and
+    /// at the collection safepoint it roots every cell-valued
+    /// `LinkedConstantPool` constant STRONGLY. This is equivalent to C++'s
+    /// visitChildren tracing for constants while the CodeBlock itself is not a cell.
+    /// Without it, a folded cell constant (e.g. a string) held ONLY by a pool — in no
+    /// register/stack slot — is swept and the next constant read is a UAF.
+    ///
+    /// COVERAGE deliberately NOT claimed (the rest of stronglyVisitStrongReferences,
+    /// CodeBlock.cpp:1942-1977): m_globalObject/m_ownerExecutable/m_unlinkedCode
+    /// (:1946-1948; Rust holds ids/`Arc`, not arena cells), the rare-data
+    /// direct-eval cache (:1949-1950), m_functionExprs/m_functionDecls (:1952-1955;
+    /// Rust `LinkedFunctionRef` is a positional `u32` handle with NO cell payload —
+    /// nothing to root yet), object-allocation profiles (:1956-1958) and the IC/DFG
+    /// aggregates (:1960-1974) — none of those Rust slots hold arena cells today.
+    /// Value/arith-profile buckets are deliberately NOT rooted, matching JSC: profile
+    /// buckets hold raw `EncodedJSValue` bits and stronglyVisitStrongReferences never
+    /// visits them (bytecode/ValueProfile.h has no visitAggregate/visitChildren).
+    ///
+    /// Known gap (accepted by the ratified decision — "the interpreter's live set is
+    /// enough"): the program/eval ENTRY CodeBlock is Vm-owned (`Vm::code_blocks`
+    /// registry + `SourceSessionExecutableEntry`), unreachable from this host; its
+    /// pool carries no cell-valued constants today (the bytecode generator emits
+    /// primitives/handles; string constants materialize into registers via
+    /// LoadString), so enumerating Vm-side blocks is the follow-up for when they can.
+    fn gather_code_block_constant_roots(&self) -> Vec<usize> {
+        let mut roots = Vec::new();
+        let mut gather_pool = |code_block: &CodeBlock| {
+            for constant in &code_block.constants().constants {
+                // The same cell-ness test as every other gathered source: only a
+                // cell-tagged value contributes an address; primitives, the EMPTY
+                // encoding, and Deferred/LinkTime handles drop out. The marker's
+                // membership gate rejects any non-arena payload without a deref.
+                if let ConstantValue::Encoded(value) = constant.value {
+                    if let Some(cell) = value.as_cell() {
+                        roots.push(cell.pointer_payload_bits());
+                    }
+                }
+            }
+        };
+        for entry in &self.function_blocks {
+            gather_pool(&entry.code_block);
+            if let Some(construct_code_block) = &entry.construct_code_block {
+                gather_pool(construct_code_block);
+            }
+        }
+        roots
     }
 
     /// gc-r4 GAP C (A1.5): bracket a baseline-JIT image's execution — push its
@@ -25565,6 +25628,140 @@ mod tests {
             host.read_global_lexical("C").ok(),
             Some(ctor),
             "the binding still resolves to the same live constructor"
+        );
+    }
+
+    /// gc-r4 CodeBlock constant-pool UAF regression — a folded STRING constant held
+    /// ONLY by a live linked CodeBlock's `LinkedConstantPool` (in NO register / stack
+    /// slot / lexical binding) must survive collection and read back intact. C++ JSC
+    /// traces every `m_constantRegisters` slot via `CodeBlock::visitChildren` ->
+    /// `stronglyVisitStrongReferences` (`visitor.appendValues(...)`,
+    /// bytecode/CodeBlock.cpp:1951); Rust's non-arena CodeBlocks provide the same
+    /// roots through `gather_code_block_constant_roots`. Two rounds so the
+    /// newly-allocated protection of collection #1 cannot mask a missing root.
+    #[test]
+    fn code_block_pool_string_constant_survives_collection_without_register_reference() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        // The folded string constant: a live arena string cell referenced ONLY by
+        // the linked pool built below.
+        let folded = host
+            .strings
+            .allocate_untracked(&mut host.objects, "folded-constant");
+        let mut constants = UnlinkedConstantPool::default();
+        constants.constants.push(UnlinkedConstant {
+            register: VirtualRegister::constant(0),
+            value: ConstantValue::Encoded(folded),
+            source_representation: SourceCodeRepresentation::StringLiteral,
+        });
+        let block = raw_code_block_with_constants(Vec::new(), constants);
+        host.append_function_code_blocks_strings_and_prototype_key(
+            vec![InterpreterFunctionCodeBlock::new(
+                CodeBlockId(CellId(1)),
+                block,
+            )],
+            HashMap::new(),
+            HashMap::new(),
+            None,
+        );
+
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        for round in 0..2 {
+            // Arm the trigger with an unrooted dead island (no explicit force_collect).
+            let mut guard = 0usize;
+            while !host.objects.space.collection_request_armed() {
+                let o = host.objects.allocate();
+                host.objects
+                    .put_data_own(
+                        o,
+                        &CorePropertyKey::Identifier(0),
+                        RuntimeValue::from_i32(7),
+                    )
+                    .unwrap();
+                guard += 1;
+                assert!(
+                    guard < 100_000,
+                    "the byte-counter trigger arms within a bound"
+                );
+            }
+            host.poll_gc_collection_safepoint(&registers, &stack, &exceptions, &mut heap);
+            assert!(
+                host.objects.is_value_marked(folded),
+                "round {round}: the pool-held string constant is reachable from a gathered root"
+            );
+            assert_eq!(
+                host.strings.text(folded),
+                Some("folded-constant"),
+                "round {round}: the pool-held string constant reads back intact (the UAF read)"
+            );
+        }
+    }
+
+    /// gc-r4 CodeBlock constant-pool rooting is not OVER-rooting — an unreferenced
+    /// string in NO pool / register / stack slot is still reclaimed by the same
+    /// collection that keeps the pool-held constant alive (matching JSC: only
+    /// `m_constantRegisters` slots are visited, CodeBlock.cpp:1951, not every string).
+    #[test]
+    fn unreferenced_string_outside_any_constant_pool_is_still_reclaimed() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let kept = host
+            .strings
+            .allocate_untracked(&mut host.objects, "pool-kept");
+        let dead = host
+            .strings
+            .allocate_untracked(&mut host.objects, "unreferenced-garbage");
+        // Only `kept` goes into a linked pool; `dead` is referenced by nothing.
+        let mut constants = UnlinkedConstantPool::default();
+        constants.constants.push(UnlinkedConstant {
+            register: VirtualRegister::constant(0),
+            value: ConstantValue::Encoded(kept),
+            source_representation: SourceCodeRepresentation::StringLiteral,
+        });
+        let block = raw_code_block_with_constants(Vec::new(), constants);
+        host.append_function_code_blocks_strings_and_prototype_key(
+            vec![InterpreterFunctionCodeBlock::new(
+                CodeBlockId(CellId(1)),
+                block,
+            )],
+            HashMap::new(),
+            HashMap::new(),
+            None,
+        );
+
+        let registers = RegisterFile::default();
+        let stack = ExecutionContextStack::default();
+        let exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+
+        let mut guard = 0usize;
+        while !host.objects.space.collection_request_armed() {
+            let o = host.objects.allocate();
+            host.objects
+                .put_data_own(
+                    o,
+                    &CorePropertyKey::Identifier(0),
+                    RuntimeValue::from_i32(7),
+                )
+                .unwrap();
+            guard += 1;
+            assert!(
+                guard < 100_000,
+                "the byte-counter trigger arms within a bound"
+            );
+        }
+        host.poll_gc_collection_safepoint(&registers, &stack, &exceptions, &mut heap);
+        assert_eq!(
+            host.strings.text(kept),
+            Some("pool-kept"),
+            "the pool-held constant survives"
+        );
+        assert_eq!(
+            host.strings.text(dead),
+            None,
+            "the unreferenced string is swept + its StringImpl slot reconciled (no over-rooting)"
         );
     }
 

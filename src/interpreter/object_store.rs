@@ -3329,10 +3329,14 @@ impl CoreObjectStore {
     ///  - EXCEPTIONS: pending / last / unwind values (`ExceptionState::root_descriptors`).
     ///  - JIT_PENDING (#3): the `VM::m_exception` mirror word, which `root_descriptors` omits.
     ///  - HOST ROOTS (#2): `host_roots` carries roots the HOST owns but the store cannot
-    ///    reach — today the global LEXICAL environment (`let`/`const`/`class` binding cell
-    ///    values, a host-side map that is JSC's `JSGlobalLexicalEnvironment` analog). The
-    ///    driver (`poll_collection_at_safepoint`) folds them in; the host wrapper supplies
-    ///    them (`CoreOpcodeDispatchHost::gather_global_lexical_roots`).
+    ///    reach — the global LEXICAL environment (`let`/`const`/`class` binding cell
+    ///    values, a host-side map that is JSC's `JSGlobalLexicalEnvironment` analog) and
+    ///    every cell-valued CONSTANT in the host's live linked CodeBlock pools (the
+    ///    `CodeBlock::visitChildren` constants analog, CodeBlock.cpp:1951 — non-arena
+    ///    CodeBlocks act as root providers). The driver (`poll_collection_at_safepoint`)
+    ///    folds them in; the host wrapper supplies them
+    ///    (`CoreOpcodeDispatchHost::gather_global_lexical_roots` +
+    ///    `gather_code_block_constant_roots`).
     ///
     /// INVESTIGATED, NOT gathered (gc-r4.md R4b #4): the microtask/promise JOB QUEUE
     /// (`runtime/jobs.rs`) is design-stage — no live instance is owned by the `Vm`/host/realm,
