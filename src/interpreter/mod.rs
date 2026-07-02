@@ -13738,6 +13738,10 @@ impl CoreOpcodeDispatchHost {
             | CoreNativeFunction::Float64ArrayConstructor => {
                 let kind =
                     typed_array_constructor_kind(native).unwrap_or(TypedArrayElementKind::Uint8);
+                // leak-fix C2: `new Uint8Array(N)` (Form A) allocates an N-byte
+                // ArrayBuffer + view eagerly; Forms B/C copy an arbitrary-length
+                // source. One native call, no bytecode back-edge.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_typed_array_constructor(state.heap, kind, arguments)
             }
             CoreNativeFunction::DataViewConstructor => {
@@ -15149,6 +15153,67 @@ impl CoreOpcodeDispatchHost {
         }
     }
 
+    /// leak-fix C2 (gc-r4 R4b live driver) — poll the cooperative collection
+    /// safepoint at the ENTRY of an allocation-heavy native builtin, before that
+    /// builtin does ANY work. C++ JSC triggers a deferred collection AT
+    /// ALLOCATION TIME from inside the block allocator's own slow path
+    /// (`LocalAllocator::allocateSlowCase`, heap/LocalAllocator.cpp:112-126: every
+    /// refill calls `heap.collectIfNecessaryOrDefer(deferralContext)`, defined at
+    /// heap/Heap.cpp:2852 and driven by the `m_bytesAllocatedThisCycle`-style
+    /// counter this port mirrors as `bytes_allocated_this_cycle`/
+    /// `collection_request_armed`, marked_space.rs:326-347), so EVERY JSC
+    /// allocation -- not just a bytecode loop back-edge -- can service a
+    /// pending collection. This Rust engine's LLInt-analog loop instead polls
+    /// only at VM-entry / loop back-edges (`execute_code_block_with_resume`,
+    /// mod.rs:24982; `poll_gc_collection_safepoint_on_backedge`, mod.rs:25616)
+    /// plus the VM re-entry boundary (vm/mod.rs:1723,1866), so a native builtin
+    /// whose OWN Rust loop allocates heavily WITHOUT ever executing a JS
+    /// bytecode back-edge (`Array`/typed-array builders, `JSON.parse`/
+    /// `stringify`, `String.prototype.split`/`match`/`replace`, ...) can arm
+    /// the trigger and never clear it (leak-fix C2).
+    ///
+    /// PLACEMENT: called at the CALL BOUNDARY, before the targeted native_*
+    /// helper's body runs -- no cell `&mut`/`&` borrow is live yet at this
+    /// point in `call_native_function`/`construct_native_function` (only the
+    /// call site itself), satisfying Decision 5 (`MarkedSpace::
+    /// collection_request_armed` doc, marked_space.rs:330-331: "NEVER collect
+    /// inline in `allocate_blob` -- that would collect re-entrantly while a
+    /// cell `&mut`/`&` is live"). `this_value`/`arguments` were loaded from
+    /// already-rooted registers by the caller and nothing new has been
+    /// allocated for THIS call yet, so the safepoint's register/frame root
+    /// gather (`CoreObjectStore::gather_all_gc_roots`) sees a root set as
+    /// complete as any other DeferToVm poll point.
+    ///
+    /// GATE: only in the VM-driven `DeferToVm` activation, exactly like every
+    /// other live-driver poll site (`DispatchHost::poll_gc_collection_safepoint`
+    /// doc, vm/mod.rs:1715-1730). A `DirectInterpreter` reentry (a native
+    /// builtin calling back into JS, e.g. a comparator or replacer callback)
+    /// holds Rust locals the precise root set does NOT cover (GAP C,
+    /// native-stack conservative scan, DEFERRED per the
+    /// `poll_collection_at_safepoint` doc, object_store.rs:4160-4166); this
+    /// poll leaves that suppression untouched -- it only ADDS entry polls at
+    /// the SAME `DeferToVm` condition the back-edge poll already requires.
+    ///
+    /// CHEAP WHEN UNARMED: `collection_request_armed()` is a plain `bool`
+    /// field read (marked_space.rs:520-522) checked BEFORE calling into
+    /// `poll_gc_collection_safepoint`, which otherwise unconditionally gathers
+    /// host roots (global-lexical + code-block constants + symbol roots,
+    /// mod.rs:6228-6249) even when disarmed.
+    fn poll_gc_collection_before_allocation_heavy_native(&mut self, state: &mut DispatchState<'_>) {
+        if state.ordinary_bytecode_call_handling != OrdinaryBytecodeCallHandling::DeferToVm {
+            return;
+        }
+        if !self.objects.space.collection_request_armed() {
+            return;
+        }
+        self.poll_gc_collection_safepoint(
+            state.registers,
+            state.stack,
+            state.exceptions,
+            state.heap,
+        );
+    }
+
     fn call_native_function(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -15214,6 +15279,11 @@ impl CoreOpcodeDispatchHost {
                 self.native_global_eval(state, arguments, function_value_completion)
             }
             CoreNativeFunction::ArrayConstructor => {
+                // leak-fix C2: `new Array(N)` (routed here via
+                // construct_native_function's ArrayConstructor => call_native_function
+                // forward) eagerly resizes the butterfly to N -- an allocation-heavy
+                // single native call with no bytecode back-edge.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_array_constructor(state.heap, arguments)
             }
             CoreNativeFunction::ArrayIsArray => Ok(RuntimeValue::from_bool(
@@ -15221,7 +15291,12 @@ impl CoreOpcodeDispatchHost {
                     .first()
                     .is_some_and(|value| self.objects.is_array(*value)),
             )),
-            CoreNativeFunction::ArrayFrom => self.native_array_from(state.heap, arguments),
+            CoreNativeFunction::ArrayFrom => {
+                // leak-fix C2: iterates an arbitrary-length iterable/array-like in one
+                // native call (no bytecode back-edge between elements).
+                self.poll_gc_collection_before_allocation_heavy_native(state);
+                self.native_array_from(state.heap, arguments)
+            }
             CoreNativeFunction::ArrayOf => self.native_array_of(state.heap, arguments),
             CoreNativeFunction::MathAbs => self.native_math_abs(arguments),
             CoreNativeFunction::MathFloor => self.native_math_floor(arguments),
@@ -15295,8 +15370,18 @@ impl CoreOpcodeDispatchHost {
             CoreNativeFunction::HostReadFile => self.native_host_read_file(state.heap, arguments),
             CoreNativeFunction::HostCurrentResolve => self.native_host_current_resolve(arguments),
             CoreNativeFunction::HostCurrentReject => Ok(self.native_host_current_reject(arguments)),
-            CoreNativeFunction::JsonParse => self.native_json_parse(state.heap, arguments),
-            CoreNativeFunction::JsonStringify => self.native_json_stringify(state, arguments),
+            CoreNativeFunction::JsonParse => {
+                // leak-fix C2: JsonParser::parse builds an arbitrarily large cell tree
+                // in one native call (no bytecode back-edge inside the parser).
+                self.poll_gc_collection_before_allocation_heavy_native(state);
+                self.native_json_parse(state.heap, arguments)
+            }
+            CoreNativeFunction::JsonStringify => {
+                // leak-fix C2: recursively serializes an arbitrarily large object graph
+                // (string-building allocations) in one native call.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
+                self.native_json_stringify(state, arguments)
+            }
             CoreNativeFunction::ReflectApply => {
                 self.native_reflect_apply(state, arguments, function_value_completion)
             }
@@ -15407,6 +15492,9 @@ impl CoreOpcodeDispatchHost {
                 self.native_regexp_test(state.heap, this_value, arguments)
             }
             CoreNativeFunction::RegExpExec => {
+                // leak-fix C2: allocates a result array + N capture-group strings per
+                // call; named explicitly in the C2 audit's target set.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_regexp_exec(state.heap, this_value, arguments)
             }
             CoreNativeFunction::RegExpPrototypeToString => {
@@ -15533,12 +15621,20 @@ impl CoreOpcodeDispatchHost {
                 self.native_uint8_array_buffer(state.heap, this_value)
             }
             CoreNativeFunction::Uint8ArrayFill => {
+                // leak-fix C2: fills an arbitrary-length view range in one native call;
+                // explicitly named in the C2 audit's typed-array target set.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_uint8_array_fill(state.heap, this_value, arguments)
             }
             CoreNativeFunction::Uint8ArraySet => {
+                // leak-fix C2: copies an arbitrary-length source view/array-like.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_uint8_array_set(state.heap, this_value, arguments)
             }
             CoreNativeFunction::Uint8ArraySubarray => {
+                // leak-fix C2: allocates one new typed-array view; low weight per call
+                // but named in the audit's "typed-array...slice" target set.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_uint8_array_subarray(state.heap, this_value, arguments)
             }
             CoreNativeFunction::DataViewConstructor => Err(self
@@ -15604,15 +15700,27 @@ impl CoreOpcodeDispatchHost {
                 self.native_array_join(state.heap, this_value, &[])
             }
             CoreNativeFunction::ArraySlice => {
+                // leak-fix C2: copies an arbitrary-length range into a fresh array.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_array_slice(state.heap, this_value, arguments)
             }
             CoreNativeFunction::ArrayConcat => {
+                // leak-fix C2: concatenates possibly-large arrays into one result.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_array_concat(state, this_value, arguments)
             }
-            CoreNativeFunction::ArrayFill => self.native_array_fill(state, this_value, arguments),
+            CoreNativeFunction::ArrayFill => {
+                // leak-fix C2: writes a value across an arbitrary-length range via
+                // per-index property stores (butterfly growth).
+                self.poll_gc_collection_before_allocation_heavy_native(state);
+                self.native_array_fill(state, this_value, arguments)
+            }
             CoreNativeFunction::ArrayReverse => self.native_array_reverse(state, this_value),
             CoreNativeFunction::ArraySort => self.native_array_sort(state, this_value, arguments),
             CoreNativeFunction::ArraySplice => {
+                // leak-fix C2: allocates the removed-elements array and shifts the
+                // remainder, both O(length) in one native call.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_array_splice(state, this_value, arguments)
             }
             CoreNativeFunction::ArrayIndexOf => self.native_array_index_of(this_value, arguments),
@@ -15656,12 +15764,24 @@ impl CoreOpcodeDispatchHost {
                 self.native_string_substr(state.heap, this_value, arguments)
             }
             CoreNativeFunction::StringSplit => {
+                // leak-fix C2: the plain-separator AND regexp-separator loops
+                // (native_string_split / native_string_split_regexp) allocate one
+                // string cell per part in a single native call with no back-edge.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_string_split(state.heap, this_value, arguments)
             }
             CoreNativeFunction::StringReplace => {
+                // leak-fix C2: a global-regexp replace loops internally, building the
+                // result string (and, with a function replacer, re-entering JS per
+                // match -- that reentry keeps the existing DirectInterpreter
+                // suppression; this poll only guards entry to the call itself).
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_string_replace(state, this_value, arguments)
             }
             CoreNativeFunction::StringMatch => {
+                // leak-fix C2: the global-flag path loops collecting every match's
+                // substring into an array -- one string cell per match, no back-edge.
+                self.poll_gc_collection_before_allocation_heavy_native(state);
                 self.native_string_match(state.heap, this_value, arguments)
             }
             CoreNativeFunction::StringToLowerCase => {
@@ -26035,6 +26155,194 @@ mod tests {
         assert!(
             host.objects.find(result).is_none(),
             "under DeferToVm the unrooted result is swept (the suppression is load-bearing)"
+        );
+    }
+
+    /// leak-fix C2 — an allocation-heavy native builtin invoked with NO intervening
+    /// JS bytecode back-edge (the C2 leak scenario: typed-array/array/string/JSON
+    /// builders run as a single native call, so the interpreter's own back-edge /
+    /// VM-entry safepoints, interpreter/mod.rs:24982 and :25616, never fire inside
+    /// them) must still service an ALREADY-armed deferred collection at its own
+    /// call boundary (`poll_gc_collection_before_allocation_heavy_native`, called
+    /// from the `ArrayConstructor` arm of `call_native_function`). Before this
+    /// batch `call_native_function` never polled the trigger, so the unrooted dead
+    /// island armed below would have stayed alive indefinitely (this test FAILS
+    /// without the new poll site: `collection_request_armed()` would still be
+    /// `true` and `dead` would still be found).
+    #[test]
+    fn allocation_heavy_native_builtin_entry_services_armed_collection_without_js_backedge() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        // Arm the trigger with an unrooted dead island via PURE native allocation --
+        // no bytecode executes here, matching the "no JS back-edge" leak scenario.
+        let dead = host.objects.allocate();
+        let mut guard = 0usize;
+        while !host.objects.space.collection_request_armed() {
+            let o = host.objects.allocate();
+            host.objects
+                .put_data_own(
+                    o,
+                    &CorePropertyKey::Identifier(0),
+                    RuntimeValue::from_i32(7),
+                )
+                .unwrap();
+            guard += 1;
+            assert!(
+                guard < 100_000,
+                "the byte-counter trigger arms within a bound"
+            );
+        }
+        assert!(
+            host.objects.find(dead).is_some(),
+            "precondition: the dead island is still live before the native call"
+        );
+        let armed_live_count = host.objects.live_object_cell_count();
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let code_block = raw_code_block_with_constants(Vec::new(), UnlinkedConstantPool::default());
+        let mut state = dispatch_state(
+            &mut stack,
+            &mut registers,
+            &mut exceptions,
+            &mut heap,
+            &code_block,
+        );
+        // The VM-driven activation: root gathering (registers/frames/exceptions) is
+        // complete here, matching every other DeferToVm poll site.
+        state.ordinary_bytecode_call_handling = OrdinaryBytecodeCallHandling::DeferToVm;
+        state.function_value_call_handling = FunctionValueCallHandling::DeferToVm;
+
+        // `new Array(4)` (routed through call_native_function's ArrayConstructor
+        // arm, which forwards from construct_native_function): a single native call
+        // that eagerly resizes the butterfly, with no bytecode back-edge inside it.
+        let arguments = [RuntimeValue::from_i32(4)];
+        let result = host.call_native_function(
+            &mut state,
+            RuntimeValue::undefined(),
+            CoreNativeFunction::ArrayConstructor,
+            RuntimeValue::undefined(),
+            &arguments,
+            None,
+        );
+        assert!(result.is_ok(), "ArrayConstructor(4) succeeds: {result:?}");
+        assert!(
+            !host.objects.space.collection_request_armed(),
+            "the native-builtin entry poll serviced the armed collection at the call boundary"
+        );
+        // R4b-sweep style proof (mirrors `live_object_cell_count`'s doc: "after a
+        // collection frees an unrooted island it returns to baseline, proving
+        // reclamation"): the call itself allocates exactly ONE new array cell, so if
+        // no collection ran the live count could only go UP from `armed_live_count`.
+        // It going DOWN proves the dead island (and the arming loop's other unrooted
+        // cells) were actually reclaimed at this call boundary. (A raw address
+        // re-check on `dead` is not used here: the freed slot can be reused by the
+        // new array cell allocated moments later in the SAME call, which would give
+        // a false "still live" via address membership alone --
+        // `CoreObjectStore::find` is address-based, not identity-based.)
+        assert!(
+            host.objects.live_object_cell_count() < armed_live_count,
+            "the call-boundary collection reclaimed the unrooted arming cells \
+             (live before call: {armed_live_count}, live after: {}), \
+             even though no JS bytecode back-edge ran between arming and this call",
+            host.objects.live_object_cell_count()
+        );
+    }
+
+    /// leak-fix C2 — the new native-builtin entry poll must respect the SAME
+    /// `DirectInterpreter` suppression as the existing back-edge poll (Decision 6 /
+    /// GAP C, mod.rs doc on `poll_gc_collection_before_allocation_heavy_native`):
+    /// a native builtin re-entered while the VM does NOT own re-entrancy (e.g. a
+    /// nested call from within another builtin's callback) must NOT collect,
+    /// because Rust locals up that native call chain are not root-covered. Sibling
+    /// of `direct_interpreter_callback_suppresses_collection_poll` at the
+    /// native-builtin-entry poll site instead of the bytecode back-edge site.
+    #[test]
+    fn allocation_heavy_native_entry_poll_respects_direct_interpreter_suppression() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let unrooted = host.objects.allocate();
+        let mut guard = 0usize;
+        while !host.objects.space.collection_request_armed() {
+            let o = host.objects.allocate();
+            host.objects
+                .put_data_own(
+                    o,
+                    &CorePropertyKey::Identifier(0),
+                    RuntimeValue::from_i32(7),
+                )
+                .unwrap();
+            guard += 1;
+            assert!(
+                guard < 100_000,
+                "the byte-counter trigger arms within a bound"
+            );
+        }
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let code_block = raw_code_block_with_constants(Vec::new(), UnlinkedConstantPool::default());
+        // `dispatch_state` defaults to DirectInterpreter (see its definition).
+        let mut state = dispatch_state(
+            &mut stack,
+            &mut registers,
+            &mut exceptions,
+            &mut heap,
+            &code_block,
+        );
+
+        host.poll_gc_collection_before_allocation_heavy_native(&mut state);
+
+        assert!(
+            host.objects.space.collection_request_armed(),
+            "DirectInterpreter native-builtin entry does NOT collect (trigger stays armed)"
+        );
+        assert!(
+            host.objects.find(unrooted).is_some(),
+            "the unrooted cell survives under DirectInterpreter (GAP C suppression intact)"
+        );
+    }
+
+    /// leak-fix C2 — cheap-when-unarmed: with the trigger DISARMED, the
+    /// native-builtin entry poll must be a pure no-op (no collection, no
+    /// observable behavior change), matching "a disarmed poll pays one bool
+    /// load" (marked_space.rs:520-522 doc). Also pins that a fresh
+    /// `CoreOpcodeDispatchHost` starts disarmed.
+    #[test]
+    fn allocation_heavy_native_entry_poll_is_noop_when_unarmed() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        assert!(
+            !host.objects.space.collection_request_armed(),
+            "precondition: a fresh store starts disarmed"
+        );
+        let live = host.objects.allocate();
+
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        let code_block = raw_code_block_with_constants(Vec::new(), UnlinkedConstantPool::default());
+        let mut state = dispatch_state(
+            &mut stack,
+            &mut registers,
+            &mut exceptions,
+            &mut heap,
+            &code_block,
+        );
+        state.ordinary_bytecode_call_handling = OrdinaryBytecodeCallHandling::DeferToVm;
+        state.function_value_call_handling = FunctionValueCallHandling::DeferToVm;
+
+        host.poll_gc_collection_before_allocation_heavy_native(&mut state);
+
+        assert!(
+            !host.objects.space.collection_request_armed(),
+            "still disarmed: no collection ran"
+        );
+        assert!(
+            host.objects.find(live).is_some(),
+            "the unrooted-but-unarmed cell is untouched (no observable behavior change)"
         );
     }
 
