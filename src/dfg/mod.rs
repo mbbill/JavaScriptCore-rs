@@ -11,6 +11,7 @@ pub(crate) mod graph;
 pub(crate) mod node_flags;
 pub(crate) mod node_type;
 pub(crate) mod osr;
+pub(crate) mod osr_exit;
 pub(crate) mod parser;
 pub(crate) mod plan;
 pub(crate) mod speculation;
@@ -48,6 +49,12 @@ pub use osr::{
     MaterializationKind, OsrEntryAvailability, OsrEntryKind, OsrExitKind, OsrExitOutcomeKind,
     OsrExitOutcomeRecord, OsrExitRecovery, RecoverySource,
 };
+// Exit-site frame reification (osr_exit.rs) operates on interpreter
+// frame-model types (`ExecutionContextStack`/`RegisterFile`), which are
+// crate-internal; the speculative DFG consumes it via
+// `crate::dfg::osr_exit::{materialize_interpreter_exit_frame,
+// resume_interpreter_exit_frame}` — no public re-export until a public
+// surface exists.
 pub use parser::{parse, parse_into, DeclineReason};
 pub use plan::{DfgCompilationMode, DfgPlan};
 pub use speculation::{

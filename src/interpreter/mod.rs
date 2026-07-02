@@ -3910,6 +3910,41 @@ impl CoreOpcodeDispatchHost {
         self.objects.is_value_marked(value)
     }
 
+    // Cross-module test support for the DFG OSR-exit frame reification proof
+    // (dfg/osr_exit.rs, materialize-then-collect-then-resume): arm the byte-counter
+    // collection trigger with unrooted garbage islands (the same pattern the
+    // in-module GC tests use) and run ONE full collection cycle through the SAME
+    // safepoint driver the VM uses (`poll_gc_collection_safepoint`, including the
+    // leaf-store reconcile). The store fields are private; this exposes the minimum
+    // so a cross-module test can prove a materialized-but-not-yet-resumed exit
+    // frame's recovered cells are gathered as live register-file/frame-header roots.
+    #[cfg(test)]
+    pub(crate) fn force_one_gc_collection_for_test(
+        &mut self,
+        registers: &RegisterFile,
+        stack: &ExecutionContextStack,
+        exceptions: &ExceptionState,
+        heap: &mut Heap,
+    ) {
+        let mut guard = 0usize;
+        while !self.objects.space.collection_request_armed() {
+            let island = self.objects.allocate();
+            self.objects
+                .put_data_own(
+                    island,
+                    &CorePropertyKey::Identifier(0),
+                    RuntimeValue::from_i32(7),
+                )
+                .expect("garbage island property store");
+            guard += 1;
+            assert!(
+                guard < 100_000,
+                "the byte-counter trigger arms within a bound"
+            );
+        }
+        self.poll_gc_collection_safepoint(registers, stack, exceptions, heap);
+    }
+
     // Cross-module test support for the baseline-JIT typed-array get_by_val/put_by_val
     // bridge (jit/operations.rs + arm64_baseline/function_emitter.rs): allocate a
     // Uint8Array view in THIS host's real object store (its R4 cell + the store-owned
@@ -24649,6 +24684,24 @@ impl<'a> InstructionCursor<'a> {
     fn contains(self, index: BytecodeIndex) -> Result<bool, InstructionDecodeError> {
         self.get(index.offset() as usize).map(|view| view.is_some())
     }
+}
+
+/// Is `index` an instruction START of this code block's stream?
+///
+/// DFG OSR-exit validation surface (dfg/osr_exit.rs): C++ `adjustAndJumpToTarget`
+/// resolves `codeBlockForExit->instructions().at(bytecodeIndex)` and asserts
+/// `bytecodeIndexForExit(exitIndex) == exitIndex`
+/// (dfg/DFGOSRExitCompilerCommon.cpp:466-467, :496). The Rust exit materializer
+/// must apply the SAME instruction-start check the dispatch loop's own resume
+/// validation applies (`validate_baseline_fallback_request` ->
+/// `InstructionCursor::contains`): ordinal bounds for ordinal streams,
+/// `raw_stream::is_instruction_start` for packed byte streams. Exposed as a
+/// tiny wrapper so the DFG side cannot drift from the interpreter's check.
+pub(crate) fn code_block_contains_instruction_start(
+    code_block: &CodeBlock,
+    index: BytecodeIndex,
+) -> Result<bool, InstructionDecodeError> {
+    InstructionCursor::new(code_block.unlinked().instructions()).contains(index)
 }
 
 pub fn execute_code_block<H: DispatchHost>(
