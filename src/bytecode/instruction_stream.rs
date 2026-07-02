@@ -100,61 +100,86 @@ impl OpcodeSize {
     }
 }
 
-/// The DECLARED subset of JSC's generated JS opcode IDs, at their REAL
-/// generated values (`Opcode.h:66` `FOR_EACH_OPCODE_ID(OPCODE_ID_ENUM)`).
+/// Symbolic names for JSC's generated JS opcode IDs (`Opcode.h:66`
+/// `FOR_EACH_OPCODE_ID(OPCODE_ID_ENUM)`), RE-DERIVED at compile time by name
+/// from [`GENERATED_OPCODE_TABLE`] so the generator-produced table is the ONE
+/// home of every numeric id — there is no second hand-pinned list to drift.
+/// The test `opcode_ids_match_jsc_generated_values` still pins the expected
+/// numeric values against the local build's `Bytecodes.h`.
 ///
-/// ID-ASSIGNMENT RULE (derived from the generator, then verified against the
-/// local build artifact): the `:Bytecode` section is declared
-/// `preserve_order: true` (`BytecodeList.rb:79-87`), so `DSL.end_section`
-/// SKIPS `Section#sort!` and only validates the required
-/// [checkpoint ops][metadata ops][plain ops] declaration ordering
-/// (`generator/DSL.rb:43-56`, `generator/Section.rb:72-97`); `create_ids!`
-/// then numbers every opcode sequentially from 0 in EXACT declaration order
+/// ID-ASSIGNMENT RULE (owned by JSC's generator, which produced the table):
+/// the `:Bytecode` section is declared `preserve_order: true`
+/// (`BytecodeList.rb:79-87`), so `DSL.end_section` SKIPS `Section#sort!` and
+/// only validates the required [checkpoint ops][metadata ops][plain ops]
+/// declaration ordering (`generator/DSL.rb:43-56`,
+/// `generator/Section.rb:72-97`); `create_ids!` then numbers every opcode
+/// sequentially from 0 in EXACT declaration order
 /// (`generator/Section.rb:99-101`; `generator/Opcode.rb:41-47,59-61` class
 /// counter), with `op_group` members appended inline in listed order
 /// (`generator/Section.rb:50-54`). An opcode's ID is therefore fixed by its
-/// position in `BytecodeList.rb` ALONE: later Rust declarations simply take
-/// their declaration-order value, and nothing already declared ever
-/// renumbers.
-///
-/// Verified against the generated header the local C++ `jsc` (the measuring
-/// instrument) was built from:
-/// `WebKitBuild/Release/DerivedSources/JavaScriptCore/Bytecodes.h`
-/// (`NUMBER_OF_BYTECODE_IDS 193`; `op_jmp_value_string "69"` ...
-/// `op_sub_value_string "161"`). A declaration-order recount of the whole
-/// `:Bytecode` section reproduces all 193 generated values exactly.
+/// position in `BytecodeList.rb` ALONE.
 pub mod opcode_id {
+    /// Compile-time by-name lookup in the generated table. C++ needs no such
+    /// helper — the generator emits the `OpcodeID` enum directly; this is the
+    /// same "name -> generated id" binding expressed over the emitted table.
+    /// Fails the build if the name is not a generated opcode.
+    const fn generated_id(name: &str) -> u8 {
+        let needle = name.as_bytes();
+        let mut i = 0;
+        while i < super::GENERATED_OPCODE_TABLE.len() {
+            if bytes_eq(super::GENERATED_OPCODE_TABLE[i].name.as_bytes(), needle) {
+                return super::GENERATED_OPCODE_TABLE[i].id;
+            }
+            i += 1;
+        }
+        panic!("opcode name not present in GENERATED_OPCODE_TABLE")
+    }
+
+    /// Const-context `==` for byte strings (`str` equality is not yet const).
+    const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     /// `op :jmp` (`BytecodeList.rb:933`).
-    pub const JMP: u8 = 69;
+    pub const JMP: u8 = generated_id("jmp");
     /// `op :jtrue` (`BytecodeList.rb:938`).
-    pub const JTRUE: u8 = 70;
+    pub const JTRUE: u8 = generated_id("jtrue");
     /// `op :ret` (`BytecodeList.rb:1040`).
-    pub const RET: u8 = 104;
+    pub const RET: u8 = generated_id("ret");
     /// Width-prefix opcode `op :wide16` (`BytecodeList.rb:1174`):
     /// `narrow()->opcodeID() == Traits::wide16` selects the wide16 form
     /// (`Instruction.h:40,81-84`). NOT id 0: the wide prefixes sit LATE in
     /// declaration order, interleaved with the super-sampler ops
     /// (`op_nop`=126, `op_super_sampler_begin`=127, wide16=128,
     /// `op_super_sampler_end`=129, wide32=130).
-    pub const WIDE16: u8 = 128;
+    pub const WIDE16: u8 = generated_id("wide16");
     /// Width-prefix opcode `op :wide32` (`BytecodeList.rb:1178`);
     /// `Instruction.h:41,86-89`.
-    pub const WIDE32: u8 = 130;
+    pub const WIDE32: u8 = generated_id("wide32");
     /// `op :enter` (`BytecodeList.rb:1180`).
-    pub const ENTER: u8 = 131;
+    pub const ENTER: u8 = generated_id("enter");
     /// `op :mov` (`BytecodeList.rb:1248-1252`).
-    pub const MOV: u8 = 144;
+    pub const MOV: u8 = generated_id("mov");
     /// First member `:eq` of `op_group :BinaryOp` (`BytecodeList.rb:1254-1274`).
-    pub const EQ: u8 = 145;
+    pub const EQ: u8 = generated_id("eq");
     /// `op_group :ProfiledBinaryOpWithOperandTypes` members in group order
     /// `[:add, :mul, :div, :sub, :bitand, :bitor, :bitxor]`
-    /// (`BytecodeList.rb:1276-1292`): add=158, mul=159, (div=160, not yet
-    /// declared here), sub=161.
-    pub const ADD: u8 = 158;
+    /// (`BytecodeList.rb:1276-1292`): add=158, mul=159, div=160, sub=161.
+    pub const ADD: u8 = generated_id("add");
     /// See [`ADD`]: second ProfiledBinaryOpWithOperandTypes member.
-    pub const MUL: u8 = 159;
+    pub const MUL: u8 = generated_id("mul");
     /// See [`ADD`]: fourth member; `div` (160) sits between `mul` and `sub`.
-    pub const SUB: u8 = 161;
+    pub const SUB: u8 = generated_id("sub");
 }
 
 /// Operand classes of the packed stream: ONE variant per C++ STREAM TYPE
@@ -278,11 +303,23 @@ impl OperandKind {
     }
 }
 
-/// Faithful descriptor for one opcode in the declared core subset.
+// The full 193-row generated opcode table (`GeneratedOpcodeRow`,
+// `GENERATED_OPCODE_TABLE`, and the four `NUMBER_OF_`/`MAX_LENGTH_OF_`
+// constants), produced by tools/bytecode-gen/generate.rb from JSC's OWN Ruby
+// bytecode generator over JSC's OWN `bytecode/BytecodeList.rb` and verified
+// row-by-row against the local build artifact `Bytecodes.h` (see the file's
+// provenance header). Textually included so `OperandKind` above is in scope,
+// mirroring how the C++ build compiles its generated `Bytecodes.h` into the
+// translation units that define the operand types.
+include!("generated/opcode_table.rs");
+
+/// Faithful descriptor for one generated JS opcode.
 ///
 /// Mirrors a `BytecodeList.rb` `op :name, args: { ... }` declaration: the
 /// operand schema plus the derived `opcodeLength` that drives
-/// `BaseInstruction::size()` (`Instruction.h:138-145`).
+/// `BaseInstruction::size()` (`Instruction.h:138-145`). Built from the pure
+/// JSC data of [`GeneratedOpcodeRow`] plus the two Rust-only dispatch fields
+/// ([`Self::is_wide_prefix`], [`Self::core`]) — see [`OPCODE_TABLE`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpcodeDescriptor {
     pub id: u8,
@@ -297,10 +334,17 @@ pub struct OpcodeDescriptor {
     /// (`generator/Metadata.rb:126-131` `Argument.new(..., :unsigned, -1)`;
     /// `generator/Opcode.rb:185-189` appends `__metadataID` to
     /// `writeOpcode`), so it is sized per-width like every other operand
-    /// field. No current hand-written row sets it: the 49 JSC opcodes with
-    /// metadata (IDs 0..49, generated `NUMBER_OF_BYTECODE_WITH_METADATA`)
-    /// are not declared here yet; the generated table will set it.
+    /// field. Exactly the 49 leading generated rows set it (IDs 0..49,
+    /// `NUMBER_OF_BYTECODE_WITH_METADATA`; `hasMetadata()` = `opcodeID <
+    /// numberOfBytecodesWithMetadata`, `Instruction.h:98-101`).
     pub has_metadata: bool,
+    /// `numberOfCheckpoints` for the checkpoint-carrying ops — the leading
+    /// id partition validated by `generator/Section.rb:72-97` and emitted as
+    /// `bytecodeCheckpointCountTable` in the generated `Bytecodes.h`.
+    /// Checkpoints subdivide one bytecode into multiple side-effect/exit
+    /// sites (`BytecodeIndex.h` checkpoint bits); stored faithfully now,
+    /// consumed once checkpoint-aware OSR exit lands. 0 for plain ops.
+    pub num_checkpoints: u8,
     /// True for the width-prefix opcodes (`op_wide16`/`op_wide32`).
     pub is_wide_prefix: bool,
     /// Rust-only bridge to the pre-generated `CoreOpcode` dispatch surface.
@@ -341,145 +385,63 @@ impl OpcodeDescriptor {
     }
 }
 
-/// Operand shape shared by EVERY `op_group :ProfiledBinaryOpWithOperandTypes`
-/// member — `args: { dst, lhs, rhs, profileIndex, operandTypes }`
-/// (`BytecodeList.rb:1276-1292`). One `const` mirrors the C++ group declaring
-/// its args ONCE for all members (`generator/Section.rb:50-54`).
-const PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS: &[OperandKind] = &[
-    OperandKind::VirtualRegister,
-    OperandKind::VirtualRegister,
-    OperandKind::VirtualRegister,
-    // `profileIndex` is a plain `unsigned` arg (`BytecodeList.rb:1276-1292`),
-    // so its kind is the C++ STREAM TYPE `unsigned`, not the arg's name.
-    OperandKind::UnsignedImmediate,
-    OperandKind::OperandTypes,
-];
-
-/// Declared-subset opcode table, in generated-ID order (= `BytecodeList.rb`
-/// declaration order). Models JSC's ONE untyped op per operation (`op_add`,
-/// NOT `AddInt32`): type specialization is the JIT's job via the profile
-/// operand (`metadata-table.md` `d1cb45f8`).
+/// Overlay ONE pure-JSC generated row with the two Rust-only fields of
+/// [`OpcodeDescriptor`].
 ///
-/// None of the declared opcodes carries metadata: their IDs are all >=
-/// NUMBER_OF_BYTECODE_WITH_METADATA (49 in the generated `Bytecodes.h:290`;
-/// `hasMetadata()` = `opcodeID() < numberOfBytecodesWithMetadata`,
-/// `Instruction.h:38,98-101`), so no row adds the +1 metadataID operand slot
-/// (`generator/Opcode.rb:372-374`) and `opcode_length == operands.len()`
-/// matches the generated `macro(op_*, length)` lines exactly.
-static OPCODE_TABLE: &[OpcodeDescriptor] = &[
-    // op :jmp, args: { targetLabel }  (BytecodeList.rb:933-936).
+/// C++ has no such overlay step: the generated opcode structs ARE the
+/// dispatch identities, and `op_wide16`/`op_wide32` are special-cased
+/// directly in `Instruction.h:40-41,81-89`. Keeping the generated artifact
+/// pure JSC data and adding `is_wide_prefix`/`core` here — in the one place
+/// the canonical table is built — keeps the regenerable file byte-for-byte
+/// the generator's output while making id/name/flag drift impossible (there
+/// is no second copy of the rows to fall out of sync).
+const fn overlay_generated_row(row: GeneratedOpcodeRow) -> OpcodeDescriptor {
     OpcodeDescriptor {
-        id: opcode_id::JMP,
-        name: "jmp",
-        operands: &[OperandKind::BoundLabel],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    // op :jtrue, args: { condition, targetLabel }  (BytecodeList.rb:938-942).
-    OpcodeDescriptor {
-        id: opcode_id::JTRUE,
-        name: "jtrue",
-        operands: &[OperandKind::VirtualRegister, OperandKind::BoundLabel],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    // op :ret, args: { value }  (BytecodeList.rb:1040-1043).
-    OpcodeDescriptor {
-        id: opcode_id::RET,
-        name: "ret",
-        operands: &[OperandKind::VirtualRegister],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: Some(CoreOpcode::Return),
-    },
-    OpcodeDescriptor {
-        id: opcode_id::WIDE16,
-        name: "wide16",
-        operands: &[],
-        has_metadata: false,
-        is_wide_prefix: true,
-        core: None,
-    },
-    OpcodeDescriptor {
-        id: opcode_id::WIDE32,
-        name: "wide32",
-        operands: &[],
-        has_metadata: false,
-        is_wide_prefix: true,
-        core: None,
-    },
-    // op :enter  (BytecodeList.rb:1180) — no operands.
-    OpcodeDescriptor {
-        id: opcode_id::ENTER,
-        name: "enter",
-        operands: &[],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    // op :mov, args: { dst, src }  (BytecodeList.rb:1248-1252).
-    OpcodeDescriptor {
-        id: opcode_id::MOV,
-        name: "mov",
-        operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: Some(CoreOpcode::Move),
-    },
-    // op_group :BinaryOp [:eq, ...], args: { dst, lhs, rhs }
-    //   (BytecodeList.rb:1254-1274). Unprofiled binary op.
-    OpcodeDescriptor {
-        id: opcode_id::EQ,
-        name: "eq",
-        operands: &[
-            OperandKind::VirtualRegister,
-            OperandKind::VirtualRegister,
-            OperandKind::VirtualRegister,
-        ],
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    // op_group :ProfiledBinaryOpWithOperandTypes [:add, :mul, :div, :sub, ...]
-    //   (BytecodeList.rb:1276-1292). UNTYPED ops carrying a profile index; the
-    //   whole group shares ONE operand shape. Decode-only until the generated
-    //   dispatch cutover: `core` stays None so the mov/ret wedge refuses to
-    //   execute them (mapping onto the type-specialized `AddInt32`-style arms
-    //   would not be faithful).
-    OpcodeDescriptor {
-        id: opcode_id::ADD,
-        name: "add",
-        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    OpcodeDescriptor {
-        id: opcode_id::MUL,
-        name: "mul",
-        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-    OpcodeDescriptor {
-        id: opcode_id::SUB,
-        name: "sub",
-        operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
-        has_metadata: false,
-        is_wide_prefix: false,
-        core: None,
-    },
-];
+        id: row.id,
+        name: row.name,
+        operands: row.operands,
+        has_metadata: row.has_metadata,
+        num_checkpoints: row.num_checkpoints,
+        // Exactly op_wide16/op_wide32 are width prefixes
+        // (`Instruction.h:40-41,81-89`).
+        is_wide_prefix: row.id == opcode_id::WIDE16 || row.id == opcode_id::WIDE32,
+        // The wedge dispatch bridge admits ONLY mov/ret (see
+        // [`OpcodeDescriptor::core`]); every other generated opcode is
+        // decode-only until the generated dispatch cutover — mapping e.g.
+        // `op_add` onto the type-specialized `AddInt32`-style arms would not
+        // be faithful.
+        core: if row.id == opcode_id::MOV {
+            Some(CoreOpcode::Move)
+        } else if row.id == opcode_id::RET {
+            Some(CoreOpcode::Return)
+        } else {
+            None
+        },
+    }
+}
 
-/// Look up a descriptor by opcode ID. The real engine indexes generated tables
-/// directly by `OpcodeID`; the declared subset scans its small table (IDs are
-/// sparse until the full 193-op table lands, e.g. `div`=160 sits undeclared
-/// between `mul`=159 and `sub`=161).
+/// The canonical opcode table: ALL 193 generated rows of JSC's `:Bytecode`
+/// section, in generated-ID order (= `BytecodeList.rb` declaration order),
+/// overlaid with the Rust-only dispatch fields. Models JSC's ONE untyped op
+/// per operation (`op_add`, NOT `AddInt32`): type specialization is the JIT's
+/// job via the profile operand (`metadata-table.md` `d1cb45f8`).
+static OPCODE_TABLE: [OpcodeDescriptor; NUMBER_OF_BYTECODE_IDS] = {
+    let mut table = [overlay_generated_row(GENERATED_OPCODE_TABLE[0]); NUMBER_OF_BYTECODE_IDS];
+    let mut i = 1;
+    while i < NUMBER_OF_BYTECODE_IDS {
+        table[i] = overlay_generated_row(GENERATED_OPCODE_TABLE[i]);
+        i += 1;
+    }
+    table
+};
+
+/// Look up a descriptor by opcode ID: a direct table index, as the C++ engine
+/// indexes its generated per-opcode tables by `OpcodeID` (ids are dense
+/// 0..NUMBER_OF_BYTECODE_IDS in declaration order). `None` past the end.
 pub fn descriptor_for(id: u8) -> Option<&'static OpcodeDescriptor> {
-    OPCODE_TABLE.iter().find(|descriptor| descriptor.id == id)
+    let descriptor = OPCODE_TABLE.get(id as usize)?;
+    debug_assert!(descriptor.id == id, "table row ids are the dense indices");
+    Some(descriptor)
 }
 
 /// A concrete operand value handed to the writer. Carries the integer plus its
@@ -1374,11 +1336,24 @@ mod tests {
         assert_eq!(descriptor_for(JMP).unwrap().opcode_length(), 1);
         assert_eq!(descriptor_for(JTRUE).unwrap().opcode_length(), 2);
         assert_eq!(descriptor_for(RET).unwrap().opcode_length(), 1);
+        // Metadata rows count the +1 m_metadataID slot: `macro(op_get_by_id, 5)`
+        // (id 20, 4 args), `macro(op_call, 6)` (id 25, 5 args),
+        // `macro(op_jneq_ptr, 4)` (id 48, 3 args), and the longest row
+        // `macro(op_iterator_next, 10)` (id 2, 9 args) — the
+        // MAX_LENGTH_OF_BYTECODE_IDS witness.
+        assert_eq!(descriptor_for(20).unwrap().name, "get_by_id");
+        assert_eq!(descriptor_for(20).unwrap().opcode_length(), 5);
+        assert_eq!(descriptor_for(25).unwrap().name, "call");
+        assert_eq!(descriptor_for(25).unwrap().opcode_length(), 6);
+        assert_eq!(descriptor_for(48).unwrap().name, "jneq_ptr");
+        assert_eq!(descriptor_for(48).unwrap().opcode_length(), 4);
+        assert_eq!(descriptor_for(2).unwrap().name, "iterator_next");
+        assert_eq!(descriptor_for(2).unwrap().opcode_length(), 10);
     }
 
-    /// FAITHFUL ID PIN: the declared subset carries JSC's REAL generated
-    /// opcode IDs. Expected values come from the generated header the local
-    /// C++ `jsc` was built from —
+    /// FAITHFUL ID PIN: the re-derived `opcode_id` constants and the table
+    /// rows carry JSC's REAL generated opcode IDs. Expected values come from
+    /// the generated header the local C++ `jsc` was built from —
     /// `WebKitBuild/Release/DerivedSources/JavaScriptCore/Bytecodes.h`
     /// (`op_jmp_value_string "69"`, `op_jtrue_value_string "70"`,
     /// `op_ret_value_string "104"`, `op_wide16_value_string "128"`,
@@ -1391,6 +1366,11 @@ mod tests {
     /// `generator/Opcode.rb:41-47,59-61`). Any drift fails loudly here.
     #[test]
     fn opcode_ids_match_jsc_generated_values() {
+        // The by-name-derived constants resolve to the pinned Bytecodes.h ids.
+        assert_eq!(
+            [JMP, JTRUE, RET, WIDE16, WIDE32, ENTER, MOV, EQ, ADD, MUL, SUB],
+            [69, 70, 104, 128, 130, 131, 144, 145, 158, 159, 161]
+        );
         let expected: &[(u8, &str)] = &[
             (69, "jmp"),
             (70, "jtrue"),
@@ -1404,18 +1384,203 @@ mod tests {
             (159, "mul"),
             (161, "sub"),
         ];
-        assert_eq!(OPCODE_TABLE.len(), expected.len());
-        for (row, &(id, name)) in OPCODE_TABLE.iter().zip(expected) {
-            // Table rows sit in generated-ID (declaration) order.
+        for &(id, name) in expected {
+            let row = descriptor_for(id).unwrap();
             assert_eq!(row.id, id, "op_{name}");
             assert_eq!(row.name, name, "id {id}");
-            assert_eq!(descriptor_for(id).unwrap().name, name, "id {id}");
             // Exactly op_wide16/op_wide32 are width prefixes
             // (Instruction.h:40-41,81-89).
             assert_eq!(row.is_wide_prefix, id == WIDE16 || id == WIDE32);
         }
-        // `div` (159+1=160) sits undeclared between mul and sub until ported.
-        assert_eq!(descriptor_for(160), None);
+        // `div` (160) — undeclared in the old 11-row subset — is a full
+        // generated row now, sharing the ProfiledBinaryOpWithOperandTypes
+        // group shape (`BytecodeList.rb:1276-1292`).
+        let div = descriptor_for(160).unwrap();
+        assert_eq!(div.name, "div");
+        assert_eq!(div.opcode_length(), 5);
+        assert_eq!(div.operands, descriptor_for(ADD).unwrap().operands);
+    }
+
+    /// FULL-TABLE INVARIANTS, pinned against the generated `Bytecodes.h`
+    /// constants the artifact-verified table carries: 193 dense ascending
+    /// ids; the 49 metadata rows are exactly the id prefix 0..49
+    /// (`hasMetadata()` = `opcodeID < numberOfBytecodesWithMetadata`,
+    /// `Instruction.h:98-101`); the 7 checkpoint rows are exactly the id
+    /// prefix 0..7 (`generator/Section.rb:72-97` partition validation);
+    /// wide16=128/wide32=130 are the ONLY width prefixes
+    /// (`Instruction.h:40-41,81-89`); max `opcodeLengths` entry is
+    /// MAX_LENGTH_OF_BYTECODE_IDS.
+    #[test]
+    fn full_table_invariants_match_generated_constants() {
+        assert_eq!(NUMBER_OF_BYTECODE_IDS, 193);
+        assert_eq!(NUMBER_OF_BYTECODE_WITH_METADATA, 49);
+        assert_eq!(NUMBER_OF_BYTECODE_WITH_CHECKPOINTS, 7);
+        assert_eq!(MAX_LENGTH_OF_BYTECODE_IDS, 10);
+        assert_eq!(OPCODE_TABLE.len(), NUMBER_OF_BYTECODE_IDS);
+
+        let mut max_length = 0usize;
+        for (index, row) in OPCODE_TABLE.iter().enumerate() {
+            let name = row.name;
+            // Ids are the dense, strictly ascending 0..193: position IS id.
+            assert_eq!(row.id as usize, index, "op_{name}");
+            assert!(
+                std::ptr::eq(descriptor_for(row.id).unwrap(), row),
+                "op_{name}"
+            );
+            // Metadata prefix partition.
+            assert_eq!(
+                row.has_metadata,
+                (row.id as usize) < NUMBER_OF_BYTECODE_WITH_METADATA,
+                "op_{name}"
+            );
+            // Checkpoint prefix partition.
+            assert_eq!(
+                row.num_checkpoints > 0,
+                (row.id as usize) < NUMBER_OF_BYTECODE_WITH_CHECKPOINTS,
+                "op_{name}"
+            );
+            // The two width prefixes and nothing else.
+            assert_eq!(row.is_wide_prefix, row.id == WIDE16 || row.id == WIDE32);
+            if row.opcode_length() > max_length {
+                max_length = row.opcode_length();
+            }
+        }
+        assert_eq!(
+            OPCODE_TABLE.iter().filter(|row| row.has_metadata).count(),
+            NUMBER_OF_BYTECODE_WITH_METADATA
+        );
+        assert_eq!(
+            OPCODE_TABLE
+                .iter()
+                .filter(|row| row.num_checkpoints > 0)
+                .count(),
+            NUMBER_OF_BYTECODE_WITH_CHECKPOINTS
+        );
+        assert_eq!(max_length, MAX_LENGTH_OF_BYTECODE_IDS);
+        assert_eq!(descriptor_for(WIDE16).unwrap().name, "wide16");
+        assert_eq!(descriptor_for(WIDE32).unwrap().name, "wide32");
+        // Past the table end: no descriptor.
+        assert_eq!(descriptor_for(NUMBER_OF_BYTECODE_IDS as u8), None);
+        assert_eq!(descriptor_for(u8::MAX), None);
+    }
+
+    /// In-domain narrow-fitting representative per stream operand kind (the
+    /// C++ value domains are cited on the matching `OperandValue` variants).
+    fn narrow_representative(kind: OperandKind) -> OperandValue {
+        match kind {
+            OperandKind::VirtualRegister => OperandValue::VirtualRegister(-1), // local(0)
+            OperandKind::UnsignedImmediate => OperandValue::UnsignedImmediate(7),
+            OperandKind::SignedImmediate => OperandValue::SignedImmediate(-7),
+            OperandKind::Bool => OperandValue::Bool(true),
+            OperandKind::OperandTypes => OperandValue::OperandTypes(0x0201),
+            OperandKind::BoundLabel => OperandValue::BoundLabel(-7),
+            OperandKind::ECMAMode => OperandValue::ECMAMode(1),
+            OperandKind::IndexingType => OperandValue::IndexingType(5),
+            OperandKind::SymbolTableOrScopeDepth => OperandValue::SymbolTableOrScopeDepth(3),
+            OperandKind::ResolveType => OperandValue::ResolveType(13),
+            OperandKind::GetPutInfo => {
+                OperandValue::GetPutInfo((1 << 30) | (1 << 20) | (2 << 10) | 13)
+            }
+            OperandKind::PutByIdFlags => OperandValue::PutByIdFlags(0b11),
+            OperandKind::ProfileTypeBytecodeFlag => OperandValue::ProfileTypeBytecodeFlag(4),
+            OperandKind::PrivateFieldPutKind => OperandValue::PrivateFieldPutKind(2),
+            OperandKind::ErrorTypeWithExtension => OperandValue::ErrorTypeWithExtension(3),
+            OperandKind::DebugHookType => OperandValue::DebugHookType(8),
+            OperandKind::ResultType => OperandValue::ResultType(0x7e),
+            OperandKind::JSType => OperandValue::JSType(20),
+        }
+    }
+
+    /// A value of `kind` that fails every width below `target` and fits
+    /// `target`, so ONE such operand forces the whole instruction to
+    /// `target` (the shared-width rule) — or `None` for the kinds whose
+    /// `Fits` check passes narrower widths for every value (u8-backed kinds;
+    /// GetPutInfo, whose narrow and wide16 checks are the same compressed
+    /// check, `Fits.h:206-212`; OperandTypes at wide32, since its wide16
+    /// same-size `bit_cast` accepts any bits, `Fits.h:52-64`).
+    fn width_forcing_value(kind: OperandKind, target: OpcodeSize) -> Option<OperandValue> {
+        let wide16 = matches!(target, OpcodeSize::Wide16);
+        Some(match kind {
+            OperandKind::VirtualRegister => {
+                OperandValue::VirtualRegister(if wide16 { -129 } else { -32_769 })
+            }
+            OperandKind::UnsignedImmediate => {
+                OperandValue::UnsignedImmediate(if wide16 { 5000 } else { 100_000 })
+            }
+            OperandKind::SignedImmediate => {
+                OperandValue::SignedImmediate(if wide16 { 5000 } else { 100_000 })
+            }
+            OperandKind::BoundLabel => {
+                OperandValue::BoundLabel(if wide16 { 5000 } else { 100_000 })
+            }
+            OperandKind::SymbolTableOrScopeDepth => {
+                OperandValue::SymbolTableOrScopeDepth(if wide16 { 5000 } else { 100_000 })
+            }
+            // A ResultType outside the 4-bit narrow nibble pack
+            // (`Fits.h:311-323`) rides the wide16 raw `bits()`.
+            OperandKind::OperandTypes if wide16 => OperandValue::OperandTypes(0x0030),
+            _ => return None,
+        })
+    }
+
+    /// FULL-TABLE EMIT->DECODE ROUND-TRIP: every generated opcode, at every
+    /// operand width the `Fits` cascade can select for it, encodes through
+    /// the writer and decodes back identically — id, name, width, the
+    /// `Instruction.h:138-145` size, and every operand value (including the
+    /// trailing m_metadataID slot of the 49 metadata rows, emitted as a plain
+    /// `unsigned`, `generator/Metadata.rb:126-131`).
+    #[test]
+    fn every_generated_opcode_round_trips_emit_decode_at_each_width() {
+        for descriptor in OPCODE_TABLE.iter() {
+            // op_wide16/op_wide32 are width PREFIXES, not standalone
+            // instructions (`Instruction.h:81-89`): the writer only ever
+            // emits them as the prefix byte of a wide instruction.
+            if descriptor.is_wide_prefix {
+                continue;
+            }
+            for target in ALL_WIDTHS {
+                let mut operands: Vec<OperandValue> = (0..descriptor.opcode_length())
+                    .map(|slot| narrow_representative(descriptor.operand_kind(slot)))
+                    .collect();
+                if !matches!(target, OpcodeSize::Narrow) {
+                    let widenable = (0..descriptor.opcode_length()).find(|&slot| {
+                        width_forcing_value(descriptor.operand_kind(slot), target).is_some()
+                    });
+                    let Some(slot) = widenable else {
+                        // Only the zero-operand ops (enter/nop/loop_hint/...)
+                        // have nothing to widen; the Fits cascade always
+                        // emits them narrow, like C++.
+                        assert_eq!(descriptor.opcode_length(), 0, "op_{}", descriptor.name);
+                        continue;
+                    };
+                    operands[slot] =
+                        width_forcing_value(descriptor.operand_kind(slot), target).unwrap();
+                }
+                let mut writer = InstructionStreamWriter::new();
+                assert_eq!(writer.emit(descriptor.id, &operands), 0);
+                let stream = writer.finalize();
+                let decoded = decode_raw_instruction(stream.bytes(), 0)
+                    .unwrap_or_else(|error| panic!("op_{} {target:?}: {error:?}", descriptor.name));
+                assert_eq!(decoded.opcode_id, descriptor.id, "op_{}", descriptor.name);
+                assert_eq!(decoded.name, descriptor.name);
+                assert_eq!(decoded.width, target, "op_{}", descriptor.name);
+                assert_eq!(
+                    decoded.size,
+                    OPCODE_ID_BYTES
+                        + descriptor.opcode_length() * target.operand_bytes()
+                        + target.prefix_bytes(),
+                    "op_{} {target:?}",
+                    descriptor.name
+                );
+                assert_eq!(decoded.size, stream.size_in_bytes());
+                let expected: Vec<i64> = operands.iter().map(|value| value.as_i64()).collect();
+                assert_eq!(
+                    decoded.operands, expected,
+                    "op_{} {target:?}",
+                    descriptor.name
+                );
+            }
+        }
     }
 
     /// `Fits` width selection: one out-of-narrow-range operand widens the WHOLE
@@ -2191,28 +2356,15 @@ mod tests {
     fn metadata_slot_lengthens_instruction_per_generated_rule() {
         // op :get_by_id, args: { dst: VirtualRegister, base: VirtualRegister,
         // property: unsigned, valueProfile: unsigned }, metadata: { ... }
-        // (`BytecodeList.rb:387-396`). Local descriptor only: the row itself
-        // lands with the generated table.
-        const GET_BY_ID_LIKE: OpcodeDescriptor = OpcodeDescriptor {
-            id: 20,
-            name: "get_by_id",
-            operands: &[
-                OperandKind::VirtualRegister,
-                OperandKind::VirtualRegister,
-                OperandKind::UnsignedImmediate,
-                OperandKind::UnsignedImmediate,
-            ],
-            has_metadata: true,
-            is_wide_prefix: false,
-            core: None,
-        };
-        assert_eq!(GET_BY_ID_LIKE.opcode_length(), 5);
+        // (`BytecodeList.rb:387-396`) — the REAL generated row (id 20).
+        let get_by_id = descriptor_for(20).unwrap();
+        assert_eq!(get_by_id.name, "get_by_id");
+        assert!(get_by_id.has_metadata);
+        assert_eq!(get_by_id.operands.len(), 4);
+        assert_eq!(get_by_id.opcode_length(), 5);
         // The trailing slot is the metadataID, typed `unsigned`.
-        assert_eq!(
-            GET_BY_ID_LIKE.operand_kind(4),
-            OperandKind::UnsignedImmediate
-        );
-        assert_eq!(GET_BY_ID_LIKE.operand_kind(0), OperandKind::VirtualRegister);
+        assert_eq!(get_by_id.operand_kind(4), OperandKind::UnsignedImmediate);
+        assert_eq!(get_by_id.operand_kind(0), OperandKind::VirtualRegister);
         // `size()` (`Instruction.h:138-145`) counts the extra slot per width.
         for (width, expected) in [
             (OpcodeSize::Narrow, 1 + 5 + 0),
@@ -2221,23 +2373,25 @@ mod tests {
         ] {
             assert_eq!(
                 OPCODE_ID_BYTES
-                    + GET_BY_ID_LIKE.opcode_length() * width.operand_bytes()
+                    + get_by_id.opcode_length() * width.operand_bytes()
                     + width.prefix_bytes(),
                 expected
             );
         }
-        // Without metadata the same arg shape stays at args.length.
-        let no_metadata = OpcodeDescriptor {
-            has_metadata: false,
-            ..GET_BY_ID_LIKE
-        };
-        assert_eq!(no_metadata.opcode_length(), 4);
-        // No current hand-written row carries metadata: all declared IDs sit
-        // at or above NUMBER_OF_BYTECODE_WITH_METADATA (49, generated
-        // `Bytecodes.h:290`).
-        for descriptor in OPCODE_TABLE {
-            assert!(!descriptor.has_metadata, "op_{}", descriptor.name);
-            assert!(descriptor.id >= 49, "op_{}", descriptor.name);
-        }
+        // Without metadata the same arg count stays at args.length:
+        // op :get_by_id_with_this (id 53) has 5 args, no metadata block
+        // (`BytecodeList.rb`), so `macro(op_get_by_id_with_this, 5)`.
+        let with_this = descriptor_for(53).unwrap();
+        assert_eq!(with_this.name, "get_by_id_with_this");
+        assert!(!with_this.has_metadata);
+        assert_eq!(with_this.opcode_length(), with_this.operands.len());
+        // The checkpoint-bearing prefix rows carry their Bytecodes.h
+        // `bytecodeCheckpointCountTable` counts: [2, 2, 3, 2, 2, 2, 3].
+        let checkpoint_counts: Vec<u8> = OPCODE_TABLE
+            .iter()
+            .take(NUMBER_OF_BYTECODE_WITH_CHECKPOINTS)
+            .map(|row| row.num_checkpoints)
+            .collect();
+        assert_eq!(checkpoint_counts, vec![2, 2, 3, 2, 2, 2, 3]);
     }
 }

@@ -52,7 +52,10 @@ BYTECODE_LIST = File.join(JSC_DIR, 'bytecode', 'BytecodeList.rb')
 WASM_JSON = File.join(JSC_DIR, 'wasm', 'wasm.json')
 ARTIFACT_BYTECODES_H = ENV['BYTECODES_H'] ||
                        File.join(WEBKIT_DIR, 'WebKitBuild', 'Release', 'DerivedSources', 'JavaScriptCore', 'Bytecodes.h')
-OUTPUT_RS = File.join(__dir__, 'generated', 'opcode_table.generated.rs')
+# The emitted table is checked in INSIDE the crate and include!d by
+# src/bytecode/instruction_stream.rs (which overlays the Rust-only dispatch
+# fields), so regeneration targets the in-crate location directly.
+OUTPUT_RS = File.expand_path(File.join(__dir__, '..', '..', 'src', 'bytecode', 'generated', 'opcode_table.rs'))
 
 [GENERATOR_DIR, BYTECODE_LIST, WASM_JSON, ARTIFACT_BYTECODES_H].each do |path|
   abort "bytecode-gen: missing input: #{path}" unless File.exist?(path)
@@ -311,8 +314,10 @@ begin
     // `OperandKind` is expected in scope at the inclusion site
     // (src/bytecode/instruction_stream.rs).
 
-    /// One row per generated JS opcode, in id order. Field shape mirrors the
-    /// hand-written `OpcodeDescriptor` rows in src/bytecode/instruction_stream.rs.
+    /// One row per generated JS opcode, in id order — pure JSC data, no
+    /// Rust-only fields. src/bytecode/instruction_stream.rs include!s this
+    /// file and overlays the two Rust-only dispatch fields (`is_wide_prefix`,
+    /// `core`) to build the crate's canonical `OPCODE_TABLE`.
     #[derive(Clone, Copy, Debug)]
     pub struct GeneratedOpcodeRow {
         pub id: u8,
@@ -336,8 +341,11 @@ begin
 
   HEADER
 
+  out << "// `const` (not `static`): the crate overlays this table into its\n"
+  out << "// `OpcodeDescriptor` array in a const initializer, and Rust const\n"
+  out << "// evaluation cannot read from `static` items.\n"
   out << "#[rustfmt::skip]\n"
-  out << "pub static GENERATED_OPCODE_TABLE: [GeneratedOpcodeRow; NUMBER_OF_BYTECODE_IDS] = [\n"
+  out << "pub const GENERATED_OPCODE_TABLE: [GeneratedOpcodeRow; NUMBER_OF_BYTECODE_IDS] = [\n"
   rows.each do |row|
     operands = row[:operands].map { |v| "OperandKind::#{v}" }.join(', ')
     out << "    GeneratedOpcodeRow { id: #{row[:id]}, name: \"#{row[:name]}\", " \

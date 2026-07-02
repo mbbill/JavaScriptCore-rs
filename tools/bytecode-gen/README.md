@@ -1,6 +1,6 @@
 # bytecode-gen: JSC-generator-backed Rust opcode table
 
-Generates `generated/opcode_table.generated.rs` — the full 193-opcode Rust
+Generates `src/bytecode/generated/opcode_table.rs` — the full 193-opcode Rust
 descriptor table for JSC's `:Bytecode` section — by running **JSC's own Ruby
 bytecode generator** over **JSC's own `bytecode/BytecodeList.rb`**, then
 walking the evaluated sections and emitting Rust. Nothing about opcode
@@ -53,16 +53,19 @@ dispatch depend on.
      `NUMBER_OF_BYTECODE_WITH_CHECKPOINTS` (7), `MAX_LENGTH_OF_BYTECODE_IDS`
      (10), the metadata/checkpoint id-prefix partitions, and the per-op
      `bytecodeCheckpointCountTable` entries;
-   - the opcode ids already hand-declared in
-     `src/bytecode/instruction_stream.rs` (`jmp=69` ... `sub=161`) appear
-     identically.
-5. Emits `generated/opcode_table.generated.rs` with a DO-NOT-EDIT header
-   recording the invocation, WebKit revision, and inputs, then prints the
-   operand-type census.
+   - the opcode ids the crate's `opcode_id` constants historically pinned
+     (`jmp=69` ... `sub=161`) appear identically.
+5. Emits `src/bytecode/generated/opcode_table.rs` — directly into the crate —
+   with a DO-NOT-EDIT header recording the invocation, WebKit revision, and
+   inputs, then prints the operand-type census.
 
-The generated file is **not** wired into the crate build yet (that is a
-separate integration unit); `OperandKind` is expected to be in scope at the
-eventual inclusion site.
+The generated file **is** the crate's canonical table:
+`src/bytecode/instruction_stream.rs` textually `include!`s it (so its
+`OperandKind` references resolve at the inclusion site) and overlays the two
+Rust-only dispatch fields (`is_wide_prefix`, `core`) to build `OPCODE_TABLE`,
+keeping the artifact itself pure JSC data. The crate's `opcode_id` constants
+are re-derived from the table by name, so regeneration is the only way any
+opcode id enters the crate.
 
 ## Regenerating
 

@@ -25,8 +25,10 @@
 // `OperandKind` is expected in scope at the inclusion site
 // (src/bytecode/instruction_stream.rs).
 
-/// One row per generated JS opcode, in id order. Field shape mirrors the
-/// hand-written `OpcodeDescriptor` rows in src/bytecode/instruction_stream.rs.
+/// One row per generated JS opcode, in id order — pure JSC data, no
+/// Rust-only fields. src/bytecode/instruction_stream.rs include!s this
+/// file and overlays the two Rust-only dispatch fields (`is_wide_prefix`,
+/// `core`) to build the crate's canonical `OPCODE_TABLE`.
 #[derive(Clone, Copy, Debug)]
 pub struct GeneratedOpcodeRow {
     pub id: u8,
@@ -48,8 +50,11 @@ pub const NUMBER_OF_BYTECODE_WITH_METADATA: usize = 49;
 /// Bytecodes.h `NUMBER_OF_BYTECODE_WITH_CHECKPOINTS`.
 pub const NUMBER_OF_BYTECODE_WITH_CHECKPOINTS: usize = 7;
 
+// `const` (not `static`): the crate overlays this table into its
+// `OpcodeDescriptor` array in a const initializer, and Rust const
+// evaluation cannot read from `static` items.
 #[rustfmt::skip]
-pub static GENERATED_OPCODE_TABLE: [GeneratedOpcodeRow; NUMBER_OF_BYTECODE_IDS] = [
+pub const GENERATED_OPCODE_TABLE: [GeneratedOpcodeRow; NUMBER_OF_BYTECODE_IDS] = [
     GeneratedOpcodeRow { id: 0, name: "tail_call_varargs", operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::SignedImmediate], has_metadata: true, num_checkpoints: 2 }, // length 7
     GeneratedOpcodeRow { id: 1, name: "call_varargs", operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::SignedImmediate, OperandKind::UnsignedImmediate], has_metadata: true, num_checkpoints: 2 }, // length 8
     GeneratedOpcodeRow { id: 2, name: "iterator_next", operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::VirtualRegister, OperandKind::UnsignedImmediate, OperandKind::UnsignedImmediate, OperandKind::UnsignedImmediate, OperandKind::UnsignedImmediate], has_metadata: true, num_checkpoints: 3 }, // length 10
