@@ -82,10 +82,10 @@ use crate::jit::{
     P6X86_64BaselineSelectedSideExitReason, P6X86_64BaselineSemanticByteEmissionError,
     P6X86_64BaselineSemanticOperandRejectionReason, P6X86_64BaselineSymbolicRegister,
     PatchWriteBarrier, PatchpointDescriptor, PatchpointKind, PropertyHasObservationDescriptor,
-    PropertyLoadAccessCasePlan, PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable,
-    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
-    PropertyLoadGuardPlan, PropertyLoadGuardRequirement,
-    PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
+    PropertyInlineCacheClearingDependent, PropertyLoadAccessCasePlan,
+    PropertyLoadAccessCasePlanKind, PropertyLoadAccessCasePlanTable, PropertyLoadBaseNormalization,
+    PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome, PropertyLoadGuardPlan,
+    PropertyLoadGuardRequirement, PropertyLoadGuardedCandidate as JitPropertyLoadGuardedCandidate,
     PropertyLoadGuardedCandidateKind as JitPropertyLoadGuardedCandidateKind,
     PropertyLoadGuardedCandidateTable, PropertyLoadObservationDescriptor,
     PropertyLoadObservationReadiness, PropertyStoreAccessCasePlan,
@@ -5602,14 +5602,29 @@ impl VmTieringIntegration {
             retires_guard,
             outcome,
         };
-        // UN-CAPPED (hotfix, redesign-audit Unit 0): 8ad6f87 misclassified this
-        // field as diagnostic-only, but property_inline_cache_clear_requests_
-        // for_watchpoint_dispatch (below) does an exact-ordinal `.find()` on it
-        // from the per-call-frame IC safepoint — a cap means guarded ICs stop
-        // being CLEARED once VM-lifetime invalidations exceed the limit (stale
-        // Active attachments = wrong-code hazard). Unbounded growth is the
-        // known pre-existing divergence; the permanent fix is the watchpoint
-        // dependents-list unit (redesign Unit 6), which retires this log.
+        // UN-CAPPED, STILL LOAD-BEARING (redesign-audit Unit 6 / R5 update): the
+        // Unit-0 hotfix (e71840f) uncapped this after 8ad6f87 misclassified it
+        // as diagnostic-only. Unit 6 replaced the DISCOVERY consumer that made
+        // a cap unsafe -- `property_inline_cache_clear_requests_for_
+        // watchpoint_dispatch`'s exact-ordinal `.find()` from the per-call-frame
+        // IC safepoint is DELETED; discovery now comes from the watchpoint
+        // dependents list (`property_load_guard_watchpoint_dependents`,
+        // interpreter/object_store.rs) and uses the `VmPropertyLoadGuard
+        // WatchpointInvalidationRecord` returned directly by THIS call, never a
+        // vec re-lookup (see `property_inline_cache_clear_request_for_guard_
+        // dependent`). But `validate_vm_property_inline_cache_clear_watchpoint_
+        // trigger` (below) is a SEPARATE consumer: it re-derives the
+        // `triggering_invalidation_ordinal` on `VmPropertyInlineCacheClearRequest`
+        // via its own ordinal `.find()` against this same vec, moments after
+        // this push, as part of the shared `build_property_inline_cache_clear_
+        // request` validation path every clear (not just watchpoint-triggered
+        // ones) goes through. A cap would reproduce the identical Unit-0 hazard
+        // one layer deeper (the record we just created failing its OWN
+        // validation lookup) unless that validator is also changed to consume
+        // the record by value instead of by ordinal -- out of this unit's scope.
+        // So this log stays intentionally unbounded; it did not survive
+        // untouched, but it was not fully retired either (an evidence-backed
+        // SCOPE NOTE, not a silent carry-over).
         self.property_load_guard_watchpoint_invalidations
             .push(record.clone());
         record
@@ -5683,13 +5698,19 @@ impl VmTieringIntegration {
             invalidation_ordinals,
             outcome,
         };
-        // Transitional cap: diagnostic-only (see `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`).
-        if self.property_load_guard_watchpoint_event_dispatches.len()
-            < HOT_TELEMETRY_RECORD_RETAIN_LIMIT
-        {
-            self.property_load_guard_watchpoint_event_dispatches
-                .push(record.clone());
-        }
+        // UN-CAPPED (redesign-audit Unit 6 / R5): no longer purely diagnostic.
+        // `property_inline_cache_clear_request_for_guard_dependent` sets
+        // `triggering_event_dispatch_ordinal: Some(this.ordinal)` on every
+        // guarded-load clear it builds, and `validate_vm_property_inline_
+        // cache_clear_watchpoint_trigger` re-derives that record via an exact-
+        // ordinal `.find()` here moments later, in the SAME synchronous
+        // `drain_pending_property_load_guard_watchpoint_events` call that just
+        // pushed it. A cap here would reproduce the identical Unit-0 hazard
+        // class one layer deeper (this record failing its own immediate
+        // round-trip lookup) -- the same reasoning as the sibling
+        // `property_load_guard_watchpoint_invalidations` push above.
+        self.property_load_guard_watchpoint_event_dispatches
+            .push(record.clone());
         record
     }
 
@@ -6222,88 +6243,95 @@ impl VmTieringIntegration {
         Ok(plan.clone())
     }
 
+    /// Redesign-audit Unit 6 / R5: resolve the Active guarded property-inline-
+    /// cache attachment for a fired watchpoint's dependent identity directly --
+    /// an O(1) lookup keyed by `(owner, slot)` -- and produce its clear
+    /// request. Mirrors C++ `PropertyInlineCacheClearingWatchpoint::
+    /// fireInternal` (bytecode/PropertyInlineCacheClearingWatchpoint.cpp),
+    /// which resets its `m_propertyCache` directly through the `(CodeBlock*
+    /// m_owner, PropertyInlineCache& m_propertyCache)` back-pointer pair with
+    /// no scan.
+    ///
+    /// REPLACES the deleted `property_inline_cache_clear_requests_for_
+    /// watchpoint_dispatch`, which cross-referenced EVERY attachment ever
+    /// recorded by comparing its `guarded_dependency_ordinals`/
+    /// `guarded_binding_set_ids` against a materialization found by re-walking
+    /// `dispatch.invalidation_ordinals` through the (formerly capped)
+    /// `property_load_guard_watchpoint_invalidations` log -- the mechanism
+    /// behind the Unit-0 unbounded-log hazard (that log was hotfixed uncapped
+    /// by e71840f: a cap there meant a just-recorded invalidation's own ordinal
+    /// could silently fail its own round-trip lookup, so the guarded IC was
+    /// never cleared -- a stale Active attachment / wrong-code hazard).
+    ///
+    /// `dispatch` is the record `record_property_load_guard_watchpoint_event_
+    /// dispatch` ALREADY produced for this same event (that call is kept
+    /// unchanged, both for its existing direct-test coverage and because
+    /// `run_ic_tiering_safepoint`'s presence-check gate reads its non-emptiness
+    /// -- see the call site). This helper does NOT call
+    /// `record_property_load_guard_watchpoint_invalidation` a second time: that
+    /// would find the materialization already flipped to `Invalidated` by
+    /// `dispatch`'s own pass and get rejected as `MaterializationAlreadyInvalidated`,
+    /// silently reproducing the exact under-clear hazard this unit exists to
+    /// fix. Instead it reads the invalidation `dispatch` already recorded --
+    /// `materialization_ordinals[i]` and `invalidation_ordinals[i]` are
+    /// positionally parallel by construction (`record_property_load_guard_
+    /// watchpoint_event_dispatch` pushes both, in lockstep, before checking
+    /// for rejection) -- so no ordinal round-trip through a vec is needed here
+    /// either.
     #[allow(dead_code)]
-    pub(crate) fn property_inline_cache_clear_requests_for_watchpoint_dispatch(
+    pub(crate) fn property_inline_cache_clear_request_for_guard_dependent(
         &self,
+        dependent: PropertyInlineCacheClearingDependent,
         dispatch: &VmPropertyLoadGuardWatchpointEventDispatchRecord,
-    ) -> Vec<VmPropertyInlineCacheClearRequest> {
+    ) -> Option<VmPropertyInlineCacheClearRequest> {
         if !matches!(
             dispatch.outcome,
             VmPropertyLoadGuardWatchpointEventDispatchOutcome::Accepted { .. }
         ) {
-            return Vec::new();
+            return None;
         }
 
-        let mut requests = Vec::new();
-        for invalidation_ordinal in &dispatch.invalidation_ordinals {
-            let Some(invalidation) = self
-                .property_load_guard_watchpoint_invalidations
-                .iter()
-                .find(|record| record.ordinal == *invalidation_ordinal)
-            else {
-                continue;
-            };
-            if !matches!(
-                invalidation.outcome,
-                VmPropertyLoadGuardWatchpointInvalidationOutcome::Accepted { .. }
-            ) {
-                continue;
-            }
+        let attachment = self
+            .property_inline_cache_attachment_records
+            .iter()
+            .find(|record| {
+                record.lifecycle == VmPropertyInlineCacheAttachmentLifecycle::Active
+                    && record.kind.is_guarded_load()
+                    && record.owner == dependent.owner
+                    && record.slot == dependent.slot
+            })?;
+        let materialization_ordinal = attachment.guarded_materialization_ordinal?;
+        let position = dispatch
+            .materialization_ordinals
+            .iter()
+            .position(|ordinal| *ordinal == materialization_ordinal)?;
+        let invalidation_ordinal = *dispatch.invalidation_ordinals.get(position)?;
 
-            let materialization_ordinal = invalidation.materialization_ordinal;
-            let Some(materialization) = self
-                .property_load_guard_watchpoint_materializations
-                .iter()
-                .find(|record| record.ordinal == materialization_ordinal)
-            else {
-                continue;
-            };
-            let Some(guard_plan_ordinal) = materialization.guard_plan_ordinal else {
-                continue;
-            };
-            let binding_set_ids = materialization
-                .bindings
-                .iter()
-                .map(|binding| binding.set_id)
-                .collect::<Vec<_>>();
-
-            for attachment in
-                self.property_inline_cache_attachment_records
-                    .iter()
-                    .filter(|record| {
-                        record.lifecycle == VmPropertyInlineCacheAttachmentLifecycle::Active
-                            && record.kind.is_guarded_load()
-                            && record.source_plan_ordinal == guard_plan_ordinal
-                            && record.guarded_materialization_ordinal
-                                == Some(materialization_ordinal)
-                            && record.guarded_dependency_ordinals
-                                == materialization.dependency_ordinals
-                            && record.guarded_binding_set_ids == binding_set_ids
-                    })
-            {
-                requests.push(VmPropertyInlineCacheClearRequest {
-                    owner: attachment.owner,
-                    bytecode_index: attachment.bytecode_index,
-                    bytecode_snapshot: attachment.bytecode_snapshot,
-                    slot: attachment.slot,
-                    kind: attachment.kind,
-                    attachment_ordinal: attachment.ordinal,
-                    source_plan_ordinal: attachment.source_plan_ordinal,
-                    guarded_materialization_ordinal: attachment.guarded_materialization_ordinal,
-                    guarded_dependency_ordinals: attachment.guarded_dependency_ordinals.clone(),
-                    guarded_binding_set_ids: attachment.guarded_binding_set_ids.clone(),
-                    triggering_invalidation_ordinal: Some(*invalidation_ordinal),
-                    triggering_event_dispatch_ordinal: Some(dispatch.ordinal),
-                    key: attachment.key,
-                    base_structure: attachment.base_structure,
-                    holder_structure: attachment.holder_structure,
-                    new_structure: attachment.new_structure,
-                    offset: attachment.offset,
-                });
-            }
-        }
-
-        requests
+        Some(VmPropertyInlineCacheClearRequest {
+            owner: attachment.owner,
+            bytecode_index: attachment.bytecode_index,
+            bytecode_snapshot: attachment.bytecode_snapshot,
+            slot: attachment.slot,
+            kind: attachment.kind,
+            attachment_ordinal: attachment.ordinal,
+            source_plan_ordinal: attachment.source_plan_ordinal,
+            guarded_materialization_ordinal: attachment.guarded_materialization_ordinal,
+            guarded_dependency_ordinals: attachment.guarded_dependency_ordinals.clone(),
+            guarded_binding_set_ids: attachment.guarded_binding_set_ids.clone(),
+            triggering_invalidation_ordinal: Some(invalidation_ordinal),
+            // `dispatch` (the record `record_property_load_guard_watchpoint_
+            // event_dispatch` returned to the caller) really did trigger this
+            // clear, so its ordinal is included for full provenance --
+            // `property_load_guard_watchpoint_event_dispatches` was made
+            // unbounded alongside `_invalidations` (see that push site's
+            // comment) specifically so this is sound.
+            triggering_event_dispatch_ordinal: Some(dispatch.ordinal),
+            key: attachment.key,
+            base_structure: attachment.base_structure,
+            holder_structure: attachment.holder_structure,
+            new_structure: attachment.new_structure,
+            offset: attachment.offset,
+        })
     }
 
     #[allow(dead_code)]

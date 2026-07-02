@@ -269,7 +269,7 @@ pub use tiering::{
     TieringValidationError, STATIC_TIER_DESCRIPTORS, TIER_DESCRIPTOR_TABLE,
 };
 pub use watchpoint::{
-    DependencyStrength, WatchpointDependency, WatchpointDependencyId, WatchpointFireEvent,
-    WatchpointFirePolicy, WatchpointOwner, WatchpointSetDescriptor, WatchpointSetId,
-    WatchpointSetState, WatchpointTarget,
+    DependencyStrength, PropertyInlineCacheClearingDependent, WatchpointDependency,
+    WatchpointDependencyId, WatchpointFireEvent, WatchpointFirePolicy, WatchpointOwner,
+    WatchpointSetDescriptor, WatchpointSetId, WatchpointSetState, WatchpointTarget,
 };

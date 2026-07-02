@@ -377,7 +377,6 @@ use tiering::{
     VmOwnedCallTargetValidationRequest, VmPropertyHasObservationRequest,
     VmPropertyInlineCacheAttachmentRequest, VmPropertyInlineCacheClearRequest,
     VmPropertyLoadGuardInstallRecheckOutcome, VmPropertyLoadGuardInstallRecheckRequest,
-    VmPropertyLoadGuardWatchpointEventDispatchOutcome,
     VmPropertyLoadGuardWatchpointEventDispatchRecord,
     VmPropertyLoadGuardWatchpointMaterializationLifecycle,
     VmPropertyLoadGuardWatchpointMaterializationOutcome,
@@ -1969,6 +1968,25 @@ impl<H: DispatchHost> DispatchHost for VmLoopHintDispatchHost<'_, H> {
 
     fn drain_watchpoint_fire_events(&mut self) -> Vec<crate::jit::WatchpointFireEvent> {
         self.inner.drain_watchpoint_fire_events()
+    }
+
+    fn register_property_load_guard_watchpoint_dependent(
+        &mut self,
+        set: crate::jit::WatchpointSetId,
+        dependent: crate::jit::PropertyInlineCacheClearingDependent,
+    ) {
+        self.inner
+            .register_property_load_guard_watchpoint_dependent(set, dependent)
+    }
+
+    fn drain_fired_property_load_guard_watchpoint_dependents(
+        &mut self,
+    ) -> Vec<(
+        crate::jit::WatchpointSetId,
+        crate::jit::PropertyInlineCacheClearingDependent,
+    )> {
+        self.inner
+            .drain_fired_property_load_guard_watchpoint_dependents()
     }
 
     fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
@@ -18507,21 +18525,50 @@ impl Vm {
         host: &mut H,
     ) -> Vec<VmPropertyLoadGuardWatchpointEventDispatchRecord> {
         let mut dispatches = Vec::new();
+        // Redesign-audit Unit 6 / R5: drained ONCE up front, alongside the fired
+        // events themselves (both queues are populated by the SAME object-store
+        // firing pass, `CoreObjectStore::fire_structure_transition_watchpoints`).
+        let fired_dependents = host.drain_fired_property_load_guard_watchpoint_dependents();
         for event in host.drain_watchpoint_fire_events() {
+            // `record_property_load_guard_watchpoint_event_dispatch` is kept for
+            // its return value's presence-check role (`run_ic_tiering_safepoint`'s
+            // steady-state memo gate reads `dispatches.is_empty()`, never the
+            // per-record contents) and for the accessor's existing direct test
+            // coverage. It is NO LONGER the discovery mechanism for which ICs to
+            // clear -- see below.
             let dispatch = self
                 .tiering
                 .record_property_load_guard_watchpoint_event_dispatch(event);
-            if matches!(
-                dispatch.outcome,
-                VmPropertyLoadGuardWatchpointEventDispatchOutcome::Accepted { .. }
-            ) {
-                let clear_requests = self
+
+            // R5: clear guarded ICs by walking the O(#watchers-of-this-set)
+            // dependents list registered at guard-materialization time, instead
+            // of the deleted `property_inline_cache_clear_requests_for_
+            // watchpoint_dispatch`'s `guarded_dependency_ordinals`/
+            // `guarded_binding_set_ids` cross-reference over every attachment
+            // ever recorded (tiering.rs `record_property_inline_cache_
+            // attachment`) -- the mechanism whose ordinal round-trip through the
+            // (formerly capped) invalidation log silently under-cleared once
+            // VM-lifetime invalidations exceeded the cap (redesign-audit Unit 0,
+            // hotfixed uncapped by e71840f). Mirrors C++
+            // `PropertyInlineCacheClearingWatchpoint::fireInternal`, which
+            // resets its `m_propertyCache` directly through its `m_owner`
+            // back-pointer with no scan
+            // (bytecode/PropertyInlineCacheClearingWatchpoint.cpp). Reuses the
+            // invalidation `dispatch` (above) already recorded rather than
+            // recording a second one -- see the callee's doc for why a second
+            // call would silently no-op.
+            for (_set_id, dependent) in fired_dependents
+                .iter()
+                .filter(|(set_id, _)| *set_id == event.set)
+            {
+                if let Some(request) = self
                     .tiering
-                    .property_inline_cache_clear_requests_for_watchpoint_dispatch(&dispatch);
-                for request in clear_requests {
+                    .property_inline_cache_clear_request_for_guard_dependent(*dependent, &dispatch)
+                {
                     self.clear_property_inline_cache_case(request);
                 }
             }
+
             dispatches.push(dispatch);
         }
         dispatches
@@ -19397,6 +19444,29 @@ impl Vm {
             return Err(ExecutionError::BaselineGeneratedExecutionRejected);
         }
         host.start_structure_transition_watchpoints(&requests)?;
+
+        // Redesign-audit Unit 6 / R5: register this guard's (owner, slot) IC
+        // identity as a dependent of each watchpoint set it now depends on, so
+        // a later fire can find and clear it directly in O(#watchers) instead
+        // of scanning every materialization/attachment ever recorded. Mirrors
+        // C++ constructing a `PropertyInlineCacheClearingWatchpoint` for the
+        // guard and adding it to the set at the same point C++ (re)materializes
+        // it (StructureTransitionPropertyInlineCacheClearingWatchpoint::
+        // fireInternal -> addTransitionWatchpoint,
+        // PropertyInlineCacheClearingWatchpoint.cpp). A dependent registered
+        // here before the outer materialization record below is itself
+        // Accepted is harmless: the watchpoint set genuinely started watching
+        // above regardless, and a stale dependent is a no-op at fire time (see
+        // `fire_structure_transition_watchpoints`'s doc).
+        for request in &requests {
+            host.register_property_load_guard_watchpoint_dependent(
+                request.set,
+                crate::jit::PropertyInlineCacheClearingDependent {
+                    owner: guard_plan.owner,
+                    slot: guard_plan.plan.slot,
+                },
+            );
+        }
 
         let snapshots = live_snapshots
             .iter()
@@ -31735,6 +31805,125 @@ mod tests {
     }
 
     #[test]
+    fn vm_property_inline_cache_watchpoint_clears_guarded_ic_after_1024_invalidations_unit0_regression(
+    ) {
+        // Redesign-audit Unit 0 / Unit 6 permanent regression guard: 8ad6f87
+        // capped `property_load_guard_watchpoint_invalidations` at
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT` (1024) as "diagnostic-only", but
+        // the per-call-frame IC safepoint's discovery path
+        // (`property_inline_cache_clear_requests_for_watchpoint_dispatch`)
+        // did an exact-ordinal `.find()` on it to clear guarded ICs -- so once
+        // VM-lifetime invalidations exceeded the cap, a newly-fired guarded
+        // IC's own invalidation record could silently fail to be stored, and
+        // the IC was never cleared (stale Active attachment = wrong-code
+        // hazard). e71840f hotfixed the cap away; THIS unit (R5, the
+        // watchpoint dependents list) is the PERMANENT fix -- discovery no
+        // longer scans that log at all (see `property_inline_cache_clear_
+        // request_for_guard_dependent`'s doc; the old scanning function is
+        // DELETED). This test proves the fix holds regardless of how many
+        // unrelated invalidations the VM has recorded over its lifetime --
+        // the exact scenario the cap used to break -- so the hazard cannot
+        // return even if someone recapped this log without understanding why
+        // it must stay unbounded.
+        let mut vm = Vm::new(VmConfig::baseline_allowed());
+        let mut host = RecordingCoreHost::with_function_blocks(Vec::new());
+
+        // Flood the invalidations log well past the historical 1024 cap with
+        // unrelated (rejected -- no such materialization exists) records,
+        // simulating VM-lifetime accumulation from unrelated guarded loads
+        // elsewhere in a long-running program.
+        for i in 0..1_100u64 {
+            vm.tiering
+                .record_property_load_guard_watchpoint_invalidation(
+                    super::tiering::VmPropertyLoadGuardWatchpointInvalidationRequest {
+                        materialization_ordinal: 9_000_000 + i,
+                        event: crate::jit::WatchpointFireEvent {
+                            set: crate::jit::WatchpointSetId(9_000_000 + i),
+                            target: crate::jit::WatchpointTarget::StructureTransition {
+                                structure: StructureId(1),
+                            },
+                            generation: WatchpointGeneration(1),
+                        },
+                    },
+                );
+        }
+        let invalidations_before = vm
+            .tiering_integration()
+            .property_load_guard_watchpoint_invalidations()
+            .len();
+        assert!(
+            invalidations_before > 1024,
+            "test setup must exceed the historical HOT_TELEMETRY_RECORD_RETAIN_LIMIT cap"
+        );
+
+        // Now set up ONE real guarded property-load IC and fire its
+        // watchpoint -- the same production path as
+        // `vm_property_inline_cache_watchpoint_dispatch_clears_only_matching_
+        // guarded_attachment`, without that test's isolation padding (this
+        // test's whole point is the flood above).
+        let (object, _) = create_prototype_data_property_object_for_test(&mut vm, &mut host);
+        host.clear_observations();
+
+        let code_block = generated_property_get_by_name_return_consumed_code_block();
+        let owner = register_test_code_block(&mut vm, code_block.clone());
+        install_typed_baseline_for_test(&mut vm, owner, 4143);
+        let first = execute_registered_code_block_with_host_and_arguments(
+            &mut vm,
+            owner,
+            &code_block,
+            &mut host,
+            vec![RuntimeValue::undefined(), object],
+        );
+        assert_eq!(
+            first,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+        let guard_plan = vm.tiering_integration().property_load_guard_plans()[0].clone();
+        let _materialization = accepted_guarded_materialization_for_plan(&vm, &guard_plan);
+        let attachment = accepted_guarded_attachment_for_plan(&vm, &guard_plan);
+
+        host.set_identifier_data_property_for_test(object, 777, RuntimeValue::from_i32(1))
+            .expect("matching shape transition");
+        let dispatches = vm.drain_property_load_guard_watchpoint_events_for_test(&mut host);
+        assert_eq!(dispatches.len(), 1);
+
+        // THE REGRESSION GUARD: the guarded IC IS cleared, despite the log
+        // holding well over 1024 entries -- this is exactly the scenario that
+        // fails under the old capped log (a cap would drop this very
+        // invalidation's own record, so its immediate round-trip lookup --
+        // and therefore the clear -- would silently miss).
+        assert_eq!(
+            vm.tiering_integration()
+                .property_inline_cache_clear_records()
+                .len(),
+            1
+        );
+        let attachment_lifecycle = vm
+            .tiering_integration()
+            .property_inline_cache_attachment_records()
+            .iter()
+            .find(|record| record.ordinal == attachment.ordinal)
+            .expect("attachment record")
+            .lifecycle;
+        assert!(matches!(
+            attachment_lifecycle,
+            VmPropertyInlineCacheAttachmentLifecycle::Cleared { .. }
+        ));
+
+        // Confirm the log really did grow past the flood (i.e. this clear's
+        // own invalidation record was appended on top of the >1024 already
+        // there, not dropped) -- the log is intentionally unbounded now (see
+        // its push site's comment), which is what makes the assertion above
+        // sound.
+        assert!(
+            vm.tiering_integration()
+                .property_load_guard_watchpoint_invalidations()
+                .len()
+                > invalidations_before
+        );
+    }
+
+    #[test]
     fn vm_property_inline_cache_clear_records_rejected_stale_already_cleared_and_mismatched_provenance(
     ) {
         let mut vm = Vm::new(VmConfig::baseline_allowed());
@@ -32616,6 +32805,25 @@ mod tests {
             self.core.drain_watchpoint_fire_events()
         }
 
+        fn register_property_load_guard_watchpoint_dependent(
+            &mut self,
+            set: crate::jit::WatchpointSetId,
+            dependent: crate::jit::PropertyInlineCacheClearingDependent,
+        ) {
+            self.core
+                .register_property_load_guard_watchpoint_dependent(set, dependent)
+        }
+
+        fn drain_fired_property_load_guard_watchpoint_dependents(
+            &mut self,
+        ) -> Vec<(
+            crate::jit::WatchpointSetId,
+            crate::jit::PropertyInlineCacheClearingDependent,
+        )> {
+            self.core
+                .drain_fired_property_load_guard_watchpoint_dependents()
+        }
+
         fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
             self.core.has_pending_structure_chain_invalidation_events()
         }
@@ -32881,6 +33089,25 @@ mod tests {
 
         fn drain_watchpoint_fire_events(&mut self) -> Vec<crate::jit::WatchpointFireEvent> {
             self.inner.drain_watchpoint_fire_events()
+        }
+
+        fn register_property_load_guard_watchpoint_dependent(
+            &mut self,
+            set: crate::jit::WatchpointSetId,
+            dependent: crate::jit::PropertyInlineCacheClearingDependent,
+        ) {
+            self.inner
+                .register_property_load_guard_watchpoint_dependent(set, dependent)
+        }
+
+        fn drain_fired_property_load_guard_watchpoint_dependents(
+            &mut self,
+        ) -> Vec<(
+            crate::jit::WatchpointSetId,
+            crate::jit::PropertyInlineCacheClearingDependent,
+        )> {
+            self.inner
+                .drain_fired_property_load_guard_watchpoint_dependents()
         }
 
         fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {

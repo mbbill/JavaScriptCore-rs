@@ -348,6 +348,29 @@ pub(crate) struct CoreObjectStore {
     pub(crate) structure_transition_watchpoints_by_structure:
         HashMap<StructureId, Vec<WatchpointSetId>>,
     pub(crate) fired_watchpoint_events: Vec<WatchpointFireEvent>,
+    // Redesign-audit Unit 6 / R5: the dependents list C++'s `WatchpointSet` gets
+    // for free from its intrusive `Watchpoint` list (`m_set`,
+    // bytecode/Watchpoint.h) -- who to notify when a set fires, in O(#watchers).
+    // Kept as a side table (sibling to `structure_transition_watchpoints`
+    // above), NOT a field on `object::watchpoint::WatchpointSet`, so that
+    // struct's footprint stays a plain state/generation/kind record; see
+    // `PropertyInlineCacheClearingDependent`'s doc for the C++ mapping.
+    // Registered at guard-materialization time
+    // (`Vm::materialize_property_load_guard_watchpoints_from_host`); replaces
+    // the `guarded_dependency_ordinals`/`guarded_binding_set_ids` cross-
+    // reference over every attachment ever recorded that used to do this
+    // discovery (the mechanism behind the Unit-0 unbounded-log hazard,
+    // hotfixed uncapped by e71840f).
+    pub(crate) property_load_guard_watchpoint_dependents:
+        HashMap<WatchpointSetId, Vec<PropertyInlineCacheClearingDependent>>,
+    // Popped off `property_load_guard_watchpoint_dependents` as each set fires
+    // (see `fire_structure_transition_watchpoints`), mirroring C++
+    // `WatchpointSet::fireAllWatchpoints` popping each `Watchpoint` off `m_set`
+    // before calling `fire()` (Watchpoint.cpp) -- the self-pruning that keeps a
+    // fired watchpoint from lingering on the set's list. Drained by
+    // `drain_fired_property_load_guard_watchpoint_dependents`.
+    pub(crate) fired_property_load_guard_watchpoint_dependents:
+        Vec<(WatchpointSetId, PropertyInlineCacheClearingDependent)>,
     pub(crate) structure_chain_invalidation_events: Vec<StructureChainInvalidationEvent>,
     pub(crate) object_prototype: Option<RuntimeValue>,
     pub(crate) function_prototype: Option<RuntimeValue>,
@@ -7452,11 +7475,57 @@ impl CoreObjectStore {
                 },
                 generation: WatchpointGeneration(record.set.generation()),
             });
+            // Redesign-audit Unit 6 / R5: pop this set's dependents into the
+            // fired queue right as it fires -- the safe-Rust mirror of C++
+            // `WatchpointSet::fireAllWatchpoints` popping each `Watchpoint` off
+            // `m_set` before firing it (Watchpoint.cpp). A dependent left
+            // registered for a set that never fires (e.g. its guarded IC was
+            // cleared/replaced first) is harmless: it is a no-op at fire time
+            // the same way `PropertyInlineCacheClearingWatchpoint::fireInternal`
+            // is a no-op when `m_owner->isPendingDestruction()`
+            // (PropertyInlineCacheClearingWatchpoint.cpp) -- liveness is
+            // rechecked at fire time rather than eagerly on every clear path.
+            if let Some(dependents) = self
+                .property_load_guard_watchpoint_dependents
+                .remove(&set_id)
+            {
+                self.fired_property_load_guard_watchpoint_dependents
+                    .extend(dependents.into_iter().map(|dependent| (set_id, dependent)));
+            }
         }
     }
 
     pub(crate) fn drain_watchpoint_fire_events(&mut self) -> Vec<WatchpointFireEvent> {
         std::mem::take(&mut self.fired_watchpoint_events)
+    }
+
+    /// Redesign-audit Unit 6 / R5: register `dependent` (an (owner, slot) IC
+    /// identity) as depending on watchpoint `set`, mirroring C++ constructing a
+    /// `PropertyInlineCacheClearingWatchpoint` and adding it to the set
+    /// (`Structure::addTransitionWatchpoint`, called from
+    /// `StructureTransitionPropertyInlineCacheClearingWatchpoint::fireInternal`,
+    /// PropertyInlineCacheClearingWatchpoint.cpp). Dedupes like the sibling
+    /// `add_structure_transition_watchpoint_reverse_lookup`.
+    pub(crate) fn register_property_load_guard_watchpoint_dependent(
+        &mut self,
+        set: WatchpointSetId,
+        dependent: PropertyInlineCacheClearingDependent,
+    ) {
+        let dependents = self
+            .property_load_guard_watchpoint_dependents
+            .entry(set)
+            .or_default();
+        if !dependents.contains(&dependent) {
+            dependents.push(dependent);
+        }
+    }
+
+    /// Redesign-audit Unit 6 / R5: drain the `(WatchpointSetId, dependent)`
+    /// pairs popped off the dependents list as their sets fired this tick.
+    pub(crate) fn drain_fired_property_load_guard_watchpoint_dependents(
+        &mut self,
+    ) -> Vec<(WatchpointSetId, PropertyInlineCacheClearingDependent)> {
+        std::mem::take(&mut self.fired_property_load_guard_watchpoint_dependents)
     }
 
     pub(crate) fn has_pending_structure_chain_invalidation_events(&self) -> bool {

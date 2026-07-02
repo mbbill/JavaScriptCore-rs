@@ -116,3 +116,28 @@ pub struct WatchpointFireEvent {
     pub target: WatchpointTarget,
     pub generation: WatchpointGeneration,
 }
+
+/// The identity a guarded property-inline-cache attachment registers as a
+/// dependent of a `WatchpointSet`, so a fire can find and clear it directly.
+///
+/// C++ JSC's `WatchpointSet` owns an intrusive list of `Watchpoint` objects
+/// (`m_set`, a `SentinelLinkedList<Watchpoint>`, bytecode/Watchpoint.h); firing
+/// pops each node off the list and dispatches to its concrete `fireInternal`.
+/// The concrete `PropertyInlineCacheClearingWatchpoint` stores exactly this
+/// pair as its own fields -- `PackedCellPtr<CodeBlock> m_owner` and
+/// `PropertyInlineCache& m_propertyCache` (bytecode/
+/// PropertyInlineCacheClearingWatchpoint.h) -- and `fireInternal` resets
+/// `m_propertyCache` through `m_owner` directly, no scan
+/// (PropertyInlineCacheClearingWatchpoint.cpp). Rust cannot hold that raw
+/// intrusive/reference pair safely, so this is the side-table entry shape used
+/// in its place (redesign-audit Unit 6 / R5): the `(CodeBlockId,
+/// InlineCacheSlotId)` identity that names the same IC slot, held in a side
+/// map keyed by `WatchpointSetId` (object store's
+/// `property_load_guard_watchpoint_dependents`) instead of an owning pointer
+/// on the `WatchpointSet` itself, so `WatchpointSet`'s footprint (object/
+/// watchpoint.rs) stays a plain state/generation/kind record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PropertyInlineCacheClearingDependent {
+    pub owner: CodeBlockId,
+    pub slot: crate::jit::InlineCacheSlotId,
+}

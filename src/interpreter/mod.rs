@@ -65,9 +65,10 @@ use crate::jit::{
     GeneratedPropertyStoreProbeMissReason, GeneratedPropertyStoreProbeRequest,
     GeneratedPropertyStoreProbeResult, InlineCacheFallbackSemantics, InlineCacheKind,
     InlineCacheMissHandoffDescriptor, InlineCacheSlotId, InlineCacheStubKind,
-    PropertyHasObservationDescriptor, PropertyLoadAccessCasePlanKind,
-    PropertyLoadBaseNormalization, PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome,
-    PropertyLoadGuardPlan, PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
+    PropertyHasObservationDescriptor, PropertyInlineCacheClearingDependent,
+    PropertyLoadAccessCasePlanKind, PropertyLoadBaseNormalization,
+    PropertyLoadGuardChainEntryProof, PropertyLoadGuardChainOutcome, PropertyLoadGuardPlan,
+    PropertyLoadGuardRequirement, PropertyLoadObservationChainEntry,
     PropertyLoadObservationDescriptor, PropertyLoadObservationReadiness,
     PropertyStoreAccessCasePlanKind, TierPlanDescriptor, WatchpointFireEvent, WatchpointSetId,
     WatchpointTarget,
@@ -3102,6 +3103,31 @@ pub trait DispatchHost {
         Vec::new()
     }
 
+    /// Redesign-audit Unit 6 / R5: register a guarded property-load IC's
+    /// (owner, slot) identity as a dependent of watchpoint `set` at guard-
+    /// materialization time, mirroring C++ constructing a
+    /// `PropertyInlineCacheClearingWatchpoint` and adding it to the set
+    /// (bytecode/PropertyInlineCacheClearingWatchpoint.cpp). Default no-op:
+    /// only the production `CoreOpcodeDispatchHost` (and hosts that wrap it)
+    /// track dependents; test/generic hosts never materialize guarded ICs.
+    fn register_property_load_guard_watchpoint_dependent(
+        &mut self,
+        _set: WatchpointSetId,
+        _dependent: PropertyInlineCacheClearingDependent,
+    ) {
+    }
+
+    /// Redesign-audit Unit 6 / R5: drain the `(WatchpointSetId, dependent)`
+    /// pairs popped off the dependents list as their sets fired this tick,
+    /// mirroring C++ popping each `Watchpoint` off `WatchpointSet::m_set`
+    /// before `fire()` (Watchpoint.cpp `fireAllWatchpoints`). Default empty,
+    /// matching `drain_watchpoint_fire_events`.
+    fn drain_fired_property_load_guard_watchpoint_dependents(
+        &mut self,
+    ) -> Vec<(WatchpointSetId, PropertyInlineCacheClearingDependent)> {
+        Vec::new()
+    }
+
     fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
         false
     }
@@ -4628,6 +4654,22 @@ impl CoreOpcodeDispatchHost {
 
     pub fn drain_watchpoint_fire_events(&mut self) -> Vec<WatchpointFireEvent> {
         self.objects.drain_watchpoint_fire_events()
+    }
+
+    pub fn register_property_load_guard_watchpoint_dependent(
+        &mut self,
+        set: WatchpointSetId,
+        dependent: PropertyInlineCacheClearingDependent,
+    ) {
+        self.objects
+            .register_property_load_guard_watchpoint_dependent(set, dependent);
+    }
+
+    pub fn drain_fired_property_load_guard_watchpoint_dependents(
+        &mut self,
+    ) -> Vec<(WatchpointSetId, PropertyInlineCacheClearingDependent)> {
+        self.objects
+            .drain_fired_property_load_guard_watchpoint_dependents()
     }
 
     pub fn has_pending_structure_chain_invalidation_events(&self) -> bool {
@@ -6452,6 +6494,22 @@ impl DispatchHost for CoreOpcodeDispatchHost {
 
     fn drain_watchpoint_fire_events(&mut self) -> Vec<WatchpointFireEvent> {
         CoreOpcodeDispatchHost::drain_watchpoint_fire_events(self)
+    }
+
+    fn register_property_load_guard_watchpoint_dependent(
+        &mut self,
+        set: WatchpointSetId,
+        dependent: PropertyInlineCacheClearingDependent,
+    ) {
+        CoreOpcodeDispatchHost::register_property_load_guard_watchpoint_dependent(
+            self, set, dependent,
+        )
+    }
+
+    fn drain_fired_property_load_guard_watchpoint_dependents(
+        &mut self,
+    ) -> Vec<(WatchpointSetId, PropertyInlineCacheClearingDependent)> {
+        CoreOpcodeDispatchHost::drain_fired_property_load_guard_watchpoint_dependents(self)
     }
 
     fn has_pending_structure_chain_invalidation_events(&mut self) -> bool {
@@ -28185,6 +28243,121 @@ mod tests {
             vec![StructureChainInvalidationEvent { old_structure }]
         );
         assert_ne!(object_structure_id(&host.objects, object), old_structure);
+    }
+
+    #[test]
+    fn property_load_guard_watchpoint_dependents_fire_together_and_prune_on_fire() {
+        // Redesign-audit Unit 6 / R5: C++'s `WatchpointSet` gets O(#watchers)
+        // firing for free via its intrusive `Watchpoint` list (bytecode/
+        // Watchpoint.h `m_set`); this is the Rust side-table mirror
+        // (`property_load_guard_watchpoint_dependents`, kept off the plain
+        // `object::watchpoint::WatchpointSet` struct -- see
+        // `PropertyInlineCacheClearingDependent`'s doc for the C++ mapping).
+        let mut host = CoreOpcodeDispatchHost::new();
+        let mut heap = Heap::new();
+        let object = host.allocate_null_prototype_object_for_test();
+        let key = CorePropertyKey::String("field".into());
+        let old_structure = object_structure_id(&host.objects, object);
+
+        // A distinct starting shape from `object`'s (both would otherwise
+        // share the same empty-root structure, StructureIdTable::create_root,
+        // and firing `object`'s transition would spuriously also fire a
+        // watchpoint on this "unrelated" structure).
+        let unrelated_object = host.allocate_null_prototype_object_for_test();
+        let unrelated_key = CorePropertyKey::String("other".into());
+        host.objects
+            .put(
+                &mut heap,
+                unrelated_object,
+                &unrelated_key,
+                RuntimeValue::from_i32(9),
+            )
+            .expect("seed unrelated object shape");
+        let unrelated_structure = object_structure_id(&host.objects, unrelated_object);
+        assert_ne!(unrelated_structure, old_structure);
+
+        let fired_set = WatchpointSetId(21);
+        let unrelated_set = WatchpointSetId(22);
+        host.start_structure_transition_watchpoints(&[
+            structure_watchpoint_request(21, old_structure),
+            structure_watchpoint_request(22, unrelated_structure),
+        ])
+        .expect("watchpoint start");
+
+        // Two independent guarded ICs (different CodeBlock owners, different
+        // IC slots) both depend on `fired_set`...
+        let dependent_a = PropertyInlineCacheClearingDependent {
+            owner: CodeBlockId(CellId(9001)),
+            slot: InlineCacheSlotId(0),
+        };
+        let dependent_b = PropertyInlineCacheClearingDependent {
+            owner: CodeBlockId(CellId(9002)),
+            slot: InlineCacheSlotId(1),
+        };
+        host.register_property_load_guard_watchpoint_dependent(fired_set, dependent_a);
+        host.register_property_load_guard_watchpoint_dependent(fired_set, dependent_b);
+        // Re-registering the same (set, dependent) pair must not duplicate it,
+        // mirroring `WatchpointSet::add`'s single-membership semantics for a
+        // given `Watchpoint` node (a re-materialized guard re-registers).
+        host.register_property_load_guard_watchpoint_dependent(fired_set, dependent_a);
+
+        // ...and one UNRELATED guarded IC depends on a different, never-fired
+        // set: firing `fired_set` must never touch it (no scan of unrelated
+        // sets).
+        let unrelated_dependent = PropertyInlineCacheClearingDependent {
+            owner: CodeBlockId(CellId(9003)),
+            slot: InlineCacheSlotId(0),
+        };
+        host.register_property_load_guard_watchpoint_dependent(unrelated_set, unrelated_dependent);
+
+        // Fire ONLY `fired_set`'s structure via a real property transition
+        // (same trigger as `structure_transition_watchpoint_fires_for_put_by_
+        // name_property_transition` above).
+        assert_eq!(
+            host.objects
+                .put(&mut heap, object, &key, RuntimeValue::from_i32(1)),
+            Ok(CorePropertyPut::Stored)
+        );
+
+        let events = host.drain_watchpoint_fire_events();
+        assert_eq!(events.len(), 1);
+        assert_structure_watchpoint_event(
+            events[0],
+            fired_set,
+            old_structure,
+            WatchpointGeneration(1),
+        );
+
+        // O(watchers): both `fired_set` dependents drain out, deduped to
+        // exactly 2 (not 3, despite `dependent_a` being registered twice), and
+        // the unrelated set's dependent is absent.
+        let fired_dependents = host.drain_fired_property_load_guard_watchpoint_dependents();
+        assert_eq!(fired_dependents.len(), 2);
+        assert!(fired_dependents.contains(&(fired_set, dependent_a)));
+        assert!(fired_dependents.contains(&(fired_set, dependent_b)));
+        assert!(!fired_dependents
+            .iter()
+            .any(|(set, dependent)| *set == unrelated_set || *dependent == unrelated_dependent));
+        // Draining again yields nothing further: the queue itself is a
+        // one-shot drain, matching `drain_watchpoint_fire_events`.
+        assert!(host
+            .drain_fired_property_load_guard_watchpoint_dependents()
+            .is_empty());
+
+        // Self-pruning on fire (mirrors C++ popping each `Watchpoint` off
+        // `WatchpointSet::m_set` before firing it, Watchpoint.cpp
+        // `fireAllWatchpoints`): the fired set's dependents entry is gone from
+        // the registry, so it cannot linger and be redundantly rescanned or
+        // double-cleared, while the never-fired unrelated set's entry is
+        // untouched.
+        assert!(!host
+            .objects
+            .property_load_guard_watchpoint_dependents
+            .contains_key(&fired_set));
+        assert!(host
+            .objects
+            .property_load_guard_watchpoint_dependents
+            .contains_key(&unrelated_set));
     }
 
     #[test]
