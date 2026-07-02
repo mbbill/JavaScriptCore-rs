@@ -965,6 +965,28 @@ impl VmTieringIntegration {
             .is_some()
     }
 
+    // Redesign-audit telemetry Unit 4 SCOPE NOTE: a resident-read repoint was
+    // attempted here (checking `candidate.structure_stub_info.access_cases.
+    // contains(&access_case_ref)` instead of scanning this log) and REVERTED on
+    // evidence -- two test failures proved the log captures state a resident
+    // read cannot: (1) `vm_structure_stub_access_case_link_rejection_does_not_
+    // mutate_code_block_access_cases` needs "have we already ATTEMPTED this
+    // exact link, even if it was REJECTED" (a rejection leaves no resident
+    // trace, so a resident-only check would re-attempt -- and re-push a fresh
+    // `VmStructureStubAccessCaseLinkRecord` -- on every safepoint entry for a
+    // permanently-failing candidate, i.e. it would make this vec's growth
+    // WORSE, unbounded-per-dispatch, exactly what this redesign track exists to
+    // prevent); (2) `vm_generated_property_load_sidecar_rejects_structure_stub_
+    // descriptor_without_current_access_case` needs the dedup to stay keyed on
+    // "did we already record linking this," not "is it resident right now" --
+    // a resident-only check self-heals when a test (or a real runtime path)
+    // externally drifts `access_cases`, silently re-establishing a link the
+    // rest of the pipeline had already moved past. Kept the original VM-global
+    // scan; a real fix needs a resident "attempted and rejected" marker on
+    // `StructureStubInfo` itself (JSC has no such log -- PolymorphicAccess
+    // either holds a case or doesn't -- so the faithful correction is a serial
+    // architecture decision to add that resident rejection memo, not a Unit-4
+    // read-repoint).
     pub(crate) fn structure_stub_access_case_link_attempt_exists(
         &self,
         candidate: &VmStructureStubPropertyInlineCacheCandidate,
@@ -6262,8 +6284,25 @@ impl VmTieringIntegration {
             self.retire_structure_stub_descriptor_records_for_clear(&record);
         }
 
-        self.property_inline_cache_clear_records
-            .push(record.clone());
+        // Redesign-audit telemetry Unit 4 SCOPE NOTE: the audit catalogued this
+        // vec as having no production vec-readback, but
+        // `assert_pending_watchpoint_dispatch_cleared_attachment` (vm/mod.rs
+        // tests) reads `.last()` for the full causal-provenance chain
+        // (attachment_ordinal / guarded_materialization_ordinal /
+        // triggering_invalidation_ordinal / triggering_event_dispatch_ordinal /
+        // outcome) that has no InlineCacheTable counterpart -- JSC keeps no such
+        // log either (bytecode/StructureStubInfo.h), but Rust's watchpoint-clear
+        // pipeline currently joins this record against sibling ordinal-keyed
+        // logs (property_load_guard_watchpoint_invalidations/_event_dispatches)
+        // that are themselves out of this unit's scope. Per the unit's own
+        // empirical method ("if a test failure reveals a reader, fall back to
+        // the cap"), this falls back to the standard
+        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT` cap-and-stop guard used
+        // throughout this file instead of full deletion.
+        if self.property_inline_cache_clear_records.len() < HOT_TELEMETRY_RECORD_RETAIN_LIMIT {
+            self.property_inline_cache_clear_records
+                .push(record.clone());
+        }
         record
     }
 
@@ -23578,6 +23617,65 @@ mod tests {
         // Exactly one evolution STATE per (site, kind) -- two sites (load,
         // store) here -- never one per operation.
         assert_eq!(tiering.property_inline_cache_evolution_states.len(), 2);
+    }
+
+    // Redesign-audit telemetry Unit 4 regression: N property-inline-cache clear
+    // events must leave `property_inline_cache_clear_records` capped at
+    // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT`, never growing to N. This field could
+    // not be safely deleted in Unit 4 (see the SCOPE NOTE on
+    // `record_property_inline_cache_clear`: a test-revealed reader --
+    // `assert_pending_watchpoint_dispatch_cleared_attachment` in vm/mod.rs --
+    // needs the full causal-provenance record, not just a resident fact), so
+    // the fallback is the standard cap-and-stop guard used throughout this
+    // file. Before this guard, every one of these N clears would have pushed a
+    // new record forever (the exact unbounded-per-operation shape this
+    // redesign track exists to close).
+    #[test]
+    fn vm_property_inline_cache_clear_records_stay_capped_across_many_clears() {
+        let owner = CodeBlockId(CellId(9500));
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+
+        const CLEARS: usize = HOT_TELEMETRY_RECORD_RETAIN_LIMIT + 500;
+        for index in 0..CLEARS {
+            let request = VmPropertyInlineCacheClearRequest {
+                owner,
+                bytecode_index: BytecodeIndex::from_offset(index as u32),
+                bytecode_snapshot,
+                slot: InlineCacheSlotId(index as u32),
+                kind: VmPropertyInlineCacheAttachmentKind::OwnDataLoad,
+                attachment_ordinal: 0,
+                source_plan_ordinal: 0,
+                guarded_materialization_ordinal: None,
+                guarded_dependency_ordinals: Vec::new(),
+                guarded_binding_set_ids: Vec::new(),
+                triggering_invalidation_ordinal: None,
+                triggering_event_dispatch_ordinal: None,
+                key: CacheKey::Property(PropertyKey::from_identifier(Identifier::from_atom(
+                    AtomId::from_table_slot(index as u32),
+                ))),
+                base_structure: StructureId(1),
+                holder_structure: None,
+                new_structure: None,
+                offset: None,
+            };
+            // Every one of these is a validation-time rejection (no matching
+            // attachment record exists), which is sufficient: the cap guards
+            // the push itself, regardless of accepted/rejected outcome (see
+            // `record_property_inline_cache_clear`, which pushes unconditionally
+            // on any outcome once under the cap).
+            tiering.record_property_inline_cache_clear(
+                request,
+                VmPropertyInlineCacheClearOutcome::Rejected {
+                    reason: VmPropertyInlineCacheClearRejectionReason::AttachmentMissing,
+                },
+            );
+        }
+
+        assert_eq!(
+            tiering.property_inline_cache_clear_records().len(),
+            HOT_TELEMETRY_RECORD_RETAIN_LIMIT
+        );
     }
 
     fn structure_stub_info_for_plan(
