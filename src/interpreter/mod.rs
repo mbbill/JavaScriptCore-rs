@@ -39,8 +39,9 @@ use crate::bytecode::register::{
     CallFrameSlotLayout, RegisterFrameShape, ThisArgumentOffset, VirtualRegister,
 };
 use crate::bytecode::{
-    ArrayProfile, BytecodeIndex, CodeKind, ConstructAbility, ConstructorKind, CoreOpcode,
-    OperandKind, PackedInstructionStream, ParseMode, PropertyCacheKey,
+    ArrayProfile, BytecodeIndex, Checkpoint, CodeKind, ConstructAbility, ConstructorKind,
+    CoreOpcode, OperandKind, PackedInstructionStream, ParseMode, PropertyCacheKey,
+    ValueProfileBucketKind,
 };
 // Indirect-eval host hooks expose the global binding set the Vm-owned eval
 // compile uses; the type lives in the bytecompiler (single-crate, no cycle).
@@ -8095,6 +8096,9 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // `op_get_from_scope` ClosureVar fast path profiles the loaded
+                // variable (`getClosureVar`, LowLevelInterpreter64.asm:2925-2930).
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::PutClosureCell => {
@@ -8139,6 +8143,13 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(error) => return DispatchOutcome::Fail(error),
                 };
+                // `op_get_from_scope` GlobalLexicalVar fast path profiles after
+                // the TDZ check passes (`getGlobalVar`, LowLevelInterpreter64.asm:
+                // 2917-2923, taken at :2944-2949); the TDZ-empty branch routes to
+                // the slow path, which throws without profiling
+                // (`slow_path_get_from_scope` uses the unprofiled `LLINT_RETURN`,
+                // LLIntSlowPaths.cpp:2356-2388).
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::InitializeGlobalLexical => {
@@ -8225,6 +8236,18 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(outcome) => return outcome,
                 };
+                // `op_get_from_scope` GlobalProperty fast path profiles the loaded
+                // property (`getProperty`, LowLevelInterpreter64.asm:2910-2915).
+                // DIVERGENCE (over-profiling, immaterial): C++ guards that fast
+                // path with loadScopeWithStructureCheck (asm:2900); a structure
+                // MISS routes to the UNPROFILED slow path
+                // (`slow_path_get_from_scope`, plain `LLINT_RETURN`,
+                // LLIntSlowPaths.cpp:2356-2388). The Rust lowering has no cached
+                // fast/slow split, so it profiles EVERY synchronous success,
+                // including executions C++ would leave unprofiled after a
+                // structure miss — same value type in steady state, so the
+                // feedback is equivalent.
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::ResolveGlobalObjectProperty => {
@@ -8390,6 +8413,11 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     Ok(value) => value,
                     Err(outcome) => return outcome,
                 };
+                // `op_get_by_id_with_this` is an LLInt slow-path-only op
+                // (LowLevelInterpreter.asm:2499) whose every successful load is
+                // profiled via `LLINT_RETURN_PROFILED`
+                // (`slow_path_get_by_id_with_this`, LLIntSlowPaths.cpp:827-836).
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::GetByName => {
@@ -8425,6 +8453,14 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                         get_cache.cached_structure_id,
                         PropertyOffset::new(get_cache.cached_offset),
                     ) {
+                        // LLInt profiles the monomorphic fast-path load before
+                        // returning (`performGetByIDHelper` `.opGetByIdDefault`
+                        // valueProfile, LowLevelInterpreter64.asm:1652-1661).
+                        self.record_value_profile(
+                            state.code_block,
+                            instruction.bytecode_index,
+                            value,
+                        );
                         return write_register(state, window, destination, value);
                     }
                 }
@@ -8464,6 +8500,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     object,
                     &get_cache,
                 );
+                // The slow path profiles the loaded value too, after the cache
+                // refill (`slow_path_get_by_id` -> `LLINT_RETURN_PROFILED`,
+                // LLIntSlowPaths.cpp:962-972).
+                self.record_value_profile(state.code_block, instruction.bytecode_index, value);
                 write_register(state, window, destination, value)
             }
             CoreOpcode::PutByName => {
@@ -10147,6 +10187,32 @@ impl CoreOpcodeDispatchHost {
             index,
             profile,
         });
+    }
+
+    // C++ JSC: the LLInt `valueProfile` macro stores the instruction's produced
+    // value into its per-site ValueProfile bucket on EVERY successful execution,
+    // fast and slow paths alike (LowLevelInterpreter64.asm:77-81; slow paths via
+    // `LLINT_RETURN_PROFILED`, LLIntSlowPaths.cpp:155-165, which runs
+    // `LLINT_CHECK_EXCEPTION` first — a throwing execution never samples). The
+    // Rust dispatch arms call this on each success path before the destination
+    // write. The record API's authority/lifecycle/missing-slot rejections are
+    // dropped, mirroring `record_in_by_val_array_profile_indexed_read` above:
+    // C++ has no failure mode here (the store is an unconditional raw write
+    // through the shared CodeBlock*), so a Rust-side gate rejection must not
+    // fail the dispatch — sites without a derived slot simply do not sample.
+    fn record_value_profile(
+        &self,
+        code_block: &CodeBlock,
+        bytecode_index: BytecodeIndex,
+        value: RuntimeValue,
+    ) {
+        let _ = code_block.record_value_profile_sample(
+            crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+            bytecode_index,
+            Checkpoint::NONE,
+            ValueProfileBucketKind::Sample,
+            value,
+        );
     }
 
     fn get_property_value(
@@ -28101,6 +28167,343 @@ mod tests {
         assert_eq!(descriptor.holder_object, descriptor.base_object);
         assert_eq!(descriptor.chain.len(), 1);
         assert!(descriptor.validate().is_ok());
+    }
+
+    // LLInt `valueProfile` semantics (LowLevelInterpreter64.asm:77-81): every
+    // successful `op_get_by_id` execution — slow path (`LLINT_RETURN_PROFILED`,
+    // LLIntSlowPaths.cpp:962-972) AND monomorphic fast path
+    // (`performGetByIDHelper` `.opGetByIdDefault`, LowLevelInterpreter64.asm:
+    // 1652-1661) — stores the loaded value into the site's profile bucket.
+    // Six runs cross the LLINT_CACHE_WARMUP=4 arming boundary, so both paths
+    // are exercised; each must sample.
+    #[test]
+    fn get_by_name_records_value_profile_on_fast_and_slow_paths() {
+        let object_register = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(240));
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "field".into());
+        let object = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(
+                object,
+                &CorePropertyKey::String("field".into()),
+                RuntimeValue::from_i32(7),
+            )
+            .unwrap();
+
+        let runs = u32::from(LLINT_CACHE_WARMUP) + 2;
+        for _ in 0..runs {
+            let mut stack = ExecutionContextStack::default();
+            let mut registers = RegisterFile::default();
+            let mut exceptions = ExceptionState::default();
+            let mut heap = Heap::new();
+            enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+            let window = stack.top_frame().unwrap().register_window;
+            registers.write(window, object_register, object).unwrap();
+
+            let completion = execute_code_block(
+                InterpreterExecutionState {
+                    stack: &mut stack,
+                    registers: &mut registers,
+                    exceptions: &mut exceptions,
+                    heap: &mut heap,
+                },
+                owner,
+                &block,
+                &mut host,
+                DispatchConfig::default(),
+            );
+            assert_eq!(
+                completion,
+                ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+            );
+        }
+
+        // The site armed monomorphic, so the last runs went through the LLInt
+        // fast path — the per-run sample count below therefore proves BOTH
+        // paths profile.
+        assert_eq!(
+            block
+                .llint_get_by_id_cache(BytecodeIndex::from_offset(0))
+                .mode,
+            GetByIdCacheMode::Monomorphic
+        );
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles.bucket_samples[0];
+        assert_eq!(sample.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
+        assert_eq!(sample.value, RuntimeValue::from_i32(7));
+        assert_eq!(sample.sample_count, runs);
+        assert_eq!(
+            profiles.jit_storage.raw_value_for_slot(sample.bucket.slot),
+            Some(RuntimeValue::from_i32(7).encoded())
+        );
+    }
+
+    // `LLINT_RETURN_PROFILED` runs `LLINT_CHECK_EXCEPTION` before the profile
+    // store (LLIntSlowPaths.cpp:155-161): a throwing `op_get_by_id` never
+    // samples its value profile.
+    #[test]
+    fn get_by_name_thrown_exception_does_not_record_value_profile() {
+        let object_register = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetByName,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(object_register),
+                    Operand::IdentifierIndex(11),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(241));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(11, "field".into());
+        // The base register stays `undefined`: the load throws the catchable
+        // "undefined is not an object" TypeError.
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert!(matches!(completion, ExecutionCompletion::Threw(_)));
+        assert!(block
+            .side_tables()
+            .value_profiles()
+            .bucket_samples
+            .is_empty());
+    }
+
+    // `op_get_from_scope` ClosureVar fast path profiles the loaded variable
+    // (`getClosureVar`, LowLevelInterpreter64.asm:2925-2930).
+    #[test]
+    fn get_closure_cell_records_value_profile_sample() {
+        let cell_register = local(0);
+        let destination = local(1);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetClosureCell,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(cell_register),
+                ],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(242));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let window = stack.top_frame().unwrap().register_window;
+        let mut host = CoreOpcodeDispatchHost::new();
+        let cell = host
+            .objects
+            .allocate_closure_cell_with_write_barrier(&mut heap, RuntimeValue::from_i32(9))
+            .unwrap();
+        registers.write(window, cell_register, cell).unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(9))
+        );
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles.bucket_samples[0];
+        assert_eq!(sample.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(sample.bucket.kind, ValueProfileBucketKind::Sample);
+        assert_eq!(sample.value, RuntimeValue::from_i32(9));
+        assert_eq!(sample.sample_count, 1);
+        assert_eq!(
+            profiles.jit_storage.raw_value_for_slot(sample.bucket.slot),
+            Some(RuntimeValue::from_i32(9).encoded())
+        );
+    }
+
+    // `op_get_from_scope` GlobalLexicalVar fast path profiles after the TDZ
+    // check passes (`getGlobalVar`, LowLevelInterpreter64.asm:2917-2923).
+    #[test]
+    fn get_global_lexical_records_value_profile_sample() {
+        let destination = local(0);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetGlobalLexical,
+                vec![Operand::Register(destination), Operand::IdentifierIndex(13)],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(243));
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        enter_program_frame(&mut stack, &mut registers, owner, &block, Vec::new());
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(13, "lexical".into());
+        host.install_global_lexical_declarations(vec![CoreGlobalLexicalDeclaration {
+            name: "lexical".into(),
+            kind: CoreGlobalLexicalDeclarationKind::Let,
+        }])
+        .unwrap();
+        host.initialize_global_lexical("lexical", RuntimeValue::from_i32(23))
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(23))
+        );
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles.bucket_samples[0];
+        assert_eq!(sample.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(sample.value, RuntimeValue::from_i32(23));
+        assert_eq!(
+            profiles.jit_storage.raw_value_for_slot(sample.bucket.slot),
+            Some(RuntimeValue::from_i32(23).encoded())
+        );
+    }
+
+    // `op_get_from_scope` GlobalProperty fast path profiles the loaded global
+    // property (`getProperty`, LowLevelInterpreter64.asm:2910-2915).
+    #[test]
+    fn get_global_object_property_records_value_profile_sample() {
+        let destination = local(0);
+        let block = wide_program_code_block(vec![
+            core_typed(
+                0,
+                CoreOpcode::GetGlobalObjectProperty,
+                vec![Operand::Register(destination), Operand::IdentifierIndex(14)],
+            ),
+            core_typed(1, CoreOpcode::Return, vec![Operand::Register(destination)]),
+        ])
+        .with_lifecycle(crate::bytecode::code_block::CodeBlockLifecycleState::LinkedInterpreter);
+        let owner = CodeBlockId(CellId(244));
+        let mut host = CoreOpcodeDispatchHost::new();
+        host.identifier_texts.insert(14, "globalField".into());
+        let global_object = host.objects.allocate_with_prototype(None);
+        host.objects
+            .set_data_own(
+                global_object,
+                &CorePropertyKey::String("globalField".into()),
+                RuntimeValue::from_i32(5),
+            )
+            .unwrap();
+        let mut stack = ExecutionContextStack::default();
+        let mut registers = RegisterFile::default();
+        let mut exceptions = ExceptionState::default();
+        let mut heap = Heap::new();
+        // `enter_program_frame` seeds an `undefined` program `this`; the
+        // GlobalProperty load resolves the global object through the entry's
+        // `this_value` (`active_global_this_value`), so seed a real one.
+        stack.enter(ExecutionEntryRecord::Program(ProgramExecutionEntry {
+            code_block: owner,
+            global_object: GlobalObjectId(ObjectId(CellId(1))),
+            this_value: global_object,
+        }));
+        stack
+            .push_frame(
+                &mut registers,
+                FramePushRequest {
+                    code_block: Some(owner),
+                    callee: None,
+                    callee_value: None,
+                    lexical_scope: None,
+                    shape: block.unlinked().frame(),
+                    argument_count_including_this: 1,
+                    argument_values: Vec::new(),
+                    start_bytecode_index: Some(BytecodeIndex::from_offset(0)),
+                    return_bytecode_index: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let completion = execute_code_block(
+            InterpreterExecutionState {
+                stack: &mut stack,
+                registers: &mut registers,
+                exceptions: &mut exceptions,
+                heap: &mut heap,
+            },
+            owner,
+            &block,
+            &mut host,
+            DispatchConfig::default(),
+        );
+
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(5))
+        );
+        let profiles = block.side_tables().value_profiles();
+        let sample = profiles.bucket_samples[0];
+        assert_eq!(sample.bytecode_index, BytecodeIndex::from_offset(0));
+        assert_eq!(sample.value, RuntimeValue::from_i32(5));
+        assert_eq!(
+            profiles.jit_storage.raw_value_for_slot(sample.bucket.slot),
+            Some(RuntimeValue::from_i32(5).encoded())
+        );
     }
 
     #[test]
