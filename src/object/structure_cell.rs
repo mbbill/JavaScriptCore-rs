@@ -80,6 +80,7 @@ use super::structure_transition_table::{
     PointerKey, StructureTransitionTable, TransitionKind, TransitionPropertyAttributes,
     TransitionStructure,
 };
+use crate::gc::CellPtr;
 use crate::gc::MarkedSpace;
 use crate::gc::StructureId as StructureHandle;
 use crate::runtime::JsType;
@@ -762,7 +763,78 @@ impl StructureIdTable {
     #[cfg(test)]
     pub(crate) fn arena_cell_is_admitted(&self, handle: StructureHandle) -> bool {
         let addr = self.arena_addrs[(handle.raw() - 1) as usize];
-        self.space.is_arena_cell(addr).is_some()
+        self.structure_arena_cell(addr).is_some()
+    }
+
+    /// TEST/ORACLE support (Structures-as-cells Step 2, design §6 Step 2 oracle):
+    /// is `handle`'s shadow arena cell MARKED after a mark phase? The structure-
+    /// space analog of `CoreObjectStore::is_value_marked`; used by the cross-store
+    /// mark-phase-proof tests (`interpreter/object_store.rs`
+    /// `structures_as_cells_step2_tests`) to assert a live object's Structure (and
+    /// the meta-structure) end up marked, while an unreferenced Structure does not.
+    #[cfg(test)]
+    pub(crate) fn arena_cell_is_marked(&self, handle: StructureHandle) -> bool {
+        match self.arena_cell_for_handle(handle) {
+            Some(cp) => self.space.collector_is_marked(cp),
+            None => false,
+        }
+    }
+
+    /// TEST/ORACLE support (Structures-as-cells Step 2): the port's `vm.
+    /// structureStructure` analog every ordinary Structure's own header names
+    /// (design §4.1-4.2). Exposed so tests can assert the meta-structure's OWN
+    /// arena cell ends up marked whenever ANY Structure cell is marked (design §4
+    /// item 3, the meta-structure self-edge) without hardcoding which handle
+    /// bootstrap happened to pick.
+    #[cfg(test)]
+    pub(crate) fn meta_structure_handle(&self) -> Option<StructureHandle> {
+        self.meta_structure_handle
+    }
+
+    /// Structures-as-cells Step 2 (design §6 Step 2 item 5): clear THIS table's
+    /// OWN space's mark bits at begin-marking. Mark state is address-global,
+    /// block-header-resident (design §0.1), so each independently-instantiated
+    /// `MarkedSpace` (design R1: the object space and this dedicated structure
+    /// space are two separate instances) needs its own begin-marking clear — the
+    /// structure-space half of what `CoreObjectStore::mark_live_set_from_addrs`
+    /// already does for `CoreObjectStore::space`. Both run at the SAME
+    /// begin-marking point of the ONE combined mark phase (`CombinedGraphMarker`,
+    /// `interpreter/object_store.rs`).
+    pub(crate) fn clear_all_marks(&self) {
+        self.space.clear_all_marks();
+    }
+
+    /// Structures-as-cells Step 2 (design §2.3 cross-space membership): is `addr`
+    /// a live (registered) arena cell in THIS table's OWN space? The SECOND of the
+    /// combined marker's bounded "2 probes" (design §2.3) — tried only after the
+    /// object space's `MarkedSpace::is_arena_cell` has already rejected the
+    /// address, exactly as `is_arena_cell` gates every other space's cells:
+    /// membership-only (never liveness), so it admits a live OR
+    /// dead-this-cycle structure cell and rejects a foreign address.
+    pub(crate) fn structure_arena_cell(&self, addr: usize) -> Option<CellPtr> {
+        self.space.is_arena_cell(addr)
+    }
+
+    /// Structures-as-cells Step 2 (design §4.4, §2.1): translate a `StructureId`
+    /// registry handle — the base-class `structure_id` edge every cell's header
+    /// carries (`JSCell::visitChildrenImpl`, `JSCellInlines.h:130-134`) — to its
+    /// `StructureArenaCell`'s membership-gated arena `CellPtr`. This is a
+    /// ONE-PROBE translation (unlike `structure_arena_cell`'s cross-space probe):
+    /// a `StructureId` handle unambiguously names a cell in THIS table's own
+    /// space, never the object space, so only `self.space` is consulted.
+    ///
+    /// `StructureId::INVALID` is `None` — the documented no-op for a leaf cell
+    /// whose `structure_id` is not yet a real handle (design §4.3: no
+    /// `vm.stringStructure`/`symbolStructure`/`bigIntStructure` analog exists in
+    /// this port yet). An out-of-range handle is also `None` (defensive; every
+    /// live handle IS registered by construction, so this never fires in
+    /// practice) — never a panic/index-out-of-bounds on a cell header read.
+    pub(crate) fn arena_cell_for_handle(&self, handle: StructureHandle) -> Option<CellPtr> {
+        if handle == StructureHandle::INVALID {
+            return None;
+        }
+        let &addr = self.arena_addrs.get((handle.raw() - 1) as usize)?;
+        self.space.is_arena_cell(addr)
     }
 
     /// Borrow a structure by handle (the registry analog of `StructureID::
