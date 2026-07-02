@@ -143,12 +143,25 @@ mod tests {
     use crate::bytecode::code_block::{
         CodeKind, LinkContext, UnlinkedCodeBlock, UnlinkedConstantPool,
     };
-    use crate::bytecode::instruction_stream::{opcode_id, InstructionStreamWriter, OperandValue};
+    use crate::bytecode::instruction::Operand;
+    use crate::bytecode::instruction_stream::{
+        decode_raw_instruction, opcode_id, InstructionStreamWriter, OperandValue,
+    };
+    use crate::bytecode::opcode::CoreOpcode;
     use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters};
     use crate::bytecode::{PackedInstructionStream, VirtualRegister};
+    use crate::bytecompiler::{
+        bytecompiler_input_from_parsed_ast, emit_unlinked_code_from_parsed_ast,
+        BytecompilerOutputPlan, BytecompilerSessionId,
+    };
     use crate::dfg::graph::{DfgPhase, GraphForm};
     use crate::dfg::node_type::NodeType;
     use crate::gc::CellId;
+    use crate::syntax::source::{
+        SourceOrigin, SourcePosition, SourceProvider, SourceSpan, SourceText,
+    };
+    use crate::syntax::{AstBuilder, Parser, ParserArena, SourceCode};
+    use std::sync::Arc;
 
     const THIS_OFFSET: i32 = 5; // CallFrameSlot::thisArgument (CallFrame.h), same as parser.rs's tests.
 
@@ -272,5 +285,216 @@ mod tests {
         // is what would move it to ThreadedCPS, and it is out of this slice.
         assert_eq!(plan.graph().phase, DfgPhase::BytecodeParsing);
         assert_eq!(plan.graph().form, GraphForm::LoadStore);
+    }
+
+    // === G4-Unit-1: real bytecompiler output -> raw packed bytes -> DFG =====
+    //
+    // The tests above all hand-build raw bytes via `InstructionStreamWriter`
+    // directly (`code_block`/`identity_function_code_block`). These tests
+    // instead drive the REAL front end
+    // (`Parser` -> `bytecompiler_input_from_parsed_ast` ->
+    // `emit_unlinked_code_from_parsed_ast`, the same pipeline
+    // `bytecompiler::tests::try_emit_program_plan_with_global_bindings` uses)
+    // so the `UnlinkedCodeBlock`s under test are the ones a real script would
+    // produce, exercising `PackedInstructionStream::with_raw_encoded_from_declarations`
+    // (`bytecode/generator.rs`'s `BytecodeGenerator::finish()` hook) instead
+    // of a fixture.
+
+    fn compile_program_source(text: &str, session: u64) -> BytecompilerOutputPlan {
+        let provider = Arc::new(SourceProvider::new(
+            SourceOrigin::default(),
+            SourceText::Latin1(text.as_bytes().to_vec()),
+        ));
+        let source = SourceCode::new(
+            provider,
+            SourceSpan::new(SourcePosition(0), SourcePosition(text.len() as u32)),
+        );
+        let mut arena = ParserArena::new();
+        let parsed = Parser::with_mode(
+            &mut arena,
+            AstBuilder::default(),
+            &source,
+            crate::syntax::ParseMode::Program,
+        )
+        .parse()
+        .expect("source parses");
+        let input = bytecompiler_input_from_parsed_ast(
+            BytecompilerSessionId(session),
+            source.clone(),
+            &parsed,
+            &arena,
+        )
+        .expect("bytecompiler handoff succeeds");
+        emit_unlinked_code_from_parsed_ast(&input, &arena).expect("bytecode emission succeeds")
+    }
+
+    /// Compile `text` (a whole program consisting of one function
+    /// declaration) and return that function's OWN `UnlinkedCodeBlock`
+    /// (`plan.function_bodies`), not the enclosing program's.
+    fn compile_single_function_body(text: &str, session: u64) -> UnlinkedCodeBlock {
+        let mut plan = compile_program_source(text, session);
+        assert_eq!(
+            plan.function_bodies.len(),
+            1,
+            "fixture must declare exactly one function"
+        );
+        plan.function_bodies.remove(0)
+    }
+
+    /// `var f = function(a,b){var t=a+b; return t-b};` compiles entirely
+    /// within the G4-Unit-1 supported family (`op_enter`/`op_mov`/`op_ret`/
+    /// `op_add`/`op_sub`/`op_mul`), and needs two Rust-vs-JSC divergences the
+    /// fixture must dodge rather than this unit fixing:
+    ///   1. A NAMED function (declaration or named expression) unconditionally
+    ///      binds its own name to `CoreOpcode::LoadCallee` at entry
+    ///      (`emit_current_function_name_binding`, bytecompiler/mod.rs:3036-3038)
+    ///      regardless of whether the body ever references that name — so
+    ///      this uses an ANONYMOUS function expression.
+    ///   2. Numeric/string/bool LITERALS lower to Rust-only immediate-carrying
+    ///      pseudo-opcodes (`CoreOpcode::LoadInt32` etc., `emit_load_int32`,
+    ///      bytecompiler/mod.rs:6693-6710) instead of JSC's real
+    ///      `op_mov dst, constant(i)` (constant-pool load) — JSC has no
+    ///      `op_load_int32` at all. This is a separate, already-known,
+    ///      load-bearing divergence (constant-pool wiring) well beyond this
+    ///      unit's scope, so this fixture uses ONLY parameter/local operands
+    ///      (`t-b`, not a literal) to stay entirely in the currently-real,
+    ///      currently-supported family. `derive_binary_arith_profiles`
+    /// (`bytecode/code_block.rs`) sees `AddInt32` then `SubInt32`, so this
+    /// also exercises the encoder's profileIndex derivation (0 then 1)
+    /// without div/bitwise/shift interference.
+    #[test]
+    fn real_bytecompiler_output_encodes_raw_packed_bytes_matching_declarations() {
+        let unlinked =
+            compile_single_function_body("var f = function(a,b){var t=a+b; return t-b;};", 1);
+        let declarations = unlinked.instructions().declarations();
+        assert!(
+            !declarations.is_empty(),
+            "a real function body must declare instructions"
+        );
+        for declaration in declarations {
+            let core = CoreOpcode::from_opcode(declaration.opcode).unwrap_or_else(|| {
+                panic!(
+                    "declared opcode {:?} has no CoreOpcode — fixture picked an unsupported opcode",
+                    declaration.opcode
+                )
+            });
+            assert!(
+                matches!(
+                    core,
+                    CoreOpcode::Move
+                        | CoreOpcode::Return
+                        | CoreOpcode::AddInt32
+                        | CoreOpcode::SubInt32
+                        | CoreOpcode::MulInt32
+                ),
+                "fixture emitted {core:?}, outside the G4-Unit-1 supported family; \
+                 pick a narrower fixture or extend the encoder first"
+            );
+        }
+
+        let raw = unlinked
+            .instructions()
+            .raw_bytes()
+            .expect("an all-in-family body must encode raw packed bytes");
+
+        // op_enter is SYNTHESIZED (BytecodeGenerator.cpp:1439-1449; see the
+        // encoder's doc) — it has no `declarations` counterpart, so decode it
+        // separately before walking `declarations` 1:1 against the rest.
+        let mut offset = 0usize;
+        let enter = decode_raw_instruction(raw, offset).expect("op_enter decodes");
+        assert_eq!(enter.opcode_id, opcode_id::ENTER);
+        assert!(enter.operands.is_empty());
+        offset += enter.size;
+
+        for declaration in declarations {
+            let decoded =
+                decode_raw_instruction(raw, offset).expect("declared instruction decodes");
+            let core = CoreOpcode::from_opcode(declaration.opcode).unwrap();
+            let expected_id = match core {
+                CoreOpcode::Move => opcode_id::MOV,
+                CoreOpcode::Return => opcode_id::RET,
+                CoreOpcode::AddInt32 => opcode_id::ADD,
+                CoreOpcode::SubInt32 => opcode_id::SUB,
+                CoreOpcode::MulInt32 => opcode_id::MUL,
+                other => panic!("unexpected in-family opcode {other:?}"),
+            };
+            assert_eq!(decoded.opcode_id, expected_id);
+
+            let expected_registers: Vec<i32> = declaration
+                .operands
+                .iter()
+                .map(|operand| {
+                    operand
+                        .as_register()
+                        .expect("supported family carries only register operands")
+                        .raw()
+                })
+                .collect();
+            let decoded_registers: Vec<i32> = decoded.operands[..expected_registers.len()]
+                .iter()
+                .map(|value| *value as i32)
+                .collect();
+            assert_eq!(
+                decoded_registers, expected_registers,
+                "raw operand order must match the declaration's operand order"
+            );
+            offset += decoded.size;
+        }
+        assert_eq!(
+            offset,
+            raw.len(),
+            "no bytes past the last declared instruction"
+        );
+
+        // THE PAYOFF: the first DFG parse of real bytecompiler output.
+        let owner = CodeBlockId(CellId(1));
+        let mut dfg_plan = DfgPlan::new(DfgGraphId(1), owner, DfgCompilationMode::Dfg);
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        dfg_plan
+            .compile_parse_only(&code_block)
+            .expect("real bytecompiler output must parse");
+
+        let graph = dfg_plan.graph();
+        assert_eq!(graph.form, GraphForm::LoadStore);
+        assert_eq!(graph.validate(), Ok(()));
+        let ops: Vec<NodeType> = graph.blocks[0]
+            .nodes
+            .iter()
+            .map(|id| graph.nodes[id.0 as usize].op)
+            .collect();
+        // `this` plus two declared parameters (a, b): the argument prologue
+        // covers `numArguments = numParametersIncludingThis`
+        // (DFGByteCodeParser.cpp:7473-7494, ctor :140).
+        assert_eq!(
+            ops.iter()
+                .filter(|op| **op == NodeType::SetArgumentDefinitely)
+                .count(),
+            3
+        );
+        assert_eq!(ops.iter().filter(|op| **op == NodeType::Return).count(), 1);
+        // `a+b`/`t-b`: GetLocal/GetArgument operands are NodeResultJS, not
+        // NodeResultNumber, so `hasNumberResult()` is false and the parser
+        // emits the Value* form (parse_block's op_add/op_sub/op_mul doc).
+        assert!(ops.contains(&NodeType::ValueAdd) || ops.contains(&NodeType::ArithAdd));
+        assert!(ops.contains(&NodeType::ValueSub) || ops.contains(&NodeType::ArithSub));
+    }
+
+    /// A body outside the supported family (`op_get_by_id`, from `o.x`)
+    /// leaves `raw` empty — unchanged decline behavior — even though it went
+    /// through the SAME real pipeline as the test above.
+    #[test]
+    fn real_bytecompiler_output_outside_supported_family_declines_with_unchanged_reason() {
+        let unlinked = compile_single_function_body("function g(o){ return o.x; }", 2);
+        assert!(
+            unlinked.instructions().raw_bytes().is_none(),
+            "an out-of-family body must not encode raw bytes"
+        );
+
+        let owner = CodeBlockId(CellId(2));
+        let mut dfg_plan = DfgPlan::new(DfgGraphId(1), owner, DfgCompilationMode::Dfg);
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        let result = dfg_plan.compile_parse_only(&code_block);
+
+        assert_eq!(result, Err(DeclineReason::NoRawPackedInstructionStream));
     }
 }

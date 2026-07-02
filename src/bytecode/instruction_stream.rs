@@ -699,6 +699,14 @@ fn get_put_info_fits_decode(raw: u64, width: OpcodeSize) -> u32 {
 /// `ResultType::unknownType().bits()` = TypeBits = 0b111_1110
 /// (`ResultType.h:40-51,168-171`).
 const RESULT_TYPE_UNKNOWN_BITS: u16 = 0x7e;
+/// `OperandTypes(ResultType::unknownType(), ResultType::unknownType()).bits()`
+/// (`ResultType.h:246-249,265-268`): the DEFAULT `OperandTypes` value JSC
+/// itself uses when a call site has no better static type info. Exposed
+/// (`pub(crate)`) to `instruction.rs`'s declarations->raw encoder, which has
+/// no `ResultType` tracking yet (see that encoder's doc) and so always emits
+/// this faithful default rather than inventing narrower types.
+pub(crate) const UNKNOWN_OPERAND_TYPES_BITS: u16 =
+    RESULT_TYPE_UNKNOWN_BITS | (RESULT_TYPE_UNKNOWN_BITS << 8);
 /// `Fits<OperandTypes>` narrow packing constants (`Fits.h:308-309`).
 const OPERAND_TYPES_TYPE_WIDTH: u32 = 4;
 const OPERAND_TYPES_MAX_TYPE: u16 = (1 << OPERAND_TYPES_TYPE_WIDTH) - 1;

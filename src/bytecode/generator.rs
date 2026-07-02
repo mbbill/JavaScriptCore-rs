@@ -83,6 +83,14 @@ impl BytecodeGenerator {
                 staged_stream
             }
         };
+        // POST-GENERATION ENCODER PASS (ratified serial decision, G4-Unit-1):
+        // try to ALSO encode this now-frozen function/program's declarations
+        // into a real packed byte stream, so `dfg::parser` — which reads
+        // ONLY `raw_bytes()` — can see real bytecompiler output. Strictly
+        // additive: on decline `raw` stays `Unencoded` exactly as before this
+        // pass existed, and the `declarations` domain the interpreter
+        // dispatches off is untouched either way (see the method doc).
+        let stream = stream.with_raw_encoded_from_declarations();
         let mut side_tables = self.side_tables;
         let first_generated_root_map_id = next_root_map_id(&side_tables);
         {

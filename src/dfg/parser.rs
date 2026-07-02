@@ -57,10 +57,25 @@ const CALL_FRAME_SLOT_CALLEE: i32 = 3;
 /// NO partial graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeclineReason {
-    /// The linked CodeBlock has no raw packed byte stream (typed-placeholder
-    /// or schema-staged representation). C++ cannot hit this — every CodeBlock
-    /// owns a packed `InstructionStream`; the live packed cutover removes this
-    /// case.
+    /// The linked CodeBlock has no raw packed byte stream. C++ cannot hit
+    /// this — every CodeBlock owns a packed `InstructionStream`.
+    ///
+    /// TRANSITIONAL STATE (G4-Unit-1): the real bytecompiler
+    /// (`BytecodeGenerator::finish()`, `bytecode/generator.rs`) now runs a
+    /// POST-GENERATION ENCODER PASS
+    /// (`PackedInstructionStream::with_raw_encoded_from_declarations`) that
+    /// tries to encode every generated function/program's `declarations`
+    /// into real packed bytes, but only within a currently-supported opcode
+    /// family (`op_enter`/`op_mov`/`op_ret`/`op_add`/`op_sub`/`op_mul`; see
+    /// `instruction.rs`'s `try_encode_declarations_as_raw`). This reason
+    /// still fires whenever a real CodeBlock's body uses any opcode outside
+    /// that family (the common case today — property access, calls, control
+    /// flow, ...), and whenever a test builds a schema-staged/typed-
+    /// placeholder stream directly without ever encoding it. The live packed
+    /// cutover (retiring the ordinal `declarations`/`typed_placeholder`
+    /// domains entirely, per `instruction_stream.rs`'s module doc) removes
+    /// this case for good; growing the supported family shrinks it batch by
+    /// batch until then.
     NoRawPackedInstructionStream,
     /// The packed stream failed to decode at `offset` (also covers opcodes the
     /// declared Rust opcode table does not know yet, e.g. `op_get_by_id`).
