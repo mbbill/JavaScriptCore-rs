@@ -10237,18 +10237,17 @@ impl CoreOpcodeDispatchHost {
                     // bsubio), mul on overflow OR a zero product with a
                     // negative operand — the -0.0 case (asm:1290-1297).
                     //
-                    // KNOWN upstream value divergence: `numeric_binary_result`
-                    // evaluates that mul -0.0 case to Int32(0) via checked_mul
-                    // where C++ jsMul yields the double -0.0. The explicit
-                    // zero/negative test below still classifies it as the
-                    // slow path (so the profile never claims the int fast
-                    // path), and the result-shape bits self-correct once the
-                    // value divergence is fixed.
-                    let mul_neg_zero_bail = opcode == CoreOpcode::MulInt32
-                        && result == RuntimeValue::from_i32(0)
-                        && (matches!(lhs.as_number(), Some(NumberValue::Int32(l)) if l < 0)
-                            || matches!(rhs.as_number(), Some(NumberValue::Int32(r)) if r < 0));
-                    if result.is_int32() && !mul_neg_zero_bail {
+                    // `numeric_binary_result` (this file) mirrors that exact
+                    // mul -0.0 guard, so it never returns Int32(0) for a
+                    // negative-operand zero product — it returns the double
+                    // -0.0 instead, matching C++ jsMul. `result.is_int32()`
+                    // is therefore already a faithful proxy for "the LLInt
+                    // int32 fast path stored a result": the -0.0 case cannot
+                    // reach this branch as an Int32, so no extra mul-specific
+                    // test is needed here (previously this classified the
+                    // -0.0 case by hand as a workaround for that value bug;
+                    // fixed in the commit that added this comment).
+                    if result.is_int32() {
                         // op_add already OR'd the equivalent operand bits
                         // pre-op; sub/mul record ArithProfileIntInt here.
                         if opcode != CoreOpcode::AddInt32 {
@@ -22586,8 +22585,35 @@ fn numeric_binary_result(
         let result = match opcode {
             CoreOpcode::AddInt32 => left.checked_add(right),
             CoreOpcode::SubInt32 => left.checked_sub(right),
-            CoreOpcode::MulInt32 => left.checked_mul(right),
-            CoreOpcode::ModNumber => left.checked_rem(right),
+            // C++ jsMul's int32 fast path (`binaryOpCustomStore(mul, ...)`,
+            // LowLevelInterpreter64.asm:1289-1300) computes `t3 = lhs * rhs`
+            // with overflow check (`bmulio`, bails to the double slow path on
+            // overflow), then ADDITIONALLY bails to the double slow path when
+            // the product is zero and either operand is negative
+            // (`btinz t3, .done` / `bilt rhs, 0, slow` / `bilt lhs, 0, slow`,
+            // asm:1292-1296) — int32 has no negative zero, but the double
+            // result of e.g. -3*0 or 0*-3 must be -0.0. `checked_mul` alone
+            // cannot distinguish +0 from -0, so replicate that exact guard
+            // here instead of trusting a zero product to be +0.
+            CoreOpcode::MulInt32 => match left.checked_mul(right) {
+                Some(0) if left < 0 || right < 0 => None,
+                other => other,
+            },
+            // C++ op_mod's int32 fast path (LowLevelInterpreter64.asm:
+            // 1324-1352) takes the `.needsNegZeroCheck` branch whenever the
+            // dividend (lhs) is negative (`bilt t0, 0, .needsNegZeroCheck`,
+            // asm:1337) and, on that branch, bails to the double slow path if
+            // the remainder is exactly zero (`btiz r1, .slow`, asm:1345) —
+            // e.g. -3%3 must yield -0.0, matching IEEE fmod's "result takes
+            // the sign of the dividend" rule (jsRemainder ->
+            // Math::fmodDouble, OperationsInlines.h:643-654). 3%-3 keeps the
+            // fast int32 path (dividend is non-negative) and correctly yields
+            // +0, since only the DIVIDEND's sign controls this, not the
+            // divisor's.
+            CoreOpcode::ModNumber => match left.checked_rem(right) {
+                Some(0) if left < 0 => None,
+                other => other,
+            },
             CoreOpcode::DivNumber | CoreOpcode::PowNumber => None,
             _ => None,
         };
@@ -29482,6 +29508,124 @@ mod tests {
         assert!(profile.arith().did_observe_int32_overflow());
         assert!(profile.arith().did_observe_non_neg_zero_double());
         assert!(!profile.arith().did_observe_int52_overflow());
+    }
+
+    // C++ jsMul's int32 fast path bails to the double slow path whenever the
+    // product is zero AND either operand is negative
+    // (`binaryOpCustomStore(mul, ...)`, LowLevelInterpreter64.asm:1289-1297:
+    // `bmulio` overflow check, then `btinz t3, .done` / `bilt rhs, 0, slow` /
+    // `bilt lhs, 0, slow`) — int32 has no negative zero, so that case must
+    // produce the double -0.0, not Int32(0). `numeric_binary_result`
+    // (interpreter/mod.rs) mirrors that exact guard. Verify both operand
+    // orderings and that an all-non-negative zero product still takes the
+    // ordinary Int32(0) fast path.
+    #[test]
+    fn mul_zero_product_negative_operand_yields_double_neg_zero() {
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::MulInt32,
+            RuntimeValue::from_i32(-3),
+            RuntimeValue::from_i32(0),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-0.0)),
+            "-3 * 0 must be the double -0.0, not Int32(0)"
+        );
+
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::MulInt32,
+            RuntimeValue::from_i32(0),
+            RuntimeValue::from_i32(-3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-0.0)),
+            "0 * -3 must be the double -0.0, not Int32(0)"
+        );
+
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::MulInt32,
+            RuntimeValue::from_i32(3),
+            RuntimeValue::from_i32(0),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0)),
+            "3 * 0 stays the ordinary +0 int32 fast path (no negative operand)"
+        );
+    }
+
+    // Profile self-correction for the mul -0.0 case (see the comment on the
+    // `CoreOpcode::MulInt32` arm in `record_binary_arith_profile_post_op`
+    // above): now that the value side actually produces the double -0.0,
+    // `result.is_int32()` alone routes it to the common-slow-path branch,
+    // which records it exactly like a C++ slow_path_mul result: Int32Overflow
+    // (both operands were int32, CommonSlowPaths.cpp:476-477) + NegZeroDouble
+    // (`!doubleVal && std::signbit(doubleVal)`, CommonSlowPaths.cpp:480-481),
+    // and NO operand-observed types (slow_path_mul has no observeLHSAndRHS,
+    // CommonSlowPaths.cpp:568-580).
+    #[test]
+    fn mul_neg_zero_records_int32_overflow_and_neg_zero_double_profile() {
+        let (completion, profile) = run_binary_arith_profile_probe(
+            CoreOpcode::MulInt32,
+            RuntimeValue::from_i32(-3),
+            RuntimeValue::from_i32(0),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-0.0))
+        );
+        let profile = profile.expect("op_mul derives a BinaryArithProfile slot");
+        assert!(profile.lhs_observed_type().is_empty());
+        assert!(profile.rhs_observed_type().is_empty());
+        assert!(profile.arith().did_observe_int32_overflow());
+        assert!(profile.arith().did_observe_neg_zero_double());
+        assert!(!profile.arith().did_observe_non_neg_zero_double());
+        assert!(!profile.arith().did_observe_int52_overflow());
+    }
+
+    // C++ op_mod's int32 fast path (LowLevelInterpreter64.asm:1324-1352)
+    // bails to the double slow path only when the DIVIDEND (lhs) is negative
+    // and the remainder is exactly zero (the `.needsNegZeroCheck` branch:
+    // `bilt t0, 0, .needsNegZeroCheck` at :1337, then `btiz r1, .slow` at
+    // :1345) — the divisor's sign never matters. jsRemainder computes via
+    // `Math::fmodDouble` on that slow path (OperationsInlines.h:643-654),
+    // which follows IEEE fmod's "result takes the sign of the dividend"
+    // rule, so -3 % 3 is -0.0 while 3 % 3 and 3 % -3 both stay +0.
+    #[test]
+    fn mod_negative_dividend_zero_remainder_yields_double_neg_zero() {
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::ModNumber,
+            RuntimeValue::from_i32(-3),
+            RuntimeValue::from_i32(3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_double(-0.0)),
+            "-3 % 3 must be the double -0.0, not Int32(0)"
+        );
+
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::ModNumber,
+            RuntimeValue::from_i32(3),
+            RuntimeValue::from_i32(3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0)),
+            "3 % 3 stays the ordinary +0 int32 fast path (non-negative dividend)"
+        );
+
+        let (completion, _) = run_binary_arith_profile_probe(
+            CoreOpcode::ModNumber,
+            RuntimeValue::from_i32(3),
+            RuntimeValue::from_i32(-3),
+        );
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(0)),
+            "3 % -3 stays +0: only the dividend's sign controls the -0.0 case, not the divisor's"
+        );
     }
 
     #[test]

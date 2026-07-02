@@ -944,19 +944,26 @@ mod tests {
             assert!(!JsValue::from_encoded(EncodedJsValue(r.dst)).is_int32());
         }
 
-        // --- The mul negative-zero guard routes int*0 to the slow path. The slow
-        // evaluator yields int32 0 here (the -0 double materialization is a separate
-        // evaluator concern), so dst == boxed int32 0; the guard's effect (taking the
-        // slow path) is what is proven (its presence is also in the byte/link tests).
+        // --- The mul negative-zero guard routes int*0 to the slow path
+        // (`operationValueMul` -> `jsMul`, JITOperations.cpp:4978), which now
+        // faithfully materializes the double -0.0 for a zero product with a
+        // negative operand (C++ jsMul's int32 fast path never takes this case
+        // to begin with — LowLevelInterpreter64.asm:1289-1297 — and the
+        // shared evaluator `numeric_binary_result`, interpreter/mod.rs,
+        // mirrors that same guard). dst == boxed double -0.0, not int32 0.
         #[test]
         fn mul_zero_result_routes_through_neg_zero_guard() {
             let r = run_case(ArithFamilyOp::Mul, i32_bits(-1), i32_bits(0));
+            let expected = JsValue::from_double(-0.0).encoded().0;
             assert_eq!(
-                r.dst,
-                i32_bits(0),
-                "dst = boxed 0 (slow path via neg-zero guard)"
+                r.dst, expected,
+                "dst = boxed double -0.0 (slow path via neg-zero guard)"
             );
             assert_eq!(r.pending, 0, "no exception");
+            assert!(
+                !JsValue::from_encoded(EncodedJsValue(r.dst)).is_int32(),
+                "result is a double, not an int32"
+            );
         }
 
         // --- A non-int32 (double) operand routes add/sub/mul to the DOUBLE FAST
