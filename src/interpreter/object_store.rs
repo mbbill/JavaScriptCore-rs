@@ -3344,12 +3344,16 @@ impl CoreObjectStore {
     /// branch of the marker's type dispatch), SUB-DISPATCHED by the cell's header `js_type`
     /// (the same `methodTable()->visitChildren` selection, one level down):
     ///
-    ///  - STRING (U1): the ONE leaf-typed cell WITH an edge is a ROPE JSString, whose fiber
-    ///    base string MUST be marked so it is not swept under a live rope (the #1 UAF
-    ///    landmine). Faithful to `JSRopeString::visitChildrenImpl` (runtime/JSString.cpp:104):
-    ///    visit the fiber. The port keeps the rope's base fiber inline on the cell
-    ///    (`CoreStringCell::base`, the `JSRopeString::m_fibers` analog); a flat/empty string
-    ///    carries the 0 sentinel, so `string_cell_rope_base` returns `None` (no edge).
+    ///  - STRING (U1 + leak-fix B): the ONE leaf-typed cell WITH edges is a ROPE JSString,
+    ///    whose fiber strings MUST be marked so they are not swept under a live rope (the
+    ///    #1 UAF landmine). Faithful to `JSRopeString::visitChildrenImpl`
+    ///    (runtime/JSString.cpp:104-140): visit EVERY fiber — the substring case visits its
+    ///    single base fiber, and the concat case loops over all fibers. The port keeps the
+    ///    fibers packed inline on the cell (`CoreStringCell::fibers`, the
+    ///    `JSRopeString::m_fibers`/`CompactFibers` analog): (base, 0) for a substring,
+    ///    (left, right) for a 2-fiber concat rope; a flat/empty string carries all-zero
+    ///    fibers, so `string_cell_fibers` returns no edges. A RESOLVED rope's fibers were
+    ///    zeroed at resolution (`convertToNonRope`), so its former children are collectable.
     ///  - SYMBOL (U2): NO edges appended — a representation divergence, commented honestly:
     ///    C++ `Symbol::visitChildrenImpl` (runtime/Symbol.cpp:112-121) visits Base plus TWO
     ///    lazily-created `WriteBarrier<JSString>` caches (`m_description` runtime/Symbol.h:93,
@@ -3379,15 +3383,17 @@ impl CoreObjectStore {
         match type_byte {
             t if t == JsType::String as u8 => {
                 // SAFETY: the header just proved StringType, so the cell is a
-                // `CoreStringCell` and its `base` fiber sits at the const-asserted offset.
-                // The read copies a `u64` and forms no reference.
-                let base = unsafe { super::string_store::string_cell_rope_base(cp.addr()) };
-                if let Some(base_addr) = base {
-                    // Membership-gate the base fiber (NOT the liveness `find`) and append it
-                    // — the rope cell's single outgoing edge. `append_unbarriered` marks
-                    // white→grey→push.
-                    if let Some(base_cp) = self.space.is_arena_cell(base_addr) {
-                        visitor.append_unbarriered(base_cp);
+                // `CoreStringCell` and its packed fibers sit at the const-asserted offset.
+                // The read copies raw bytes and forms no reference.
+                let fibers = unsafe { super::string_store::string_cell_fibers(cp.addr()) };
+                for fiber_addr in fibers.into_iter().flatten() {
+                    // Membership-gate each fiber (NOT the liveness `find`) and append it —
+                    // `JSRopeString::visitChildrenImpl` visits EVERY fiber (runtime/
+                    // JSString.cpp:110-136). `append_unbarriered` marks white→grey→push.
+                    // A missed fiber (e.g. tracing only fiber0 of a 2-fiber concat) would
+                    // sweep a live rope child and resolve the parent into garbage.
+                    if let Some(fiber_cp) = self.space.is_arena_cell(fiber_addr) {
+                        visitor.append_unbarriered(fiber_cp);
                     }
                 }
             }
@@ -13754,6 +13760,108 @@ mod string_cell_gc_u1_tests {
             "rope base still survives via the fiber edge (#2)"
         );
         assert_eq!(strings.text(rope), Some(&base_text[5..45]));
+    }
+
+    // (b2 — leak-fix B) BOTH fibers of an UNRESOLVED 2-fiber CONCAT rope survive
+    // collections while the rope is live (`JSRopeString::visitChildrenImpl` visits EVERY
+    // fiber, runtime/JSString.cpp:110-136). Each operand is reachable ONLY through the
+    // rope, so a fiber0-only trace (the pre-leak-fix-B single-base read) would sweep the
+    // RIGHT operand and corrupt the deferred concat — the final resolve is the tripwire.
+    #[test]
+    fn concat_rope_both_fibers_survive_collections_before_resolve() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let left = strings
+            .allocate_with_heap(&mut objects, &mut heap, "left-fiber-payload::")
+            .unwrap();
+        let right = strings
+            .allocate_with_heap(&mut objects, &mut heap, "right-fiber-payload!")
+            .unwrap();
+        let rope = strings
+            .allocate_rope_with_heap(&mut objects, &mut heap, left, right)
+            .unwrap();
+        let rope_slot = strings.index_for_value(rope).unwrap();
+        match &strings.string_records[rope_slot].text {
+            CoreStringCellText::Rope {
+                resolved,
+                len_code_units,
+                ..
+            } => {
+                assert!(resolved.get().is_none(), "fresh concat rope is unresolved");
+                assert_eq!(*len_code_units, 40);
+            }
+            other => panic!("expected a 2-fiber concat rope record, got {other:?}"),
+        }
+        // Hold the ROPE via a live object; both fibers are reachable ONLY through it.
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), rope).unwrap();
+
+        collect(&mut objects, &mut strings, &[holder]);
+        assert!(
+            objects.is_value_marked(rope),
+            "rope marked via object edge (#1)"
+        );
+        assert!(
+            objects.is_value_marked(left),
+            "fiber0 survives via the fiber edge (#1)"
+        );
+        assert!(
+            objects.is_value_marked(right),
+            "fiber1 survives via the fiber edge (#1) — a fiber0-only trace sweeps it"
+        );
+
+        collect(&mut objects, &mut strings, &[holder]); // #2 — the survivor landmine
+        assert!(objects.is_value_marked(left), "fiber0 still survives (#2)");
+        assert!(objects.is_value_marked(right), "fiber1 still survives (#2)");
+
+        // Resolve AFTER surviving two collections: the exact concatenation proves both
+        // fibers' records stayed intact under GC.
+        assert_eq!(
+            strings.text(rope),
+            Some("left-fiber-payload::right-fiber-payload!")
+        );
+    }
+
+    // (b3 — leak-fix B) A RESOLVED rope drops its fiber edges (`convertToNonRope`,
+    // JSString.cpp:240/255): the children become collectable exactly as in C++, and the
+    // cached resolution survives their death.
+    #[test]
+    fn resolved_rope_drops_fiber_edges_so_children_can_die() {
+        let mut objects = CoreObjectStore::default();
+        let mut strings = CoreStringStore::default();
+        let mut heap = Heap::new();
+        let left = strings
+            .allocate_with_heap(&mut objects, &mut heap, "left-fiber-payload::")
+            .unwrap();
+        let right = strings
+            .allocate_with_heap(&mut objects, &mut heap, "right-fiber-payload!")
+            .unwrap();
+        let rope = strings
+            .allocate_rope_with_heap(&mut objects, &mut heap, left, right)
+            .unwrap();
+        let expected = "left-fiber-payload::right-fiber-payload!";
+        assert_eq!(strings.text(rope), Some(expected), "resolve before any GC");
+
+        let holder = objects.allocate();
+        objects.put_data_own(holder, &ident(0), rope).unwrap();
+        collect(&mut objects, &mut strings, &[holder]);
+
+        assert!(objects.is_value_marked(rope), "rope stays live via holder");
+        assert!(
+            !objects.is_value_marked(left),
+            "resolved rope no longer retains fiber0 (convertToNonRope dropped the edge)"
+        );
+        assert!(
+            !objects.is_value_marked(right),
+            "resolved rope no longer retains fiber1"
+        );
+        assert_eq!(strings.text(left), None, "dead fiber0 record reclaimed");
+        assert_eq!(
+            strings.text(rope),
+            Some(expected),
+            "cached resolution survives the children's death"
+        );
     }
 
     // (c) A DEAD string's slab slot is freed AND its interning entry removed by identity; re-

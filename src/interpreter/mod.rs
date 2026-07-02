@@ -6233,6 +6233,11 @@ impl DispatchHost for CoreOpcodeDispatchHost {
         exceptions: &ExceptionState,
         heap: &mut Heap,
     ) {
+        // leak-fix B — fold any rope-resolve extra-memory cost into the collection trigger
+        // BEFORE polling it (the C++ inline `reportExtraMemoryAllocated` at resolveRope,
+        // JSString.cpp:252-257, deferred store-side; see
+        // `CoreStringStore::drain_pending_resolved_bytes`).
+        self.strings.drain_pending_resolved_bytes(&mut self.objects);
         let mut host_roots = self.gather_global_lexical_roots();
         host_roots.extend(self.gather_code_block_constant_roots());
         // gc-r4-completion U2 — the SYMBOL store's own strong roots (well-known symbols +
@@ -8823,8 +8828,10 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                     cache_key: None,
                 };
                 let value = if key.is_string("length") {
-                    if let Some(text) = self.strings.text(object) {
-                        Ok(RuntimeValue::from_i32(string_code_unit_len_i32(text)))
+                    // leak-fix B: `JSString::length()` is O(1) and never resolves a rope
+                    // (inline `CompactFibers::m_length`, runtime/JSString.h:524-527).
+                    if let Some(length) = self.strings.code_unit_length_i32(object) {
+                        Ok(RuntimeValue::from_i32(length))
                     } else {
                         match self.objects.array_length(object) {
                             Ok(Some(length)) => Ok(length),
@@ -9210,8 +9217,9 @@ impl DispatchHost for CoreOpcodeDispatchHost {
                 if matches!(value.kind(), ValueKind::Undefined | ValueKind::Null) {
                     return self.not_an_object_type_error(state.heap, value);
                 }
-                let length = if let Some(text) = self.strings.text(value) {
-                    Ok(RuntimeValue::from_i32(string_code_unit_len_i32(text)))
+                // leak-fix B: rope length is O(1), never resolves (JSString.h:524-527).
+                let length = if let Some(length) = self.strings.code_unit_length_i32(value) {
+                    Ok(RuntimeValue::from_i32(length))
                 } else {
                     match self.objects.array_length(value) {
                         Ok(Some(length)) => Ok(length),
@@ -9848,21 +9856,137 @@ impl CoreOpcodeDispatchHost {
             && !self.symbols.is_symbol(value)
     }
 
+    // leak-fix B — C++ jsAdd routes a string `+` to jsString(...): a both-string-cell add
+    // takes jsString(JSGlobalObject*, JSString*, JSString*) (OperationsInlines.h:144-162,
+    // reached via jsAddNonNumber :551-552 / jsAddSlowCase Operations.cpp:44-63), which
+    // NEVER eagerly concatenates — the empty-side shortcuts return the OTHER OPERAND
+    // ITSELF, otherwise it always builds a lazy JSRopeString. A mixed string+primitive add
+    // converts the non-string side first and takes the jsString(JSString*, const String&)
+    // overloads (OperationsInlines.h:75-142), which DO have a tiny eager path (see
+    // concat_string_cell_with_converted). This replaces the former unconditional eager
+    // copy — the O(n^2)-transient-bytes `s += chunk` pattern (pdfjs/typescript).
     fn concat_primitives(
         &mut self,
         heap: &mut Heap,
         left: RuntimeValue,
         right: RuntimeValue,
     ) -> Result<RuntimeValue, ExecutionError> {
-        let mut text = self
-            .primitive_to_string(left)
-            .ok_or(ExecutionError::ExpectedObject)?;
-        let right = self
-            .primitive_to_string(right)
-            .ok_or(ExecutionError::ExpectedObject)?;
-        text.push_str(&right);
+        match (
+            self.strings.code_unit_length(left),
+            self.strings.code_unit_length(right),
+        ) {
+            (Some(left_len), Some(right_len)) => {
+                // jsString(globalObject, s1, s2): `if (!length1) return s2; if (!length2)
+                // return s1;` (OperationsInlines.h:149-154) — identity-preserving returns.
+                if left_len == 0 {
+                    return Ok(right);
+                }
+                if right_len == 0 {
+                    return Ok(left);
+                }
+                // `return JSRopeString::create(vm, s1, s2);` (OperationsInlines.h:161).
+                self.strings
+                    .allocate_rope_with_heap(&mut self.objects, heap, left, right)
+            }
+            (Some(cell_len), None) => {
+                let converted = self
+                    .primitive_to_string(right)
+                    .ok_or(ExecutionError::ExpectedObject)?;
+                self.concat_string_cell_with_converted(heap, left, cell_len, converted, false)
+            }
+            (None, Some(cell_len)) => {
+                let converted = self
+                    .primitive_to_string(left)
+                    .ok_or(ExecutionError::ExpectedObject)?;
+                self.concat_string_cell_with_converted(heap, right, cell_len, converted, true)
+            }
+            (None, None) => {
+                // Unreachable through op_add (the caller guards at least one string-cell
+                // operand, and jsAddSlowCase always keeps the string side a JSString*);
+                // kept as the former eager concat for defense in depth.
+                let mut text = self
+                    .primitive_to_string(left)
+                    .ok_or(ExecutionError::ExpectedObject)?;
+                let right = self
+                    .primitive_to_string(right)
+                    .ok_or(ExecutionError::ExpectedObject)?;
+                text.push_str(&right);
+                self.strings
+                    .allocate_with_heap(&mut self.objects, heap, &text)
+            }
+        }
+    }
+
+    /// `jsString(JSGlobalObject*, JSString* s1, const String& u2)` and its mirrored
+    /// overload (OperationsInlines.h:75-142): the mixed string-cell + converted-primitive
+    /// concat. Empty-side shortcuts first (:81-85/:117-121); then JSC's cost model picks
+    /// lazy vs eager: `if (s1->isRope() || (StringImpl::headerSize<Latin1Character>() +
+    /// length1 + length2) >= sizeof(JSRopeString)) return JSRopeString::create(...)`
+    /// (:97-98/:130-131) — i.e. an eager flat copy ONLY when the combined StringImpl
+    /// payload would be no bigger than the rope cell it replaces.
+    fn concat_string_cell_with_converted(
+        &mut self,
+        heap: &mut Heap,
+        cell_side: RuntimeValue,
+        cell_len: usize,
+        converted: String,
+        converted_on_left: bool,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        // `if (!length1) return jsString(vm, u2);` / `if (!length2) return s1;`.
+        if cell_len == 0 {
+            return self
+                .strings
+                .allocate_with_heap(&mut self.objects, heap, &converted);
+        }
+        let converted_len = string_code_unit_len(&converted);
+        if converted_len == 0 {
+            return Ok(cell_side);
+        }
+        // WTF StringImpl::headerSize<Latin1Character>() = 20 (StringImpl.h:536 delegating
+        // to tailOffset :1245-1248: offsetof(m_hashAndFlags)=16 + 4 bytes, align 1) and
+        // sizeof(JSRopeString) = 32 (runtime/JSString.h:328 — shrunk 48->32 by 1bbd6bf9's
+        // CompactFibers). Eager therefore only when len1 + len2 < 12.
+        const STRING_IMPL_HEADER_SIZE: usize = 20;
+        const JS_ROPE_STRING_SIZE: usize = 32;
+        if self.strings.is_rope(cell_side)
+            || STRING_IMPL_HEADER_SIZE + cell_len + converted_len >= JS_ROPE_STRING_SIZE
+        {
+            // Rope path: flat-allocate the converted side (`jsString(vm, u2)`) and build
+            // the 2-fiber rope in operand order (:98/:131).
+            let converted_cell =
+                self.strings
+                    .allocate_with_heap(&mut self.objects, heap, &converted)?;
+            let (rope_left, rope_right) = if converted_on_left {
+                (converted_cell, cell_side)
+            } else {
+                (cell_side, converted_cell)
+            };
+            return self.strings.allocate_rope_with_heap(
+                &mut self.objects,
+                heap,
+                rope_left,
+                rope_right,
+            );
+        }
+        // Tiny eager path (`tryMakeString(u1, u2)`, :103/:136): the cell side is flat
+        // (non-rope) and the combined payload is tiny, so the copy is cheap.
+        let combined = {
+            let cell_text = self
+                .strings
+                .text(cell_side)
+                .ok_or(ExecutionError::ExpectedObject)?;
+            if converted_on_left {
+                let mut text = converted;
+                text.push_str(cell_text);
+                text
+            } else {
+                let mut text = cell_text.to_owned();
+                text.push_str(&converted);
+                text
+            }
+        };
         self.strings
-            .allocate_with_heap(&mut self.objects, heap, &text)
+            .allocate_with_heap(&mut self.objects, heap, &combined)
     }
 
     fn coerce_to_string_value(
@@ -10691,10 +10815,12 @@ impl CoreOpcodeDispatchHost {
                 // llint/LLIntSlowPaths.cpp:1236-1241). Other non-object-store
                 // bases fall out of C++ getByVal's string/object arms with no
                 // marking (LLIntSlowPaths.cpp:1259-1261).
+                // leak-fix B: the OOB check reads `length()` only — O(1) on a rope,
+                // no resolve (JSString.h:524-527).
                 None => self
                     .strings
-                    .text(base)
-                    .is_some_and(|text| index >= string_code_unit_len_i32(text) as u32),
+                    .code_unit_length_i32(base)
+                    .is_some_and(|length| index >= length as u32),
             },
             // `baseValue.isCell()` (JSCJSValue.h:998-1001) — any heap cell,
             // including string/symbol/bigint cells outside the object store.
@@ -11904,10 +12030,11 @@ impl CoreOpcodeDispatchHost {
             if let Some(site) = lookup_site {
                 self.record_property_lookup(opaque_record(site));
             }
+            // leak-fix B: `JSString::length()` is O(1) and never resolves a rope
+            // (inline `CompactFibers::m_length`, runtime/JSString.h:524-527).
             let length = self
                 .strings
-                .text(value)
-                .map(string_code_unit_len_i32)
+                .code_unit_length_i32(value)
                 .ok_or(DispatchOutcome::Fail(ExecutionError::ExpectedObject))?;
             return Ok(RuntimeValue::from_i32(length));
         }
@@ -35251,6 +35378,232 @@ mod tests {
             CoreStringCellText::Flat(_),
         ));
         assert!(strings.by_text.contains_key("\u{1f600}"));
+    }
+
+    // ================= leak-fix B: lazy 2-fiber concat rope (JSRopeString) =================
+
+    fn rope_record_is_unresolved(strings: &CoreStringStore, value: RuntimeValue) -> bool {
+        let slot = strings.index_for_value(value).unwrap();
+        match &strings.string_records[slot].text {
+            CoreStringCellText::Rope { resolved, .. } => resolved.get().is_none(),
+            _ => false,
+        }
+    }
+
+    // (b) A both-string-cell `+` builds a LAZY 2-fiber rope (jsString(g, s1, s2) has NO
+    // eager path, OperationsInlines.h:144-162) whose O(1) length is available WITHOUT
+    // resolving, and whose resolution yields the exact concatenation — including unicode
+    // fibers and rope-of-rope nesting (resolving the outer rope leaves the inner rope
+    // unresolved, exactly like resolveToBuffer reading nested fibers without converting
+    // them).
+    #[test]
+    fn string_concat_builds_lazy_rope_and_resolves_exact_text() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let mut heap = Heap::new();
+        let a = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "Hello, ")
+            .unwrap();
+        let b = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "\u{4e16}\u{754c} \u{1f30d}")
+            .unwrap();
+        let bang = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "!!!!!!!!!!!!!!")
+            .unwrap();
+
+        let c = host.concat_primitives(&mut heap, a, b).unwrap();
+        assert!(rope_record_is_unresolved(&host.strings, c));
+        // O(1) rope length (JSString.h:524-527), no resolve: "Hello, " = 7 code units,
+        // "世界 🌍" = 1+1+1+2 = 5.
+        assert_eq!(host.strings.code_unit_length(c), Some(12));
+        assert!(
+            rope_record_is_unresolved(&host.strings, c),
+            "a length read must NOT flatten the rope"
+        );
+
+        let d = host.concat_primitives(&mut heap, c, bang).unwrap();
+        assert!(rope_record_is_unresolved(&host.strings, d));
+        assert_eq!(host.strings.code_unit_length(d), Some(26));
+
+        // Resolving the OUTER rope walks the inner one without converting it.
+        assert_eq!(
+            host.strings.text(d),
+            Some("Hello, \u{4e16}\u{754c} \u{1f30d}!!!!!!!!!!!!!!")
+        );
+        assert!(
+            rope_record_is_unresolved(&host.strings, c),
+            "resolving d must not resolve its nested fiber c"
+        );
+        // The inner rope resolves independently later.
+        assert_eq!(
+            host.strings.text(c),
+            Some("Hello, \u{4e16}\u{754c} \u{1f30d}")
+        );
+    }
+
+    // (b) Empty-side shortcuts return the OTHER OPERAND ITSELF (identity), never a copy:
+    // `if (!length1) return s2; if (!length2) return s1;` (OperationsInlines.h:149-154).
+    #[test]
+    fn string_concat_empty_side_returns_other_operand_identity() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let mut heap = Heap::new();
+        let empty = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "")
+            .unwrap();
+        let s = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "nonempty-operand")
+            .unwrap();
+
+        assert_eq!(host.concat_primitives(&mut heap, empty, s).unwrap(), s);
+        assert_eq!(host.concat_primitives(&mut heap, s, empty).unwrap(), s);
+    }
+
+    // (d) resolve-once semantics: the second flat-text access returns the SAME cached
+    // buffer (pointer identity), and the first resolution drops the cell's inline fiber
+    // edges (convertToNonRope, JSString.cpp:240/255 — a resolved rope no longer visits
+    // fibers).
+    #[test]
+    fn string_concat_rope_resolves_once_and_drops_fiber_edges() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let mut heap = Heap::new();
+        let left = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "fiber-left-text!!")
+            .unwrap();
+        let right = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "fiber-right-text!")
+            .unwrap();
+        let rope = host.concat_primitives(&mut heap, left, right).unwrap();
+        let rope_addr = cell_payload(rope);
+
+        // Unresolved: the packed cell fibers carry BOTH operand addresses (the GC edges).
+        // SAFETY: `rope_addr` is the live arena string cell just allocated.
+        let fibers = unsafe { string_cell_fibers(rope_addr) };
+        assert_eq!(fibers[0], Some(cell_payload(left)), "fiber0 = left operand");
+        assert_eq!(
+            fibers[1],
+            Some(cell_payload(right)),
+            "fiber1 = right operand"
+        );
+
+        let first_ptr = host.strings.text(rope).unwrap().as_ptr();
+        let second_ptr = host.strings.text(rope).unwrap().as_ptr();
+        assert_eq!(
+            first_ptr, second_ptr,
+            "second access reuses the cached resolution (no re-flatten)"
+        );
+        // SAFETY: as above; resolution zeroed the packed fiber bytes.
+        let fibers = unsafe { string_cell_fibers(rope_addr) };
+        assert_eq!(fibers, [None, None], "resolution drops both fiber edges");
+        assert_eq!(
+            host.strings.text(rope),
+            Some("fiber-left-text!!fiber-right-text!")
+        );
+    }
+
+    // (e) The tiny eager path exists ONLY on the mixed string+converted-primitive overloads
+    // (OperationsInlines.h:97-98/:130-131: eager iff non-rope AND headerSize(20) + len1 +
+    // len2 < sizeof(JSRopeString)(32)); a both-cell concat is ALWAYS a rope (no eager arm
+    // in jsString(g, s1, s2), :144-162), and a rope operand forces the rope path even when
+    // tiny.
+    #[test]
+    fn tiny_string_concat_eagerness_mirrors_jsstring_cost_model() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let mut heap = Heap::new();
+        let ab = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "ab")
+            .unwrap();
+
+        // Mixed, combined 2 + 1 = 3 < 12: eager flat.
+        let eager = host
+            .concat_primitives(&mut heap, ab, RuntimeValue::from_i32(7))
+            .unwrap();
+        let eager_slot = host.strings.index_for_value(eager).unwrap();
+        assert!(matches!(
+            host.strings.string_records[eager_slot].text,
+            CoreStringCellText::Flat(_)
+        ));
+        assert_eq!(host.strings.text(eager), Some("ab7"));
+
+        // Mixed, combined 8 + 5 = 13 >= 12: rope.
+        let abcdefgh = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "abcdefgh")
+            .unwrap();
+        let mixed_rope = host
+            .concat_primitives(&mut heap, abcdefgh, RuntimeValue::from_i32(12345))
+            .unwrap();
+        assert!(rope_record_is_unresolved(&host.strings, mixed_rope));
+        assert_eq!(host.strings.text(mixed_rope), Some("abcdefgh12345"));
+
+        // Both cells, tiny: STILL a rope (JSC has no eager arm for two JSStrings).
+        let cd = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "cd")
+            .unwrap();
+        let cell_rope = host.concat_primitives(&mut heap, ab, cd).unwrap();
+        assert!(rope_record_is_unresolved(&host.strings, cell_rope));
+
+        // A rope operand forces the rope path even when the combined length is tiny
+        // (`s1->isRope() || ...`).
+        let rope_plus_tiny = host
+            .concat_primitives(&mut heap, cell_rope, RuntimeValue::from_i32(1))
+            .unwrap();
+        assert!(rope_record_is_unresolved(&host.strings, rope_plus_tiny));
+        assert_eq!(host.strings.text(rope_plus_tiny), Some("abcd1"));
+    }
+
+    // (a) THE leak-fix B claim: an `s += chunk` loop allocates O(total) bytes toward the
+    // collection trigger, not O(n^2) — each `+` allocates one 16-byte rope cell and ~no
+    // text; the flattened text bytes are reported ONCE at resolution (JSString.cpp:252-257),
+    // mirroring C1's report-at-allocation for flat strings.
+    #[test]
+    fn string_concat_loop_allocates_linear_not_quadratic_bytes() {
+        let mut host = CoreOpcodeDispatchHost::default();
+        let mut heap = Heap::new();
+        let chunk_text = "0123456789abcdef"; // 16 bytes per iteration
+        let iterations = 512usize;
+        let mut s = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, "seed:")
+            .unwrap();
+        let chunk = host
+            .strings
+            .allocate_with_heap(&mut host.objects, &mut heap, chunk_text)
+            .unwrap();
+
+        let before_loop = host.objects.space.bytes_allocated_this_cycle();
+        for _ in 0..iterations {
+            s = host.concat_primitives(&mut heap, s, chunk).unwrap();
+        }
+        let loop_bytes = host.objects.space.bytes_allocated_this_cycle() - before_loop;
+        let total_text_bytes = "seed:".len() + chunk_text.len() * iterations;
+        // O(n) rope cells (16 bytes each), no per-iteration text copy. The former eager
+        // concat reported ~sum(i * 16) ≈ 2.1 MB of transient text here.
+        assert!(
+            loop_bytes <= iterations * 64,
+            "concat loop must allocate O(iterations) cell bytes, got {loop_bytes}"
+        );
+        assert!(
+            loop_bytes < total_text_bytes * 8,
+            "concat loop bytes must be O(total text), got {loop_bytes} vs total {total_text_bytes}"
+        );
+
+        // Resolution flattens once and reports the full text cost to the trigger.
+        let expected = format!("seed:{}", chunk_text.repeat(iterations));
+        assert_eq!(host.strings.text(s), Some(expected.as_str()));
+        host.strings.drain_pending_resolved_bytes(&mut host.objects);
+        let after_resolve = host.objects.space.bytes_allocated_this_cycle();
+        assert!(
+            after_resolve - before_loop - loop_bytes >= total_text_bytes,
+            "resolution must report the flattened byte cost (report-at-flatten)"
+        );
     }
 
     #[test]
