@@ -157,31 +157,124 @@ pub mod opcode_id {
     pub const SUB: u8 = 161;
 }
 
-/// Operand classes in the declared subset.
+/// Operand classes of the packed stream: ONE variant per C++ STREAM TYPE
+/// appearing in a `BytecodeList.rb` `args:` block of the `:Bytecode` section,
+/// named as the C++ type CamelCased (`unsigned` -> `UnsignedImmediate`,
+/// `int` -> `SignedImmediate`) so a generated table can emit
+/// `OperandKind::<Type>` mechanically from the declared arg type.
+/// `metadata:` blocks are NOT stream operand types — a metadata opcode adds
+/// exactly ONE trailing `unsigned` m_metadataID slot (see
+/// [`OpcodeDescriptor::has_metadata`]).
 ///
-/// Each maps to a `BytecodeList.rb` arg type. The class fixes the operand's
-/// signedness for `Fits` width selection and for sign/zero extension on decode
-/// (`Fits.h:66-85`, `Fits.h:118-156`, `Fits.h:355-379`).
+/// Census of ALL `args:` blocks in the 193-opcode `:Bytecode` section
+/// (`BytecodeList.rb:79-1395`), expanded per opcode and verified by
+/// reproducing every generated `macro(op_*, length)` of the local build's
+/// `WebKitBuild/Release/DerivedSources/JavaScriptCore/Bytecodes.h`:
+/// VirtualRegister 423, unsigned 113, BoundLabel 23, ECMAMode 8, int 7,
+/// OperandTypes 7, IndexingType 2, SymbolTableOrScopeDepth 2, ResolveType 2,
+/// GetPutInfo 2, PutByIdFlags 1, ProfileTypeBytecodeFlag 1,
+/// PrivateFieldPutKind 1, ErrorTypeWithExtension 1, DebugHookType 1,
+/// ResultType 1, JSType 1. `bool` appears in NO `args:` block (only inside
+/// the `metadata:` block of `op :jneq_ptr`, `BytecodeList.rb:769`).
+///
+/// Each variant fixes the operand's `Fits` encode/check semantics for width
+/// selection and its sign/zero extension (or structural unpack) on decode;
+/// the mirrored `Fits.h` specialization is cited per variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperandKind {
-    /// `VirtualRegister` arg: a signed frame/constant slot index, encoded
-    /// through `Fits<VirtualRegister>` for constants in narrow/wide16 forms.
+    /// `VirtualRegister`: signed frame/constant slot index.
+    /// `Fits<VirtualRegister, Narrow|Wide16>` constant-band remap
+    /// (`Fits.h:118-156`); Wide32 is the same-size `bit_cast` fallback
+    /// (`Fits.h:52-64`) storing the raw offset.
     VirtualRegister,
-    /// `unsigned` profile-table index (e.g. `op_add`'s `profileIndex`).
-    ProfileIndex,
-    /// `OperandTypes` arg: packed result-type hints, stored unsigned
-    /// (`Fits.h:300-353`).
+    /// `unsigned` (value/array-profile indices, property/argc/argv, the
+    /// m_metadataID slot, ...). `Fits<unsigned, Narrow|Wide16>` unsigned
+    /// range check (`Fits.h:66-85`); Wide32 same-size (`Fits.h:52-64`).
+    /// Zero-extends on decode.
+    UnsignedImmediate,
+    /// `int` (`firstVarArg`, `get_argument`'s `index`, ...).
+    /// `Fits<int, Narrow|Wide16>` signed range check (`Fits.h:66-85`);
+    /// Wide32 same-size. Two's complement; sign-extends on decode.
+    SignedImmediate,
+    /// `bool`. NO current `args:` block uses it (metadata-only, see the enum
+    /// doc); kept so the generator can express it mechanically. Narrow is the
+    /// same-size `bit_cast` (`Fits.h:52-64`, sizeof(bool) == 1); wider forms
+    /// go through `Fits<bool, size> : Fits<uint8_t, size>` (`Fits.h:87-103`).
+    /// Stored 0/1, zero-extends.
+    Bool,
+    /// `OperandTypes`: a `(ResultType, ResultType)` pair. Narrow packs each
+    /// type into 4 bits with unknownType <-> 0 remapped
+    /// (`Fits.h:300-353`); Wide16 is the same-size `bit_cast` of the raw
+    /// `bits()` (`Fits.h:52-64`) and Wide32 zero-extends them.
     OperandTypes,
-    /// `BoundLabel` arg: a SIGNED byte delta from the jump instruction's start
-    /// to its target (`Label.h:73-79,146-151`).
+    /// `BoundLabel`: SIGNED byte delta from the jump instruction's start to
+    /// its target (`Label.h:73-79,146-151`).
+    /// `Fits<GenericBoundLabel, size> : Fits<int, size>` (`Fits.h:355-379`).
     BoundLabel,
+    /// `ECMAMode`: `value()` byte, 0 = strict / 1 = sloppy
+    /// (`ECMAMode.h:39-49`). `Fits<ECMAMode, size> : Fits<uint8_t, size>`
+    /// (`Fits.h:381-399`); always fits Narrow.
+    ECMAMode,
+    /// `IndexingType`: `typedef uint8_t IndexingType` (`IndexingType.h:63`);
+    /// plain `Fits<uint8_t>` integral semantics. Always fits Narrow.
+    IndexingType,
+    /// `SymbolTableOrScopeDepth`: `raw()` u32
+    /// (`SymbolTableOrScopeDepth.h:48-63`).
+    /// `Fits<SymbolTableOrScopeDepth, size> : Fits<unsigned, size>`
+    /// (`Fits.h:158-176`); Wide32 same-size.
+    SymbolTableOrScopeDepth,
+    /// `ResolveType`: `enum ResolveType : unsigned` (`GetPutInfo.h:59`),
+    /// values 0..=13 (Dynamic). Enum `Fits` forwards to the underlying
+    /// unsigned (`Fits.h:269-285`).
+    ResolveType,
+    /// `GetPutInfo`: carried as the C++ class's `m_operand` u32
+    /// (`GetPutInfo.h:222-257`: isStrict<<30 | resolveMode<<20 |
+    /// initializationMode<<10 | resolveType). Narrow/Wide16 store the
+    /// COMPRESSED byte isStrict<<7 | resolveType<<3 | initializationMode<<1 |
+    /// resolveMode (`Fits.h:178-232`); Wide32 is the same-size `bit_cast` of
+    /// the raw m_operand (`Fits.h:52-64`).
+    GetPutInfo,
+    /// `PutByIdFlags`: two booleans packed as isStrict<<1 | isDirect
+    /// (`Fits.h:234-267`, check always true; `PutByIdFlags.h:32-57`).
+    PutByIdFlags,
+    /// `ProfileTypeBytecodeFlag`: unscoped enum, values 0..=4
+    /// (`ProfileTypeBytecodeFlag.h:30-36`). Clang gives non-negative unscoped
+    /// enums an UNSIGNED underlying type, so enum `Fits` (`Fits.h:269-285`)
+    /// forwards to `Fits<unsigned>`.
+    ProfileTypeBytecodeFlag,
+    /// `PrivateFieldPutKind`: `value()` byte, 0..=2
+    /// (`PrivateFieldPutKind.h:40-53`).
+    /// `Fits<PrivateFieldPutKind, size> : Fits<uint8_t, size>`
+    /// (`Fits.h:401-419`); always fits Narrow.
+    PrivateFieldPutKind,
+    /// `ErrorTypeWithExtension`: `enum class : uint8_t` (`ErrorType.h:59`);
+    /// enum `Fits` forwards to `Fits<uint8_t>` (`Fits.h:269-285`). Always
+    /// fits Narrow.
+    ErrorTypeWithExtension,
+    /// `DebugHookType`: unscoped enum, values 0..=8 (`Interpreter.h:91-101`);
+    /// unsigned underlying type like [`Self::ProfileTypeBytecodeFlag`].
+    DebugHookType,
+    /// `ResultType`: `bits()` byte (`ResultType.h:39-59,231`).
+    /// `Fits<ResultType, size> : Fits<uint8_t, size>` (`Fits.h:287-298`);
+    /// always fits Narrow.
+    ResultType,
+    /// `JSType`: `enum JSType : uint8_t` (`JSType.h:164`); enum `Fits`
+    /// forwards to `Fits<uint8_t>`. Always fits Narrow.
+    JSType,
 }
 
 impl OperandKind {
-    /// `BoundLabel` and `VirtualRegister` are signed; profile/type indices are
-    /// unsigned. Governs both the `Fits` range check and decode extension.
+    /// Signed stream fields: `VirtualRegister` (`Fits.h:118-156` signed
+    /// TargetType), `int`, and `BoundLabel` (`Fits.h:355-379` : Fits<int>).
+    /// Everything else is unsigned-backed (`unsigned`, uint8-backed wrappers,
+    /// unsigned-underlying enums, and the packed GetPutInfo/OperandTypes/
+    /// PutByIdFlags encodings). Governs both the `Fits` range check and
+    /// decode extension.
     pub const fn is_signed(self) -> bool {
-        matches!(self, Self::VirtualRegister | Self::BoundLabel)
+        matches!(
+            self,
+            Self::VirtualRegister | Self::SignedImmediate | Self::BoundLabel
+        )
     }
 }
 
@@ -194,7 +287,20 @@ impl OperandKind {
 pub struct OpcodeDescriptor {
     pub id: u8,
     pub name: &'static str,
+    /// The `args:` block stream types, in declaration order. Does NOT include
+    /// the metadataID slot — that is derived from [`Self::has_metadata`].
     pub operands: &'static [OperandKind],
+    /// True when the opcode declares a `metadata:` block: the instruction
+    /// then carries ONE extra TRAILING stream slot for m_metadataID
+    /// (`generator/Opcode.rb:372-374` `length = args.length + (metadata ?
+    /// 1 : 0)`). The slot is emitted as a plain `unsigned` operand
+    /// (`generator/Metadata.rb:126-131` `Argument.new(..., :unsigned, -1)`;
+    /// `generator/Opcode.rb:185-189` appends `__metadataID` to
+    /// `writeOpcode`), so it is sized per-width like every other operand
+    /// field. No current hand-written row sets it: the 49 JSC opcodes with
+    /// metadata (IDs 0..49, generated `NUMBER_OF_BYTECODE_WITH_METADATA`)
+    /// are not declared here yet; the generated table will set it.
+    pub has_metadata: bool,
     /// True for the width-prefix opcodes (`op_wide16`/`op_wide32`).
     pub is_wide_prefix: bool,
     /// Rust-only bridge to the pre-generated `CoreOpcode` dispatch surface.
@@ -214,12 +320,24 @@ impl OpcodeDescriptor {
     /// `opcodeLengths[id]` = operand-slot count.
     ///
     /// `generator/Opcode.rb:372-374` `length = args.length + (metadata ? 1 : 0)`
-    /// and `generator/Section.rb:111` emits `macro(name, length)`. The declared
-    /// subset has no metadata (every declared id is >= the metadata partition
-    /// bound 49 — see the `OPCODE_TABLE` doc), so this is exactly
-    /// `operands.len()`.
+    /// and `generator/Section.rb:111` emits `macro(name, length)`. A metadata
+    /// opcode's m_metadataID occupies one trailing slot (see
+    /// [`Self::has_metadata`]).
     pub const fn opcode_length(&self) -> usize {
-        self.operands.len()
+        self.operands.len() + self.has_metadata as usize
+    }
+
+    /// Stream-operand kind at slot `index`, INCLUDING the trailing
+    /// m_metadataID slot of metadata opcodes, which is written as a plain
+    /// `unsigned` (`generator/Metadata.rb:126-131`).
+    pub const fn operand_kind(&self, index: usize) -> OperandKind {
+        if index < self.operands.len() {
+            self.operands[index]
+        } else if self.has_metadata && index == self.operands.len() {
+            OperandKind::UnsignedImmediate
+        } else {
+            panic!("operand index out of range")
+        }
     }
 }
 
@@ -231,7 +349,9 @@ const PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS: &[OperandKind] = &[
     OperandKind::VirtualRegister,
     OperandKind::VirtualRegister,
     OperandKind::VirtualRegister,
-    OperandKind::ProfileIndex,
+    // `profileIndex` is a plain `unsigned` arg (`BytecodeList.rb:1276-1292`),
+    // so its kind is the C++ STREAM TYPE `unsigned`, not the arg's name.
+    OperandKind::UnsignedImmediate,
     OperandKind::OperandTypes,
 ];
 
@@ -252,6 +372,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::JMP,
         name: "jmp",
         operands: &[OperandKind::BoundLabel],
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -260,6 +381,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::JTRUE,
         name: "jtrue",
         operands: &[OperandKind::VirtualRegister, OperandKind::BoundLabel],
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -268,6 +390,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::RET,
         name: "ret",
         operands: &[OperandKind::VirtualRegister],
+        has_metadata: false,
         is_wide_prefix: false,
         core: Some(CoreOpcode::Return),
     },
@@ -275,6 +398,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::WIDE16,
         name: "wide16",
         operands: &[],
+        has_metadata: false,
         is_wide_prefix: true,
         core: None,
     },
@@ -282,6 +406,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::WIDE32,
         name: "wide32",
         operands: &[],
+        has_metadata: false,
         is_wide_prefix: true,
         core: None,
     },
@@ -290,6 +415,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::ENTER,
         name: "enter",
         operands: &[],
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -298,6 +424,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::MOV,
         name: "mov",
         operands: &[OperandKind::VirtualRegister, OperandKind::VirtualRegister],
+        has_metadata: false,
         is_wide_prefix: false,
         core: Some(CoreOpcode::Move),
     },
@@ -311,6 +438,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
             OperandKind::VirtualRegister,
             OperandKind::VirtualRegister,
         ],
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -324,6 +452,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::ADD,
         name: "add",
         operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -331,6 +460,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::MUL,
         name: "mul",
         operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -338,6 +468,7 @@ static OPCODE_TABLE: &[OpcodeDescriptor] = &[
         id: opcode_id::SUB,
         name: "sub",
         operands: PROFILED_BINARY_OP_WITH_OPERAND_TYPES_ARGS,
+        has_metadata: false,
         is_wide_prefix: false,
         core: None,
     },
@@ -353,62 +484,142 @@ pub fn descriptor_for(id: u8) -> Option<&'static OpcodeDescriptor> {
 
 /// A concrete operand value handed to the writer. Carries the integer plus its
 /// `OperandKind` so the writer can range-check and convert via `Fits`.
+///
+/// Each variant carries the C++ type's canonical scalar (the same value the
+/// generated struct field holds / `decode` returns); see the matching
+/// [`OperandKind`] variant for the storage evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperandValue {
+    /// Raw signed `VirtualRegister` offset.
     VirtualRegister(i32),
-    ProfileIndex(u32),
+    /// `unsigned` arg (profile/property/argc/... index, or the m_metadataID
+    /// slot value of a metadata opcode).
+    UnsignedImmediate(u32),
+    /// `int` arg.
+    SignedImmediate(i32),
+    /// `bool` arg (no current `args:` block uses it; see `OperandKind::Bool`).
+    Bool(bool),
+    /// `OperandTypes` as its `bits()` u16: low byte = first, high byte =
+    /// second (little-endian `bit_cast` of `{ m_first, m_second }`,
+    /// `ResultType.h:244-274`).
     OperandTypes(u16),
     /// Signed byte delta from the jump instruction start to its target.
     BoundLabel(i32),
+    /// `ECMAMode::value()`: 0 = strict, 1 = sloppy (`ECMAMode.h:39-49`).
+    ECMAMode(u8),
+    /// `IndexingType` byte (`IndexingType.h:63`).
+    IndexingType(u8),
+    /// `SymbolTableOrScopeDepth::raw()` (`SymbolTableOrScopeDepth.h:48-63`).
+    SymbolTableOrScopeDepth(u32),
+    /// `ResolveType` enumerator value (`GetPutInfo.h:59`).
+    ResolveType(u32),
+    /// `GetPutInfo::m_operand` (`GetPutInfo.h:222-257`).
+    GetPutInfo(u32),
+    /// `PutByIdFlags` packed as isStrict<<1 | isDirect (`Fits.h:238-258`).
+    PutByIdFlags(u8),
+    /// `ProfileTypeBytecodeFlag` enumerator value
+    /// (`ProfileTypeBytecodeFlag.h:30-36`).
+    ProfileTypeBytecodeFlag(u32),
+    /// `PrivateFieldPutKind::value()` (`PrivateFieldPutKind.h:40-53`).
+    PrivateFieldPutKind(u8),
+    /// `ErrorTypeWithExtension` enumerator value (`ErrorType.h:59`).
+    ErrorTypeWithExtension(u8),
+    /// `DebugHookType` enumerator value (`Interpreter.h:91-101`).
+    DebugHookType(u32),
+    /// `ResultType::bits()` (`ResultType.h:39-59,231`).
+    ResultType(u8),
+    /// `JSType` enumerator value (`JSType.h:164`).
+    JSType(u8),
 }
 
 impl OperandValue {
     const fn kind(self) -> OperandKind {
         match self {
             Self::VirtualRegister(_) => OperandKind::VirtualRegister,
-            Self::ProfileIndex(_) => OperandKind::ProfileIndex,
+            Self::UnsignedImmediate(_) => OperandKind::UnsignedImmediate,
+            Self::SignedImmediate(_) => OperandKind::SignedImmediate,
+            Self::Bool(_) => OperandKind::Bool,
             Self::OperandTypes(_) => OperandKind::OperandTypes,
             Self::BoundLabel(_) => OperandKind::BoundLabel,
+            Self::ECMAMode(_) => OperandKind::ECMAMode,
+            Self::IndexingType(_) => OperandKind::IndexingType,
+            Self::SymbolTableOrScopeDepth(_) => OperandKind::SymbolTableOrScopeDepth,
+            Self::ResolveType(_) => OperandKind::ResolveType,
+            Self::GetPutInfo(_) => OperandKind::GetPutInfo,
+            Self::PutByIdFlags(_) => OperandKind::PutByIdFlags,
+            Self::ProfileTypeBytecodeFlag(_) => OperandKind::ProfileTypeBytecodeFlag,
+            Self::PrivateFieldPutKind(_) => OperandKind::PrivateFieldPutKind,
+            Self::ErrorTypeWithExtension(_) => OperandKind::ErrorTypeWithExtension,
+            Self::DebugHookType(_) => OperandKind::DebugHookType,
+            Self::ResultType(_) => OperandKind::ResultType,
+            Self::JSType(_) => OperandKind::JSType,
         }
     }
 
+    /// The value-domain integer (what `Fits::convert(TargetType)` yields back
+    /// after decode; for GetPutInfo/OperandTypes the STRUCTURAL wide form,
+    /// not the narrow packing).
     const fn as_i64(self) -> i64 {
         match self {
             Self::VirtualRegister(value) => value as i64,
-            Self::ProfileIndex(value) => value as i64,
+            Self::UnsignedImmediate(value) => value as i64,
+            Self::SignedImmediate(value) => value as i64,
+            Self::Bool(value) => value as i64,
             Self::OperandTypes(value) => value as i64,
             Self::BoundLabel(value) => value as i64,
+            Self::ECMAMode(value) => value as i64,
+            Self::IndexingType(value) => value as i64,
+            Self::SymbolTableOrScopeDepth(value) => value as i64,
+            Self::ResolveType(value) => value as i64,
+            Self::GetPutInfo(value) => value as i64,
+            Self::PutByIdFlags(value) => value as i64,
+            Self::ProfileTypeBytecodeFlag(value) => value as i64,
+            Self::PrivateFieldPutKind(value) => value as i64,
+            Self::ErrorTypeWithExtension(value) => value as i64,
+            Self::DebugHookType(value) => value as i64,
+            Self::ResultType(value) => value as i64,
+            Self::JSType(value) => value as i64,
         }
     }
 
-    /// `Fits<T, size>::check` (`Fits.h:71-74`) plus the `Fits<VirtualRegister>`
-    /// constant remap (`Fits.h:118-156`): does this operand fit the width?
+    /// `Fits<T, size>::check` (`Fits.h:71-74`) with the structural
+    /// specializations: the `Fits<VirtualRegister>` constant remap
+    /// (`Fits.h:118-156`), the `Fits<GetPutInfo>` compressed-field check
+    /// (`Fits.h:206-212`), and the `Fits<OperandTypes>` narrow nibble check
+    /// (`Fits.h:311-323`). Does this operand fit the width?
     fn fits_check(self, width: OpcodeSize) -> bool {
-        if let Self::VirtualRegister(register) = self {
-            return virtual_register_fits_check(register, width);
-        }
-        if self.kind().is_signed() {
-            let value = self.as_i64();
-            value >= width.signed_min() && value <= width.signed_max()
-        } else {
-            (self.as_i64() as u64) <= width.unsigned_max()
+        match self {
+            Self::VirtualRegister(register) => virtual_register_fits_check(register, width),
+            Self::GetPutInfo(operand) => get_put_info_fits_check(operand, width),
+            Self::OperandTypes(bits) => operand_types_fits_check(bits, width),
+            _ if self.kind().is_signed() => {
+                let value = self.as_i64();
+                value >= width.signed_min() && value <= width.signed_max()
+            }
+            _ => (self.as_i64() as u64) <= width.unsigned_max(),
         }
     }
 
-    /// `Fits<T, size>::convert` (`Fits.h:76-80`) plus the
-    /// `Fits<VirtualRegister>::convert` constant-band encoding. The result is the
-    /// width-truncated little-endian bit pattern stored into the stream.
+    /// `Fits<T, size>::convert` (`Fits.h:76-80`) with the structural
+    /// encodings: `Fits<VirtualRegister>` constant-band (`Fits.h:141-147`),
+    /// `Fits<GetPutInfo>` compressed byte (`Fits.h:214-222`), and
+    /// `Fits<OperandTypes>` narrow nibble pack (`Fits.h:325-338`). The result
+    /// is the width-truncated little-endian bit pattern stored into the
+    /// stream.
     fn fits_convert(self, width: OpcodeSize) -> u64 {
         debug_assert!(
             self.fits_check(width),
             "operand does not fit selected width"
         );
         let converted = match self {
-            Self::VirtualRegister(register) => virtual_register_fits_convert(register, width),
-            _ => self.as_i64(),
+            Self::VirtualRegister(register) => {
+                virtual_register_fits_convert(register, width) as u64
+            }
+            Self::GetPutInfo(operand) => get_put_info_fits_convert(operand, width),
+            Self::OperandTypes(bits) => operand_types_fits_convert(bits, width),
+            _ => self.as_i64() as u64,
         };
-        let mask = width.unsigned_max();
-        (converted as u64) & mask
+        converted & width.unsigned_max()
     }
 }
 
@@ -460,6 +671,152 @@ fn virtual_register_fits_decode(encoded: i64, width: OpcodeSize) -> i32 {
         return encoded;
     }
     encoded as i32
+}
+
+// `GetPutInfo::m_operand` layout (`GetPutInfo.h:225-233`): 10 bits per field —
+// resolveType bits 0..10, initializationMode bits 10..20, resolveMode bits
+// 20..30, isStrict bit 30.
+const GET_PUT_INFO_INITIALIZATION_SHIFT: u32 = 10;
+const GET_PUT_INFO_MODE_SHIFT: u32 = 20;
+const GET_PUT_INFO_IS_STRICT_SHIFT: u32 = 30;
+const GET_PUT_INFO_TYPE_BITS: u32 = (1 << GET_PUT_INFO_INITIALIZATION_SHIFT) - 1;
+const GET_PUT_INFO_FIELD_MASK: u32 = GET_PUT_INFO_TYPE_BITS;
+
+/// Split an `m_operand` into (resolveType, initializationMode, resolveMode,
+/// isStrict) per the accessors `GetPutInfo.h:248-251`.
+const fn get_put_info_fields(operand: u32) -> (u32, u32, u32, u32) {
+    let resolve_type = operand & GET_PUT_INFO_TYPE_BITS;
+    let initialization_mode =
+        (operand >> GET_PUT_INFO_INITIALIZATION_SHIFT) & GET_PUT_INFO_FIELD_MASK;
+    let resolve_mode = (operand >> GET_PUT_INFO_MODE_SHIFT) & GET_PUT_INFO_FIELD_MASK;
+    let is_strict = (operand >> GET_PUT_INFO_IS_STRICT_SHIFT) & 1;
+    (resolve_type, initialization_mode, resolve_mode, is_strict)
+}
+
+/// `Fits<GetPutInfo, Narrow|Wide16>::check` (`Fits.h:206-212`): the
+/// compressed encoding holds resolveType in 4 bits, initializationMode in 2,
+/// resolveMode in 1. Wide32 is the same-size `bit_cast` of the raw
+/// m_operand (`Fits.h:52-64`), which always fits.
+fn get_put_info_fits_check(operand: u32, width: OpcodeSize) -> bool {
+    if matches!(width, OpcodeSize::Wide32) {
+        return true;
+    }
+    let (resolve_type, initialization_mode, resolve_mode, _) = get_put_info_fields(operand);
+    resolve_type < 16 && initialization_mode < 4 && resolve_mode < 2
+}
+
+/// `Fits<GetPutInfo, Narrow|Wide16>::convert` (`Fits.h:214-222`):
+/// `isStrict << 7 | resolveType << 3 | initializationMode << 1 | resolveMode`.
+/// Wide32: raw m_operand.
+fn get_put_info_fits_convert(operand: u32, width: OpcodeSize) -> u64 {
+    if matches!(width, OpcodeSize::Wide32) {
+        return operand as u64;
+    }
+    let (resolve_type, initialization_mode, resolve_mode, is_strict) = get_put_info_fields(operand);
+    ((is_strict << 7) | (resolve_type << 3) | (initialization_mode << 1) | resolve_mode) as u64
+}
+
+/// `Fits<GetPutInfo, Narrow|Wide16>::convert(TargetType)` (`Fits.h:224-231`)
+/// rebuilt into the m_operand layout the `GetPutInfo(resolveMode,
+/// resolveType, initializationMode, ecmaMode)` constructor produces
+/// (`GetPutInfo.h:238-240`). Wide32: raw m_operand back unchanged.
+fn get_put_info_fits_decode(raw: u64, width: OpcodeSize) -> u32 {
+    if matches!(width, OpcodeSize::Wide32) {
+        return raw as u32;
+    }
+    let resolve_type = ((raw >> 3) & 0xf) as u32;
+    let initialization_mode = ((raw >> 1) & 0x3) as u32;
+    let resolve_mode = (raw & 0x1) as u32;
+    let is_strict = ((raw >> 7) & 0x1) as u32;
+    (is_strict << GET_PUT_INFO_IS_STRICT_SHIFT)
+        | (resolve_mode << GET_PUT_INFO_MODE_SHIFT)
+        | (initialization_mode << GET_PUT_INFO_INITIALIZATION_SHIFT)
+        | resolve_type
+}
+
+/// `ResultType::unknownType().bits()` = TypeBits = 0b111_1110
+/// (`ResultType.h:40-51,168-171`).
+const RESULT_TYPE_UNKNOWN_BITS: u16 = 0x7e;
+/// `Fits<OperandTypes>` narrow packing constants (`Fits.h:308-309`).
+const OPERAND_TYPES_TYPE_WIDTH: u32 = 4;
+const OPERAND_TYPES_MAX_TYPE: u16 = (1 << OPERAND_TYPES_TYPE_WIDTH) - 1;
+
+/// Split `OperandTypes::bits()` into (first, second): the u16 is the
+/// little-endian `bit_cast` of `{ uint8_t m_first; uint8_t m_second; }`
+/// (`ResultType.h:244-274`), so first is the LOW byte.
+const fn operand_types_first_second(bits: u16) -> (u16, u16) {
+    (bits & 0xff, bits >> 8)
+}
+
+/// The narrow unknownType <-> 0 remap of `Fits<OperandTypes>`
+/// (`Fits.h:313-320`): unknown is encoded as 0 so it fits 4 bits.
+const fn operand_types_narrow_remap(type_bits: u16) -> u16 {
+    if type_bits == RESULT_TYPE_UNKNOWN_BITS {
+        0
+    } else {
+        type_bits
+    }
+}
+
+/// `Fits<OperandTypes, Narrow>::check` (`Fits.h:311-323`): each remapped type
+/// must fit 4 bits. Wide16 is the same-size `bit_cast` (`Fits.h:52-64`) and
+/// Wide32 returns true (`Fits.h:322`).
+fn operand_types_fits_check(bits: u16, width: OpcodeSize) -> bool {
+    if !matches!(width, OpcodeSize::Narrow) {
+        return true;
+    }
+    let (first, second) = operand_types_first_second(bits);
+    operand_types_narrow_remap(first) <= OPERAND_TYPES_MAX_TYPE
+        && operand_types_narrow_remap(second) <= OPERAND_TYPES_MAX_TYPE
+}
+
+/// `Fits<OperandTypes, Narrow>::convert` (`Fits.h:325-338`):
+/// `(first << 4) | second` after the unknown->0 remap. Wide16/Wide32 store
+/// the raw `bits()`.
+fn operand_types_fits_convert(bits: u16, width: OpcodeSize) -> u64 {
+    if !matches!(width, OpcodeSize::Narrow) {
+        return bits as u64;
+    }
+    let (first, second) = operand_types_first_second(bits);
+    ((operand_types_narrow_remap(first) << OPERAND_TYPES_TYPE_WIDTH)
+        | operand_types_narrow_remap(second)) as u64
+}
+
+/// `Fits<OperandTypes, Narrow>::convert(TargetType)` (`Fits.h:340-352`):
+/// unpack the nibbles with the 0 -> unknownType remap; wide forms truncate
+/// the raw field back to the u16 `bits()` (`Fits.h:351`
+/// `fromBits(static_cast<uint16_t>(types))`).
+fn operand_types_fits_decode(raw: u64, width: OpcodeSize) -> u16 {
+    if !matches!(width, OpcodeSize::Narrow) {
+        return raw as u16;
+    }
+    let mut first = ((raw >> OPERAND_TYPES_TYPE_WIDTH) & OPERAND_TYPES_MAX_TYPE as u64) as u16;
+    let mut second = (raw & OPERAND_TYPES_MAX_TYPE as u64) as u16;
+    if first == 0 {
+        first = RESULT_TYPE_UNKNOWN_BITS;
+    }
+    if second == 0 {
+        second = RESULT_TYPE_UNKNOWN_BITS;
+    }
+    first | (second << 8)
+}
+
+/// Back-convert one raw width-truncated stream field to its value-domain
+/// integer — the `Fits<T, size>::convert(TargetType)` direction used by the
+/// generated struct accessors: constant-band remap for `VirtualRegister`,
+/// structural unpack for `GetPutInfo`/`OperandTypes`, sign extension for the
+/// signed kinds, zero extension for everything else.
+fn fits_decode(kind: OperandKind, raw: u64, width: OpcodeSize) -> i64 {
+    match kind {
+        OperandKind::VirtualRegister => i64::from(virtual_register_fits_decode(
+            sign_extend(raw, width.operand_bytes()),
+            width,
+        )),
+        OperandKind::GetPutInfo => i64::from(get_put_info_fits_decode(raw, width)),
+        OperandKind::OperandTypes => i64::from(operand_types_fits_decode(raw, width)),
+        kind if kind.is_signed() => sign_extend(raw, width.operand_bytes()),
+        _ => raw as i64,
+    }
 }
 
 /// Read `width` little-endian bytes from `bytes[start..]` as an unsigned value.
@@ -620,15 +977,7 @@ pub fn decode_raw_instruction(
     for index in 0..descriptor.opcode_length() {
         let at = operands_start + index * width.operand_bytes();
         let raw = read_unsigned_le(bytes, at, width.operand_bytes());
-        let value = match descriptor.operands[index] {
-            OperandKind::VirtualRegister => i64::from(virtual_register_fits_decode(
-                sign_extend(raw, width.operand_bytes()),
-                width,
-            )),
-            kind if kind.is_signed() => sign_extend(raw, width.operand_bytes()),
-            _ => raw as i64,
-        };
-        operands.push(value);
+        operands.push(fits_decode(descriptor.operand_kind(index), raw, width));
     }
     Ok(RawDecodedInstruction {
         offset,
@@ -710,9 +1059,21 @@ impl InstructionStreamWriter {
         assert_eq!(
             operands.len(),
             descriptor.opcode_length(),
-            "operand count must match opcodeLengths[{}]",
+            "operand count must match opcodeLengths[{}] (incl. metadataID slot)",
             descriptor.name
         );
+        // C++ gets per-operand type agreement from the generated emitters'
+        // typed signatures (`generator/Opcode.rb:185-189`); the raw writer
+        // re-checks it dynamically. A metadata opcode's trailing slot is the
+        // `unsigned` metadataID (`generator/Metadata.rb:126-131`).
+        for (index, operand) in operands.iter().enumerate() {
+            debug_assert!(
+                operand.kind() == descriptor.operand_kind(index),
+                "operand {index} of {} must be {:?}",
+                descriptor.name,
+                descriptor.operand_kind(index)
+            );
+        }
         let width = select_width(operands);
         let start = self.position;
 
@@ -749,6 +1110,12 @@ impl InstructionStreamWriter {
         let (width, descriptor, operands_start) =
             decode_header(&self.instructions, instruction_offset);
         assert!(operand_index < descriptor.opcode_length());
+        debug_assert!(
+            value.kind() == descriptor.operand_kind(operand_index),
+            "patched operand {operand_index} of {} must be {:?}",
+            descriptor.name,
+            descriptor.operand_kind(operand_index)
+        );
         let at = operands_start + operand_index * width.operand_bytes();
         let raw = value.fits_convert(width);
         let mut k = 0;
@@ -932,14 +1299,7 @@ impl<'a> Ref<'a> {
         assert!(i < descriptor.opcode_length());
         let at = operands_start + i * width.operand_bytes();
         let raw = read_unsigned_le(self.instructions, at, width.operand_bytes());
-        match descriptor.operands[i] {
-            OperandKind::VirtualRegister => i64::from(virtual_register_fits_decode(
-                sign_extend(raw, width.operand_bytes()),
-                width,
-            )),
-            kind if kind.is_signed() => sign_extend(raw, width.operand_bytes()),
-            _ => raw as i64,
-        }
+        fits_decode(descriptor.operand_kind(i), raw, width)
     }
 
     /// Resolve a `BoundLabel` operand to an absolute target BYTE OFFSET:
@@ -1070,13 +1430,14 @@ mod tests {
             ]),
             OpcodeSize::Narrow
         );
-        // profileIndex 5000 overflows int8/uint8 -> Wide16 for every field.
+        // profileIndex (a plain `unsigned` arg) 5000 overflows int8/uint8 ->
+        // Wide16 for every field.
         assert_eq!(
             select_width(&[
                 OperandValue::VirtualRegister(-1),
                 OperandValue::VirtualRegister(-2),
                 OperandValue::VirtualRegister(-3),
-                OperandValue::ProfileIndex(5000),
+                OperandValue::UnsignedImmediate(5000),
                 OperandValue::OperandTypes(0),
             ]),
             OpcodeSize::Wide16
@@ -1087,7 +1448,7 @@ mod tests {
                 OperandValue::VirtualRegister(-1),
                 OperandValue::VirtualRegister(-2),
                 OperandValue::VirtualRegister(-3),
-                OperandValue::ProfileIndex(100_000),
+                OperandValue::UnsignedImmediate(100_000),
                 OperandValue::OperandTypes(0),
             ]),
             OpcodeSize::Wide32
@@ -1122,7 +1483,7 @@ mod tests {
                 OperandValue::VirtualRegister(-1),
                 OperandValue::VirtualRegister(-2),
                 OperandValue::VirtualRegister(-3),
-                OperandValue::ProfileIndex(5000),
+                OperandValue::UnsignedImmediate(5000),
                 OperandValue::OperandTypes(0x0102),
             ],
         );
@@ -1133,7 +1494,7 @@ mod tests {
                 OperandValue::VirtualRegister(-1),
                 OperandValue::VirtualRegister(-2),
                 OperandValue::VirtualRegister(-3),
-                OperandValue::ProfileIndex(100_000),
+                OperandValue::UnsignedImmediate(100_000),
                 OperandValue::OperandTypes(0x0304),
             ],
         );
@@ -1317,10 +1678,13 @@ mod tests {
     /// the C++ layout (`Instruction.h:181-198` narrow form
     /// `[opcode][operands...]`, opcode always one byte per `Opcode.h:86-87`).
     /// `op_add`'s operands are dst, lhs, rhs, profileIndex, operandTypes
-    /// (`BytecodeList.rb:1276-1292`), one byte each in narrow form:
+    /// (`BytecodeList.rb:1276-1292`), one byte each in narrow form. The
+    /// narrow operandTypes byte is the `Fits<OperandTypes, Narrow>` 4-bit
+    /// pack `(first << 4) | second` (`Fits.h:325-338`): byte 0x12 = first
+    /// TypeInt32(0x01), second TypeMaybeNumber(0x02), i.e. `bits()` 0x0201.
     ///   offset 0: enter                          = [ENTER]           (size 1)
     ///   offset 1: add local0, local1, constant0,
-    ///             profileIndex=7, operandTypes=0x12
+    ///             profileIndex=7, operandTypes bits=0x0201
     ///             = [ADD, 0xff, 0xfe, 0x10, 0x07, 0x12]              (size 6)
     ///   offset 7: ret local0                     = [RET, 0xff]       (size 2)
     #[test]
@@ -1342,7 +1706,12 @@ mod tests {
         assert_eq!(add.operands[1], -2); // lhs = local(1)
         assert_eq!(add.operands[2], i64::from(FIRST_CONSTANT_REGISTER_INDEX)); // rhs = constant(0)
         assert_eq!(add.operands[3], 7); // profileIndex, unsigned zero-extend
-        assert_eq!(add.operands[4], 0x12); // operandTypes, unsigned
+
+        // operandTypes: narrow byte 0x12 unpacks to bits() 0x0201
+        // (`Fits.h:340-352`; first = low byte). The old expectation 0x12 was
+        // an accidental raw-truncation divergence, corrected to the C++
+        // nibble unpack.
+        assert_eq!(add.operands[4], 0x0201);
 
         let ret = decode_raw_instruction(&bytes, 7).expect("ret decodes at 7");
         assert_eq!(ret.opcode_id, RET);
@@ -1446,8 +1815,10 @@ mod tests {
                     OperandValue::VirtualRegister(-1),
                     OperandValue::VirtualRegister(-2),
                     OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
-                    OperandValue::ProfileIndex(7),
-                    OperandValue::OperandTypes(0x12),
+                    OperandValue::UnsignedImmediate(7),
+                    // bits() 0x0201 narrow-packs to the byte 0x12
+                    // (`Fits.h:325-338`), matching the hand fixture.
+                    OperandValue::OperandTypes(0x0201),
                 ],
             ),
             1
@@ -1459,7 +1830,7 @@ mod tests {
                     OperandValue::VirtualRegister(-1),
                     OperandValue::VirtualRegister(-2),
                     OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
-                    OperandValue::ProfileIndex(5000),
+                    OperandValue::UnsignedImmediate(5000),
                     OperandValue::OperandTypes(0x0102),
                 ],
             ),
@@ -1472,7 +1843,7 @@ mod tests {
                     OperandValue::VirtualRegister(-1),
                     OperandValue::VirtualRegister(-2),
                     OperandValue::VirtualRegister(FIRST_CONSTANT_REGISTER_INDEX),
-                    OperandValue::ProfileIndex(100_000),
+                    OperandValue::UnsignedImmediate(100_000),
                     OperandValue::OperandTypes(0x0102),
                 ],
             ),
@@ -1565,5 +1936,308 @@ mod tests {
             read_unsigned_le(wide32.bytes(), 6, OpcodeSize::Wide32.operand_bytes()),
             FIRST_CONSTANT_REGISTER_INDEX as u32 as u64
         );
+    }
+
+    /// Encode->decode one operand at a fixed width — the
+    /// `Fits<T>::convert(T)` / `Fits<T>::convert(TargetType)` pair.
+    fn round_trip(value: OperandValue, width: OpcodeSize) -> i64 {
+        fits_decode(value.kind(), value.fits_convert(width), width)
+    }
+
+    const ALL_WIDTHS: [OpcodeSize; 3] =
+        [OpcodeSize::Narrow, OpcodeSize::Wide16, OpcodeSize::Wide32];
+
+    /// `unsigned` / `int` immediates hit the exact `Fits<integral>` bounds
+    /// (`Fits.h:66-85`): unsigned saturates the width's unsigned max and
+    /// zero-extends back; int uses the signed two's-complement range and
+    /// sign-extends back.
+    #[test]
+    fn fits_round_trips_unsigned_and_signed_immediates_at_boundaries() {
+        // Max narrow unsigned is 255; 256 widens; 65535 is the wide16 max.
+        assert_eq!(
+            select_width(&[OperandValue::UnsignedImmediate(255)]),
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            round_trip(OperandValue::UnsignedImmediate(255), OpcodeSize::Narrow),
+            255
+        );
+        assert_eq!(
+            select_width(&[OperandValue::UnsignedImmediate(256)]),
+            OpcodeSize::Wide16
+        );
+        assert_eq!(
+            select_width(&[OperandValue::UnsignedImmediate(65_535)]),
+            OpcodeSize::Wide16
+        );
+        assert_eq!(
+            round_trip(OperandValue::UnsignedImmediate(65_535), OpcodeSize::Wide16),
+            65_535
+        );
+        assert_eq!(
+            select_width(&[OperandValue::UnsignedImmediate(65_536)]),
+            OpcodeSize::Wide32
+        );
+        assert_eq!(
+            round_trip(
+                OperandValue::UnsignedImmediate(u32::MAX),
+                OpcodeSize::Wide32
+            ),
+            i64::from(u32::MAX)
+        );
+
+        // `int`: int8 bounds [-128, 127], int16 bounds [-32768, 32767].
+        assert_eq!(
+            select_width(&[OperandValue::SignedImmediate(127)]),
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SignedImmediate(-128)]),
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            round_trip(OperandValue::SignedImmediate(-128), OpcodeSize::Narrow),
+            -128
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SignedImmediate(128)]),
+            OpcodeSize::Wide16
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SignedImmediate(-129)]),
+            OpcodeSize::Wide16
+        );
+        assert_eq!(
+            round_trip(OperandValue::SignedImmediate(-32_768), OpcodeSize::Wide16),
+            -32_768
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SignedImmediate(-32_769)]),
+            OpcodeSize::Wide32
+        );
+        assert_eq!(
+            round_trip(OperandValue::SignedImmediate(i32::MIN), OpcodeSize::Wide32),
+            i64::from(i32::MIN)
+        );
+        // A negative int is stored two's complement and re-extended at EVERY
+        // width, like the BoundLabel backward-jump delta.
+        for width in ALL_WIDTHS {
+            assert_eq!(round_trip(OperandValue::SignedImmediate(-7), width), -7);
+            assert_eq!(round_trip(OperandValue::BoundLabel(-7), width), -7);
+        }
+    }
+
+    /// Every uint8-backed stream type always passes the narrow `Fits` check
+    /// (same-size `bit_cast` at Narrow, `Fits.h:52-64`; uint8->uint16/32
+    /// upcast when wide, `Fits.h:66-85`) and round-trips zero-extended:
+    /// bool (`Fits.h:87-103`), ECMAMode (`Fits.h:381-399`, value 0 = strict),
+    /// IndexingType (`IndexingType.h:63`), PrivateFieldPutKind
+    /// (`Fits.h:401-419`), ErrorTypeWithExtension (`ErrorType.h:59`),
+    /// ResultType (`Fits.h:287-298`), JSType (`JSType.h:164`), and the 2-bit
+    /// PutByIdFlags pack (`Fits.h:234-267`, check always true).
+    #[test]
+    fn bool_and_u8_backed_kinds_always_fit_narrow_and_round_trip() {
+        let values = [
+            OperandValue::Bool(true),
+            OperandValue::Bool(false),
+            OperandValue::ECMAMode(0),
+            OperandValue::ECMAMode(1),
+            OperandValue::IndexingType(255), // max narrow unsigned boundary
+            OperandValue::PrivateFieldPutKind(2), // Define
+            OperandValue::ErrorTypeWithExtension(3),
+            OperandValue::ResultType(0x7e), // unknownType bits
+            OperandValue::JSType(255),
+            OperandValue::PutByIdFlags(0b11), // strict | direct
+        ];
+        for value in values {
+            assert_eq!(select_width(&[value]), OpcodeSize::Narrow, "{value:?}");
+            for width in ALL_WIDTHS {
+                assert_eq!(
+                    round_trip(value, width),
+                    value.as_i64(),
+                    "{value:?} at {width:?}"
+                );
+            }
+        }
+        // bool stores 0/1 exactly (`Fits.h:92-97` casts through uint8_t).
+        assert_eq!(OperandValue::Bool(true).fits_convert(OpcodeSize::Narrow), 1);
+        assert_eq!(
+            OperandValue::Bool(false).fits_convert(OpcodeSize::Narrow),
+            0
+        );
+    }
+
+    /// The u32-backed unsigned kinds — SymbolTableOrScopeDepth raw()
+    /// (`Fits.h:158-176`), ResolveType (`GetPutInfo.h:59` `: unsigned`), and
+    /// the unscoped unsigned-underlying enums ProfileTypeBytecodeFlag /
+    /// DebugHookType (`Fits.h:269-285`) — range-check and zero-extend like
+    /// plain `unsigned`.
+    #[test]
+    fn u32_backed_unsigned_kinds_zero_extend_and_widen() {
+        assert_eq!(
+            select_width(&[OperandValue::ResolveType(13)]), // Dynamic
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            select_width(&[OperandValue::DebugHookType(8)]), // DidAwait
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            select_width(&[OperandValue::ProfileTypeBytecodeFlag(4)]),
+            OpcodeSize::Narrow
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SymbolTableOrScopeDepth(300)]),
+            OpcodeSize::Wide16
+        );
+        assert_eq!(
+            select_width(&[OperandValue::SymbolTableOrScopeDepth(70_000)]),
+            OpcodeSize::Wide32
+        );
+        // Unsigned decode NEVER sign-extends: 0xffff at wide16 is 65535.
+        assert_eq!(
+            round_trip(
+                OperandValue::SymbolTableOrScopeDepth(0xffff),
+                OpcodeSize::Wide16
+            ),
+            0xffff
+        );
+        for value in [
+            OperandValue::ResolveType(13),
+            OperandValue::DebugHookType(8),
+            OperandValue::ProfileTypeBytecodeFlag(4),
+            OperandValue::SymbolTableOrScopeDepth(70_000),
+        ] {
+            assert_eq!(
+                round_trip(value, OpcodeSize::Wide32),
+                value.as_i64(),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// `Fits<GetPutInfo>` (`Fits.h:178-232`): narrow/wide16 store the
+    /// COMPRESSED byte `isStrict<<7 | resolveType<<3 | initMode<<1 |
+    /// resolveMode`; wide32 is the same-size `bit_cast` of the raw
+    /// `m_operand` (`GetPutInfo.h:222-257`). Decode rebuilds the m_operand
+    /// the `GetPutInfo(...)` constructor produces (`GetPutInfo.h:238-240`).
+    #[test]
+    fn get_put_info_fits_matches_cpp_compressed_and_raw_encodings() {
+        // (resolveMode=DoNotThrowIfNotFound(1), resolveType=Dynamic(13),
+        // initializationMode=NotInitialization(2), strict).
+        let operand: u32 = (1 << 30) | (1 << 20) | (2 << 10) | 13;
+        let compressed: u64 = (1 << 7) | (13 << 3) | (2 << 1) | 1;
+        let value = OperandValue::GetPutInfo(operand);
+        assert_eq!(select_width(&[value]), OpcodeSize::Narrow);
+        assert_eq!(value.fits_convert(OpcodeSize::Narrow), compressed);
+        assert_eq!(value.fits_convert(OpcodeSize::Wide16), compressed);
+        assert_eq!(value.fits_convert(OpcodeSize::Wide32), u64::from(operand));
+        for width in ALL_WIDTHS {
+            assert_eq!(round_trip(value, width), i64::from(operand), "{width:?}");
+        }
+        // A resolveType overflowing the 4-bit compressed field fails the
+        // narrow/wide16 check (`Fits.h:206-212`) and rides wide32 raw.
+        let overflow = OperandValue::GetPutInfo(16);
+        assert!(!overflow.fits_check(OpcodeSize::Narrow));
+        assert!(!overflow.fits_check(OpcodeSize::Wide16));
+        assert_eq!(select_width(&[overflow]), OpcodeSize::Wide32);
+    }
+
+    /// `Fits<OperandTypes>` (`Fits.h:300-353`): narrow packs
+    /// `(first << 4) | second` with unknownType(0x7e) <-> 0 remapped;
+    /// wide16 is the same-size `bit_cast` of the raw `bits()`
+    /// (`Fits.h:52-64`, little-endian {m_first, m_second} so first is the
+    /// LOW byte, `ResultType.h:244-274`); wide32 truncates back to u16 on
+    /// decode (`Fits.h:351`).
+    #[test]
+    fn operand_types_fits_matches_cpp_nibble_packing() {
+        // first = TypeInt32 (0x01), second = TypeMaybeNumber (0x02).
+        let int32_maybe_number = OperandValue::OperandTypes(0x0201);
+        assert_eq!(select_width(&[int32_maybe_number]), OpcodeSize::Narrow);
+        assert_eq!(int32_maybe_number.fits_convert(OpcodeSize::Narrow), 0x12);
+        assert_eq!(
+            fits_decode(OperandKind::OperandTypes, 0x12, OpcodeSize::Narrow),
+            0x0201
+        );
+
+        // The default unknown/unknown pair encodes narrow as 0x00 and comes
+        // back through the 0 -> unknownType remap.
+        let unknown_pair = OperandValue::OperandTypes(0x7e7e);
+        assert_eq!(select_width(&[unknown_pair]), OpcodeSize::Narrow);
+        assert_eq!(unknown_pair.fits_convert(OpcodeSize::Narrow), 0x00);
+        assert_eq!(
+            fits_decode(OperandKind::OperandTypes, 0x00, OpcodeSize::Narrow),
+            0x7e7e
+        );
+
+        // A type neither unknown nor 4-bit (first = TypeMaybeNull |
+        // TypeMaybeBool = 0x30) fails the narrow check and stores raw bits.
+        let wide = OperandValue::OperandTypes(0x0030);
+        assert!(!wide.fits_check(OpcodeSize::Narrow));
+        assert_eq!(select_width(&[wide]), OpcodeSize::Wide16);
+        assert_eq!(wide.fits_convert(OpcodeSize::Wide16), 0x0030);
+        assert_eq!(round_trip(wide, OpcodeSize::Wide16), 0x0030);
+        assert_eq!(round_trip(wide, OpcodeSize::Wide32), 0x0030);
+    }
+
+    /// The m_metadataID slot: a metadata opcode's length is
+    /// `args.length + 1` (`generator/Opcode.rb:372-374`), the extra slot
+    /// being ONE per-width `unsigned` stream field
+    /// (`generator/Metadata.rb:126-131`). Pinned against the generated
+    /// `WebKitBuild/.../Bytecodes.h`: `macro(op_get_by_id, 5)` (id 20, 4
+    /// args + metadata), `macro(op_call, 6)` (id 25, 5 args + metadata),
+    /// `macro(op_jneq_ptr, 4)` (id 48, 3 args + metadata).
+    #[test]
+    fn metadata_slot_lengthens_instruction_per_generated_rule() {
+        // op :get_by_id, args: { dst: VirtualRegister, base: VirtualRegister,
+        // property: unsigned, valueProfile: unsigned }, metadata: { ... }
+        // (`BytecodeList.rb:387-396`). Local descriptor only: the row itself
+        // lands with the generated table.
+        const GET_BY_ID_LIKE: OpcodeDescriptor = OpcodeDescriptor {
+            id: 20,
+            name: "get_by_id",
+            operands: &[
+                OperandKind::VirtualRegister,
+                OperandKind::VirtualRegister,
+                OperandKind::UnsignedImmediate,
+                OperandKind::UnsignedImmediate,
+            ],
+            has_metadata: true,
+            is_wide_prefix: false,
+            core: None,
+        };
+        assert_eq!(GET_BY_ID_LIKE.opcode_length(), 5);
+        // The trailing slot is the metadataID, typed `unsigned`.
+        assert_eq!(
+            GET_BY_ID_LIKE.operand_kind(4),
+            OperandKind::UnsignedImmediate
+        );
+        assert_eq!(GET_BY_ID_LIKE.operand_kind(0), OperandKind::VirtualRegister);
+        // `size()` (`Instruction.h:138-145`) counts the extra slot per width.
+        for (width, expected) in [
+            (OpcodeSize::Narrow, 1 + 5 + 0),
+            (OpcodeSize::Wide16, 1 + 10 + 1),
+            (OpcodeSize::Wide32, 1 + 20 + 1),
+        ] {
+            assert_eq!(
+                OPCODE_ID_BYTES
+                    + GET_BY_ID_LIKE.opcode_length() * width.operand_bytes()
+                    + width.prefix_bytes(),
+                expected
+            );
+        }
+        // Without metadata the same arg shape stays at args.length.
+        let no_metadata = OpcodeDescriptor {
+            has_metadata: false,
+            ..GET_BY_ID_LIKE
+        };
+        assert_eq!(no_metadata.opcode_length(), 4);
+        // No current hand-written row carries metadata: all declared IDs sit
+        // at or above NUMBER_OF_BYTECODE_WITH_METADATA (49, generated
+        // `Bytecodes.h:290`).
+        for descriptor in OPCODE_TABLE {
+            assert!(!descriptor.has_metadata, "op_{}", descriptor.name);
+            assert!(descriptor.id >= 49, "op_{}", descriptor.name);
+        }
     }
 }
