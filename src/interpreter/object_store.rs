@@ -6804,11 +6804,33 @@ impl CoreObjectStore {
     /// preserve (and by tests fabricating a planned transition target). For a
     /// non-PropertyAddition change that MUST preserve surviving offsets, use
     /// `fresh_dictionary_structure` instead.
+    ///
+    /// C++ JSC: `Structure::create(VM&, JSGlobalObject*, JSValue prototype, const
+    /// TypeInfo&, ...)` (Structure.h:216, StructureInlines.h) ALWAYS receives a real
+    /// `TypeInfo` naming the concrete `JSCell::m_type` the structure's instances carry
+    /// — there is no "typeless" structure in JSC. This entry point has no `kind` to
+    /// thread (its only production caller, `fresh_dictionary_structure`'s
+    /// non-live-`old` fallback, has none either — see its own doc), but every
+    /// `Structure` in this port backs a JSObject-shaped cell (leaf cells carry
+    /// `StructureId::INVALID`, never a real structure — see `allocate_cell`'s
+    /// callers). So the faithful default is the `JSType::Object` object-range
+    /// umbrella (runtime/JSType.h:77 `ObjectType`, "the first JSObject type... used
+    /// as the umbrella for object kinds whose faithful per-subclass JSType is not
+    /// yet modeled" — `JsType::Object`'s own doc), NOT `0` (JSC `CellType`, a
+    /// non-object base type nothing in this port ever allocates through a
+    /// Structure). Prior to this fix this was hardcoded `0`, which kept
+    /// `trace_structure`'s `isObject()` gate (Structure.cpp:1420,
+    /// `type >= JSType::Object` / JSTypeInfo.h:88) permanently false for every
+    /// structure minted here, silently dropping the `m_prototype` cell edge — a
+    /// live UAF for any object whose custom prototype is reachable ONLY through
+    /// its Structure (the `Object.create(proto)` class; see
+    /// `docs/STATUS.md`/commit history for the structures-as-cells Step 3 trace
+    /// wiring this closes).
     pub(crate) fn allocate_structure_id(&mut self) -> StructureId {
         self.structure_table.create_root(
             PrototypePointer::null(),
             NON_ARRAY,
-            0,
+            JsType::Object as u8,
             0,
             INLINE_CAPACITY as u8,
         )
@@ -7140,6 +7162,22 @@ impl CoreObjectStore {
     /// interpreter reconstructs that shared root via structure_seed_roots (the
     /// create_root analog) so sibling objects begin from ONE structure id and their
     /// first add-property transition converges (cross-instance IC hits depend on this).
+    ///
+    /// THE PRODUCTION CHOKEPOINT for structure `ty`: this is the ONE call site every
+    /// fresh object's Structure is seeded from (`allocate_cell`'s `structure_id ==
+    /// INVALID` arm). C++ `Structure::create` always receives the concrete instance's
+    /// `TypeInfo`/`JSType` (Structure.h:216; e.g. `JSFinalObject::typeInfo()` ->
+    /// `TypeInfo(FinalObjectType, ...)`, JSObject.h:1221) — never a placeholder. `kind`
+    /// is already the SAME per-kind classifier `allocate_cell` uses to stamp the
+    /// instance's own `JSCell::m_type` (`cell.js_type = cell.kind.js_type()`,
+    /// object_store.rs `allocate_cell`), so threading `kind.js_type()` here keeps the
+    /// structure's `ty` in agreement with its instances' own header tag, exactly as
+    /// C++ requires (a Structure and the JSCells it types share one JSType). Prior to
+    /// this fix this was hardcoded `0` (JSC `CellType`, never `>= JSType::Object`),
+    /// which kept `trace_structure`'s `isObject()` gate (Structure.cpp:1420,
+    /// JSTypeInfo.h:88 `type >= ObjectType`) dead for every production structure —
+    /// silently dropping the `m_prototype` cell edge and UAF-ing any object's custom
+    /// prototype reachable ONLY through its Structure (`Object.create(proto)`).
     pub(crate) fn seed_structure_id(
         &mut self,
         kind: CoreObjectKind,
@@ -7153,7 +7191,7 @@ impl CoreObjectStore {
         let id = self.structure_table.create_root(
             prototype_pointer,
             NON_ARRAY,
-            0,
+            kind.js_type() as u8,
             0,
             INLINE_CAPACITY as u8,
         );
@@ -15419,13 +15457,16 @@ mod structures_as_cells_step3_tests {
     // structure). The prototype object is reachable from NO root except
     // through the structure's own `m_prototype` edge.
     //
-    // Production `create_root`/`seed_structure_id` callers pass `ty == 0`
-    // today (a PRE-EXISTING gap this unit does not fix — the port does not
-    // yet wire a faithful per-kind `JSType` into structure creation; see the
-    // returned report's finding). This test constructs the structure
-    // directly with a real object `JSType`, exactly as `structure_cell.rs`'s
-    // own leaf unit tests do (`FINAL_OBJECT_TYPE`), to exercise the TRUE
-    // positive path `trace_structure`'s `isObject()` gate implements.
+    // Historical note: production `create_root`/`seed_structure_id` callers
+    // hardcoded `ty == 0` until the ty-threading fix (`seed_structure_id` /
+    // `allocate_structure_id` now pass `kind.js_type()` / `JsType::Object`;
+    // see their doc comments and the
+    // `structures_as_cells_step3_ty_threading_tests` module below for the
+    // end-to-end force_collect proof). This test still constructs the
+    // structure directly with an explicit object `JsType`, exactly as
+    // `structure_cell.rs`'s own leaf unit tests do (`FINAL_OBJECT_TYPE`), to
+    // exercise ONLY `trace_structure`'s mark-phase `isObject()` gate in
+    // isolation, independent of which production call site seeds the ty.
     #[test]
     fn structure_marks_its_prototype_object_across_spaces() {
         let mut store = CoreObjectStore::default();
@@ -15548,6 +15589,281 @@ mod structures_as_cells_step3_tests {
              must not yet drop an unpinned table (see `trace_structure`'s doc \
              comment for why: it requires a mutable mark-phase pass this unit \
              does not introduce)"
+        );
+    }
+}
+
+// Structures-as-cells Step 3 follow-up — THE ty-THREADING FIX: every production
+// structure-creation site (`allocate_structure_id` / `seed_structure_id`)
+// hardcoded `ty == 0` (JSC `CellType`, never `>= JSType::Object`), which kept
+// `trace_structure`'s `isObject()` gate (Structure.cpp:1420, JSTypeInfo.h:88
+// `type >= ObjectType`) permanently DEAD for every structure this port ever
+// creates in production. C++ JSC never has an untyped Structure —
+// `Structure::create(VM&, JSGlobalObject*, JSValue, const TypeInfo&, ...)`
+// (Structure.h:216) always receives the concrete instance's `TypeInfo`
+// (e.g. `JSFinalObject::typeInfo()` -> `TypeInfo(FinalObjectType, ...)`,
+// JSObject.h:1221). `seed_structure_id`/`allocate_structure_id` now thread
+// `kind.js_type()` / the `JsType::Object` umbrella — see their doc comments.
+//
+// CONSUMER AUDIT (why this cannot regress shape/IC logic that assumed `ty==0`):
+// the ONLY non-test reader of `Structure::type_info_blob().ty()` in this port is
+// `trace_structure`'s `isObject()` check above; no property/transition/IC path
+// branches on it. `structure_cell.rs`'s own leaf tests already exercised a real
+// `FINAL_OBJECT_TYPE`, and `structures_as_cells_step3_tests::
+// structure_marks_its_prototype_object_across_spaces` already hand-built a
+// real-`ty` structure to probe the mark-only edge in isolation — this module
+// closes the gap end-to-end (a real `force_collect` with sweep) through the
+// PRODUCTION call sites, plus the transition/dictionary ty-inheritance proof.
+//
+// DIVERGENCE NOTE surfaced by this unit (NOT fixed here — out of this bounded
+// unit's scope, flagged for the orchestrator): `CoreObjectCell` carries its OWN
+// `prototype: Option<RuntimeValue>` field, independently traced by `trace_cell`
+// (this file, the `inline_optional` array). C++ `JSObject` has NO own prototype
+// field — `JSObject::getPrototypeDirect` reads ONLY `structure()->
+// storedPrototype()`. This port's redundant `cell.prototype` mirror means that
+// for every object allocated through `allocate_with_prototype`/`allocate_cell`
+// (i.e. every "Object.create(proto)"-shaped live object), the prototype is
+// ALREADY independently rooted by `cell.prototype`'s own edge, which MASKS this
+// ty-threading bug for that common case (verified empirically: reverting the
+// fix and running a naive `allocate_with_prototype` + `force_collect` probe
+// still kept the prototype alive, via `cell.prototype`, not `trace_structure`).
+// The tests below therefore isolate `trace_structure`'s OWN edge by clearing
+// `cell.prototype` after allocation (or bypassing it entirely, hand-building the
+// structure) — simulating the FAITHFUL C++ model where the object has no prototype
+// field of its own — so they prove what `trace_structure`'s edge itself
+// contributes, not what the redundant cache already covers. The `cell.prototype`
+// vs `Structure::m_prototype` duplication is itself a divergence worth a future
+// dedicated correction (unifying reads onto the Structure, as C++ does), but
+// removing it is a cross-cutting change (touches every prototype-chain read
+// site) out of scope here.
+#[cfg(test)]
+mod structures_as_cells_step3_ty_threading_tests {
+    use super::*;
+
+    fn addr(v: RuntimeValue) -> usize {
+        v.as_cell().unwrap().pointer_payload_bits()
+    }
+
+    /// Per-site ty assignment proof: `allocate_structure_id` (no `kind` to
+    /// thread — see its doc) still mints an object-shaped ty; `seed_structure_id`
+    /// threads the SAME per-kind classifier `allocate_cell` stamps onto the
+    /// instance's own `JSCell::m_type` header (`cell.js_type = cell.kind.js_type()`).
+    #[test]
+    fn allocate_structure_id_and_seed_structure_id_thread_object_shaped_ty() {
+        let mut store = CoreObjectStore::default();
+        let _bootstrap = store.allocate(); // bootstraps the meta-structure + Object.prototype
+
+        let generic_sid = store.allocate_structure_id();
+        assert!(
+            store
+                .structure_table
+                .structure(generic_sid)
+                .type_info_blob()
+                .ty()
+                >= JsType::Object as u8,
+            "allocate_structure_id must mint an object-shaped ty (>= JsType::Object), \
+             not the pre-fix ty==0 (JSC CellType) that kept trace_structure's \
+             isObject() gate dead"
+        );
+
+        let p1 = store.allocate();
+        let ordinary_sid = store.seed_structure_id(CoreObjectKind::Ordinary, Some(p1));
+        assert_eq!(
+            store
+                .structure_table
+                .structure(ordinary_sid)
+                .type_info_blob()
+                .ty(),
+            JsType::FinalObject as u8,
+            "an ordinary {{}} object's seeded root Structure must carry JSC \
+             FinalObjectType (runtime/JSType.h:78; JSObject.h:1221 \
+             JSFinalObject::typeInfo()), matching the instance's own header tag \
+             (CoreObjectKind::Ordinary -> JsType::FinalObject)"
+        );
+
+        let p2 = store.allocate();
+        let array_sid = store.seed_structure_id(CoreObjectKind::Array, Some(p2));
+        let array_ty = store
+            .structure_table
+            .structure(array_sid)
+            .type_info_blob()
+            .ty();
+        assert_eq!(
+            array_ty,
+            CoreObjectKind::Array.js_type() as u8,
+            "a non-ordinary object kind's seeded root Structure must carry that \
+             SAME kind's js_type() (the Object-range umbrella today; per-subclass \
+             JSType refinement is a separate, already-flagged divergence)"
+        );
+        assert!(array_ty >= JsType::Object as u8);
+    }
+
+    /// Transition-inheritance proof (item 2 of this unit): a `PropertyAddition`
+    /// transition child, and the conservative fresh-dictionary fallback, must both
+    /// PRESERVE the base structure's `ty` — never fall back to a placeholder.
+    /// C++ `Structure(VM&, StructureVariant, Structure* previous)` (Structure.cpp:
+    /// 329-383) copies `m_blob = TypeInfoBlob(previous->
+    /// indexingModeIncludingHistory(), typeInfo)` (:362-363) — the WHOLE blob,
+    /// `ty` included — from the parent; this port's `Structure::new_transition`
+    /// mirrors that via a whole-`blob` field copy (`structure_cell.rs`).
+    #[test]
+    fn property_transitions_and_dictionary_structures_preserve_the_parents_ty() {
+        let mut store = CoreObjectStore::default();
+        let _bootstrap = store.allocate();
+
+        // Seed through a NON-default kind (Array -> the Object umbrella, NOT
+        // FinalObject) so this proof cannot be mistaken for both sides merely
+        // defaulting to the same value.
+        let proto = store.allocate();
+        let root = store.seed_structure_id(CoreObjectKind::Array, Some(proto));
+        let root_ty = store.structure_table.structure(root).type_info_blob().ty();
+        assert_eq!(root_ty, JsType::Object as u8, "test setup sanity");
+
+        let uid = store.intern_property_uid(&CorePropertyKey::Identifier(1));
+        let (child, _offset) = store.structure_table.add_property_transition(root, uid, 0);
+        assert_eq!(
+            store.structure_table.structure(child).type_info_blob().ty(),
+            root_ty,
+            "add_property_transition's PropertyAddition child must preserve the \
+             parent's ty"
+        );
+
+        let dict = store.fresh_dictionary_structure(root, None);
+        assert_eq!(
+            store.structure_table.structure(dict).type_info_blob().ty(),
+            root_ty,
+            "fresh_dictionary_structure's per-object dictionary (the non-\
+             PropertyAddition conservative path: delete / data<->accessor /\
+             attribute change) must also preserve the base's ty"
+        );
+    }
+
+    /// THE LOAD-BEARING UAF TEST (item 3 of this unit), POSITIVE half: an object
+    /// created with a custom prototype where the prototype cell's ONLY reference
+    /// is the (production-seeded) Structure's `m_prototype` — `force_collect` —
+    /// the prototype survives and reads back intact. Also the negative control:
+    /// an unreferenced non-prototype object in the SAME cycle is still swept.
+    ///
+    /// `cell.prototype` is cleared after allocation to isolate `trace_structure`'s
+    /// own edge from the port's redundant cell-level mirror (see this module's
+    /// header comment's DIVERGENCE NOTE) — i.e. this simulates the faithful C++
+    /// model where `JSObject` has no prototype field of its own, only the
+    /// Structure does.
+    #[test]
+    fn custom_prototype_reachable_only_via_structure_survives_force_collect_and_reads_back_intact()
+    {
+        let mut store = CoreObjectStore::default();
+        let _bootstrap = store.allocate();
+
+        // A CUSTOM prototype — not one of `gather_intrinsic_roots`' canonical
+        // prototypes — carrying a property, to prove a REAL cell survives (not
+        // just a raw address staying resident by chance).
+        let proto = store.allocate();
+        let tag = CorePropertyKey::String("tag".into());
+        store
+            .set_data_own(proto, &tag, RuntimeValue::from_i32(7))
+            .unwrap();
+
+        // Route through the PRODUCTION chokepoint: `allocate_cell`'s
+        // `structure_id == INVALID` arm -> `seed_structure_id(kind, prototype)`
+        // (this unit's fix site), which stores `proto` as the seeded Structure's
+        // `m_prototype`.
+        let obj = store.allocate_with_prototype(Some(proto));
+        store
+            .with_cell_mut(obj, |cell| cell.prototype = None)
+            .expect("obj is a live arena object cell");
+
+        // Negative control: an object referenced by nothing and not anyone's
+        // prototype, collected in the SAME cycle.
+        let decoy = store.allocate();
+
+        let obj_addr = addr(obj);
+        let stats = store.force_collect(&[obj_addr]);
+
+        assert!(
+            store.find(obj).is_some(),
+            "sanity: the directly-rooted object survives"
+        );
+        assert!(
+            store.find(proto).is_some() && store.is_value_marked(proto),
+            "THE LOAD-BEARING UAF FIX: `proto` is reachable from NO root except the \
+             live object's own PRODUCTION-seeded Structure's `m_prototype` edge — it \
+             must survive, proving `seed_structure_id` now threads an object-shaped \
+             `ty` (>= JsType::Object) so `trace_structure`'s `isObject()` gate \
+             (Structure.cpp:1420-1423) fires for a real production structure"
+        );
+        assert!(
+            store.find(decoy).is_none(),
+            "negative control: an unreferenced non-prototype object in the SAME \
+             cycle is still swept"
+        );
+        assert!(
+            stats.cells_reclaimed >= 1,
+            "the decoy was actually reclaimed"
+        );
+
+        // Reads back intact: the property set on `proto` BEFORE collection is
+        // still correct after collection (not a UAF read of freed/reused memory).
+        match store
+            .get_own_property(proto, &tag)
+            .expect("proto is a live object cell")
+            .expect("own property present")
+            .kind
+        {
+            CorePropertyKind::Data(v) => assert_eq!(v, RuntimeValue::from_i32(7)),
+            other => panic!("expected a data property, got {other:?}"),
+        }
+    }
+
+    /// THE LOAD-BEARING UAF TEST, NEGATIVE half (the "fails without the fix"
+    /// proof the unit contract requires): the EXACT same harness as the test
+    /// above, but with the Structure hand-built the PRE-FIX way (`ty == 0`)
+    /// instead of routed through the (now-fixed) `seed_structure_id`. This proves
+    /// the mechanism — not merely that the fixed code happens to pass — by
+    /// reproducing the pre-fix failure on demand.
+    #[test]
+    fn pre_fix_ty_zero_structure_drops_the_prototype_edge_and_uaf_sweeps_it() {
+        let mut store = CoreObjectStore::default();
+        let _bootstrap = store.allocate();
+
+        let proto = store.allocate();
+        let proto_pointer = store.prototype_pointer(Some(proto));
+
+        // Mint the structure the PRE-FIX way: ty == 0 (JSC CellType, never
+        // `>= JSType::Object`) — exactly what `seed_structure_id`/
+        // `allocate_structure_id` hardcoded before this batch threaded
+        // `kind.js_type()` / `JsType::Object`.
+        let bad_structure = store.structure_table.create_root(
+            proto_pointer,
+            NON_ARRAY,
+            0,
+            0,
+            INLINE_CAPACITY as u8,
+        );
+
+        let obj = store.allocate();
+        store
+            .with_cell_mut(obj, |cell| {
+                cell.structure_id = bad_structure;
+                cell.prototype = None; // identical isolation to the positive test
+            })
+            .expect("obj is a live arena object cell");
+
+        let obj_addr = addr(obj);
+        store.force_collect(&[obj_addr]);
+
+        assert!(
+            store.find(obj).is_some(),
+            "sanity: obj itself is directly rooted and survives"
+        );
+        assert!(
+            store.find(proto).is_none(),
+            "PRE-FIX PROOF: with a non-object ty (0, JSC CellType), \
+             trace_structure's isObject() gate never fires, so the Structure's own \
+             m_prototype edge is never traced — `proto` is silently reclaimed while \
+             `obj` is still alive and its Structure still names it. This is the LIVE \
+             UAF class this unit's fix (seed_structure_id/allocate_structure_id \
+             threading a real per-kind/object-shaped ty) closes."
         );
     }
 }
