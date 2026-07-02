@@ -18803,12 +18803,57 @@ impl Vm {
             return None;
         }
         let access_case_ref = reserved_structure_stub_access_case_ref(transaction)?;
-        if self.tiering.structure_stub_access_case_link_attempt_exists(
-            &candidate,
-            transaction.ordinal,
-            access_case_ref,
-        ) {
+
+        // C++ JSC never re-invokes `considerRepatchingCacheImpl` for a site
+        // whose generated fast path already hits: only the SLOW PATH (a
+        // structure mismatch) re-enters it (`Repatch.cpp`'s
+        // `tryCacheGetBy`-style functions run from `operationGetByIdOptimize`
+        // et al., never from the fast-path hit). This safepoint scan is
+        // called on every dispatch of the owning `CodeBlock` regardless of
+        // hit/miss (see the call-link precedent's comment above this
+        // function's caller, `reserve_descriptor_only_structure_stub_repatch_
+        // transactions_at_safepoint`'s caller), so once this exact access
+        // case is already resident the candidate is a repeat "still hitting"
+        // observation, not a new miss -- skip it before touching any
+        // cooldown/buffering state, matching the C++ fast-path/slow-path
+        // split.
+        if candidate
+            .structure_stub_info
+            .access_cases
+            .contains(&access_case_ref)
+        {
             return None;
+        }
+
+        // R2 of docs/design/ic-resident-provenance.md ("§B. Property-IC
+        // attachment cluster"): the resident cooldown/buffering gate --
+        // faithful port of `PropertyInlineCache::considerRepatchingCacheImpl`
+        // (`PropertyInlineCache.h:248-342`) -- replaces the log-based
+        // `structure_stub_access_case_link_attempt_exists` rejection memo
+        // that used to gate this call. That memo answered "did we already
+        // ATTEMPT this exact candidate/transaction/access-case combo, even
+        // if rejected" by scanning `structure_stub_access_case_links`
+        // forever; C++ has no such memo (`PolymorphicAccess::addCases`
+        // dedups only against the CURRENTLY buffered/installed list, never a
+        // history of past rejections -- see the design doc's "crux
+        // finding"). The faithful replacement is `consider_repatching`:
+        // a permanently-failing candidate is naturally throttled by the
+        // escalating cooldown (`countdown`/`repatch_count`/
+        // `number_of_cool_downs`), not blocked by a memo, so it is
+        // reconsidered again once the cooldown/buffering windows allow it,
+        // exactly like C++.
+        let structure_stub_key = match candidate.key {
+            CacheKey::Property(key) => Some(key),
+            CacheKey::Dynamic => None,
+        };
+        match self.code_blocks.consider_repatching_structure_stub(
+            candidate.owner,
+            candidate.structure_stub_index,
+            Some(candidate.base_structure),
+            structure_stub_key,
+        ) {
+            Some(true) => {}
+            Some(false) | None => return None,
         }
 
         let link_request = structure_stub_access_case_link_request(&candidate, access_case_ref)?;
@@ -30269,6 +30314,14 @@ mod tests {
             owner,
             &code_block,
         );
+        // R2 of docs/design/ic-resident-provenance.md: `StructureStubInfo::
+        // countdown` starts at 1 (C++ "we'll patch it after the first
+        // execution"), so the first pass only reserves the transaction and
+        // counts the cooldown down; the link is attached on the second pass.
+        vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            owner,
+            &code_block,
+        );
         let transaction = vm
             .tiering_integration()
             .structure_stub_repatch_transactions()
@@ -30490,6 +30543,19 @@ mod tests {
             owner,
             &code_block,
         );
+        // R2 of docs/design/ic-resident-provenance.md: `StructureStubInfo::
+        // countdown` starts at 1 (C++ `PropertyInlineCache::countdown { 1 }`,
+        // "we'll patch it after the first execution"), so the FIRST safepoint
+        // pass only counts the cooldown down to 0 -- `record_structure_stub_
+        // repatch_transaction` still reserves a transaction every pass
+        // (unconditional, unaffected by the gate), but the LINK step now
+        // consults `consider_repatching` and does not attach on this first
+        // pass. The SECOND pass is where `countdown == 0` and the site is
+        // actually considered, exactly like C++.
+        vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            owner,
+            &code_block,
+        );
 
         let transactions = vm
             .tiering_integration()
@@ -30577,6 +30643,17 @@ mod tests {
             VmPropertyInlineCacheAttachmentOutcome::Accepted { .. }
         ));
 
+        vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            owner,
+            &code_block,
+        );
+        // R2 of docs/design/ic-resident-provenance.md: `countdown` starts at
+        // 1 (C++ "we'll patch it after the first execution"), so the FIRST
+        // pass only reserves the transaction (unconditional every pass) and
+        // counts the cooldown down to 0; the LINK is not attached until the
+        // SECOND pass, once `consider_repatching` actually runs. This extra
+        // pass establishes the "first" link baseline the idempotency check
+        // below then re-confirms across repeated passes.
         vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
             owner,
             &code_block,
@@ -30671,6 +30748,19 @@ mod tests {
             Some(crate::bytecode::ic::PropertyOffset(99));
         *registered = registered.clone().with_side_tables(side_tables);
 
+        // R2 of docs/design/ic-resident-provenance.md: `StructureStubInfo::
+        // countdown` starts at 1 (C++ "we'll patch it after the first
+        // execution"), so the FIRST attempt at a fresh site is always
+        // throttled by `consider_repatching` before it even reaches the
+        // link/validation logic below -- `None`, not a rejected-outcome
+        // record.
+        assert!(vm
+            .link_reserved_structure_stub_access_case_for_candidate(candidate.clone(), &transaction)
+            .is_none());
+
+        // Second attempt: `countdown == 0`, `consider_repatching` returns
+        // `true` (fresh structure, still buffering) and the link attempt
+        // actually runs, hitting the offset mismatch installed above.
         let link = vm
             .link_reserved_structure_stub_access_case_for_candidate(candidate.clone(), &transaction)
             .expect("rejected access-case link record");
@@ -30701,6 +30791,20 @@ mod tests {
             .structure_stubs[0]
             .access_cases
             .is_empty());
+
+        // Third attempt, same candidate/structure: NOT re-attempted, but for
+        // the faithful reason (design doc "the crux finding") -- C++ has no
+        // permanent rejection memo. `consider_repatching`'s bounded
+        // `buffered_structures` dedup already recorded this structure as
+        // considered THIS cycle in the previous call (a rejected attempt
+        // still consumes the dedup slot -- the dedup runs before the outcome
+        // is known, exactly like C++: `isNewlyAdded` gates generation
+        // regardless of whether generation later succeeds), so it returns
+        // `false` and the gate short-circuits before ever reaching the link/
+        // validation logic again. This is bounded, cycle-scoped throttling,
+        // not a permanent memo: a later regeneration or cool-down escalation
+        // (see `consider_repatching`'s unit tests in `bytecode/ic.rs`) makes
+        // the site eligible again.
         assert!(vm
             .link_reserved_structure_stub_access_case_for_candidate(candidate, &transaction)
             .is_none());
@@ -30729,6 +30833,13 @@ mod tests {
             VmPropertyInlineCacheAttachmentOutcome::Accepted { .. }
         ));
 
+        vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            owner,
+            &code_block,
+        );
+        // R2 of docs/design/ic-resident-provenance.md: `countdown` starts at
+        // 1, so the first pass only reserves the transaction and counts the
+        // cooldown down; the link is attached on the second pass.
         vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
             owner,
             &code_block,
@@ -30921,6 +31032,13 @@ mod tests {
             structure_attachment.outcome,
             VmPropertyInlineCacheAttachmentOutcome::Accepted { .. }
         ));
+        vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
+            structure_owner,
+            &structure_code_block,
+        );
+        // R2 of docs/design/ic-resident-provenance.md: `countdown` starts at
+        // 1, so the first pass only reserves the transaction and counts the
+        // cooldown down; the link is attached on the second pass.
         vm.reserve_descriptor_only_structure_stub_repatch_transactions_at_safepoint(
             structure_owner,
             &structure_code_block,

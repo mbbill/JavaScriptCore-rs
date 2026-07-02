@@ -19,10 +19,11 @@ use crate::bytecode::{
     ExecutableEntrypoints, JitCodeSlot, ValueProfileBucketKind, ValueProfileBucketSample,
     ValueProfileJitStoreTarget, ValueProfileSampleError, VirtualRegister,
 };
-use crate::gc::{CellDestructionState, CellType, Heap, HeapAllocationRecord};
+use crate::gc::{CellDestructionState, CellType, Heap, HeapAllocationRecord, StructureId};
 use crate::jit::plan::BaselineBytecodeSnapshotFingerprint;
 use crate::jit::{CacheKey, InlineCacheSlotId};
 use crate::runtime::CodeBlockId;
+use crate::strings::PropertyKey;
 use crate::value::JsValue;
 use crate::vm::tiering::{
     VmAttachedPropertyInlineCacheCandidate, VmCallLinkInlineCacheAttachmentLifecycle,
@@ -676,6 +677,30 @@ impl CodeBlockRegistry {
             }
             Err(error) => CodeBlockRegistryStructureStubAccessCaseLink::Rejected(error),
         }
+    }
+
+    /// R2 attach-pipeline gate (`docs/design/ic-resident-provenance.md`):
+    /// registry-level reach-through to `CodeBlock::consider_repatching_
+    /// structure_stub`, mirroring `link_structure_stub_access_case` above.
+    /// Returns `None` when the owner isn't registered or the structure-stub
+    /// index is out of range (mirrors that method's own `Option`).
+    ///
+    /// Unlike `link_structure_stub_access_case`, this does NOT bump
+    /// `revision`: it only mutates `countdown`/`repatch_count`/
+    /// `number_of_cool_downs`/`buffering_countdown`/`buffered_structures`/
+    /// `ever_considered`, none of which any projected plan/sidecar table
+    /// reads (those key off `access_cases`, which this call never touches).
+    pub(crate) fn consider_repatching_structure_stub(
+        &mut self,
+        owner: CodeBlockId,
+        structure_stub_index: usize,
+        structure: Option<StructureId>,
+        key: Option<PropertyKey>,
+    ) -> Option<bool> {
+        let record = self.records.get(&owner)?;
+        record
+            .code_block
+            .consider_repatching_structure_stub(structure_stub_index, structure, key)
     }
 
     #[allow(dead_code)]

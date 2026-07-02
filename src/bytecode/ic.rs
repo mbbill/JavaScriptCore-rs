@@ -931,15 +931,18 @@ pub struct PropertyOffset(pub i32);
 /// Patchable structure stub metadata used by property inline caches.
 ///
 /// R0 of `docs/design/ic-resident-provenance.md` ("§B. Property-IC
-/// attachment cluster") adds the `countdown`/`repatch_count`/
+/// attachment cluster") added the `countdown`/`repatch_count`/
 /// `number_of_cool_downs`/`buffering_countdown`/`buffered_structures`/
 /// `ever_considered`/`took_slow_path` fields below, field-for-field from C++
 /// `PropertyInlineCache` (`bytecode/PropertyInlineCache.h:463-478`, read in
 /// full). They are the resident "should we even try to repatch" gate that
 /// C++'s `considerRepatchingCacheImpl` (`PropertyInlineCache.h:248-342`)
-/// reads/mutates in place; this unit only ADDS the fields (unwired,
-/// `#[allow(dead_code)]`) so Unit R2 can port `consider_repatching`'s exact
-/// arithmetic against them. Zero behavior change in this commit.
+/// reads/mutates in place. R2 wires them: `consider_repatching`/
+/// `clear_buffered_structures` below port that method's exact arithmetic,
+/// and the property-IC attach pipeline (`vm/mod.rs`,
+/// `link_reserved_structure_stub_access_case_for_candidate`) now consults
+/// this gate instead of the log-based `structure_stub_access_case_link_
+/// attempt_exists` rejection memo it replaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureStubInfo {
     pub bytecode_index: BytecodeIndex,
@@ -959,46 +962,41 @@ pub struct StructureStubInfo {
 
     /// C++ `PropertyInlineCache::countdown` (`PropertyInlineCache.h:468`,
     /// init `{ 1 }`): repatch is considered once this hits 0; C++ patches
-    /// after the first execution. Unread until Unit R2 wires
-    /// `consider_repatching`.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// after the first execution. Wired by `consider_repatching` (Unit R2).
     pub countdown: u8,
     /// C++ `repatchCount` (`:469`, init `{ 0 }`): saturating count of
     /// consecutive countdown-expirations, compared against
     /// `Options::repatchCountForCoolDown()` to detect over-frequent
-    /// repatching. Unread until Unit R2.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// repatching. Wired by `consider_repatching` (Unit R2).
     pub repatch_count: u8,
     /// C++ `numberOfCoolDowns` (`:470`, init `{ 0 }`): exponential-backoff
     /// generation counter — each time repatching is throttled, `countdown`
     /// is reseeded via `leftShiftWithSaturation(initialCoolDownCount,
-    /// numberOfCoolDowns++)`. Unread until Unit R2.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// numberOfCoolDowns++)`. Wired by `consider_repatching` (Unit R2).
     pub number_of_cool_downs: u8,
     /// C++ `bufferingCountdown` (`:471`, init
     /// `Options::initialRepatchBufferingCountdown()` — default `6`,
     /// `runtime/OptionsList.h:109`). Decremented once per buffered (but not
     /// yet regenerated) access-case attempt; hitting 0 forces a repatch
-    /// rather than buffering indefinitely. Unread until Unit R2.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// rather than buffering indefinitely. Wired by `consider_repatching`
+    /// (Unit R2).
     pub buffering_countdown: u8,
     /// C++ `m_bufferedStructures` (`:438`, guarded by
     /// `m_bufferedStructuresLock`): a BOUNDED, per-regeneration-cycle dedup
     /// set, NOT a permanent rejection memo — cleared every successful stub
     /// regeneration (`clearBufferedStructures`, `:346-357`). See
     /// docs/design/ic-resident-provenance.md, "the crux finding": JSC does
-    /// not memoize permanently-rejected access-case attempts. Unread until
-    /// Unit R2.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// not memoize permanently-rejected access-case attempts. Wired by
+    /// `consider_repatching`/`clear_buffered_structures` (Unit R2).
     pub buffered_structures: PropertyInlineCacheBufferedStructures,
     /// C++ `everConsidered : 1` (`:477`, init `{ false }`): set once
     /// `considerRepatchingCacheImpl` has been called at all for this site.
-    /// Unread until Unit R2.
-    #[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+    /// Wired by `consider_repatching` (Unit R2).
     pub ever_considered: bool,
     /// C++ `tookSlowPath : 1` (`:478`, init `{ false }`). Unread until Unit
-    /// R2/R3 (property-IC slow-path bookkeeping).
-    #[allow(dead_code)] // wired by Unit R2/R3
+    /// R3 (property-IC slow-path bookkeeping) -- `consider_repatching`
+    /// itself does not read or write it in C++ either.
+    #[allow(dead_code)] // wired by Unit R3
     pub took_slow_path: bool,
 }
 
@@ -1018,23 +1016,27 @@ pub const STRUCTURE_STUB_INITIAL_NUMBER_OF_COOL_DOWNS: u8 = 0;
 pub const STRUCTURE_STUB_INITIAL_BUFFERING_COUNTDOWN: u8 = 6;
 /// C++ `Options::repatchCountForCoolDown()`'s default (`runtime/OptionsList.h:106`:
 /// `v(Unsigned, repatchCountForCoolDown, 8, Normal, nullptr)`), compared
-/// against `repatchCount` by `considerRepatchingCacheImpl` (`:267`). Unread
-/// until Unit R2 (consider_repatching).
-#[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+/// against `repatchCount` by `considerRepatchingCacheImpl` (`:267`). Wired by
+/// `consider_repatching` (Unit R2).
 pub const STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN: u8 = 8;
 /// C++ `Options::initialCoolDownCount()`'s default (`runtime/OptionsList.h:107`:
 /// `v(Unsigned, initialCoolDownCount, 20, Normal, nullptr)`), the base value
 /// left-shifted by `numberOfCoolDowns` to reseed `countdown` (`:274-277`).
-/// Unread until Unit R2 (consider_repatching).
-#[allow(dead_code)] // wired by Unit R2 (consider_repatching)
+/// Wired by `consider_repatching` (Unit R2).
 pub const STRUCTURE_STUB_INITIAL_COOL_DOWN_COUNT: u8 = 20;
 
 /// C++ `PropertyInlineCache::m_bufferedStructures`
 /// (`PropertyInlineCache.h:438`): `Variant<monostate, Vector<StructureID>,
-/// Vector<tuple<StructureID, CacheableIdentifier>>>`. Structure-only when the
-/// site has no identifier component (`m_identifier` is null, `:312-314`);
-/// `(StructureId, PropertyKey)` pairs otherwise. A BOUNDED per-cycle dedup
-/// set — cleared on every regeneration (`clearBufferedStructures`,
+/// Vector<tuple<StructureID, CacheableIdentifier>>>`. Plain `StructureID`s
+/// when the site HAS a fixed identifier (`if (m_identifier)`,
+/// `PropertyInlineCache.h:312-314` — correcting this design doc's inverted
+/// prose in `docs/design/ic-resident-provenance.md` §B, which said the
+/// opposite; the C++ source is authoritative and was re-read to confirm),
+/// since the identifier is then implied by the site itself and only the
+/// structure varies; `(StructureId, PropertyKey)` pairs when the site is
+/// keyless (no fixed identifier) and the identifier must be recorded
+/// alongside each structure. A BOUNDED per-cycle dedup set — cleared on
+/// every regeneration (`clearBufferedStructures`,
 /// `:346-357`) — not a permanent rejection log; see
 /// docs/design/ic-resident-provenance.md §B.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1043,6 +1045,205 @@ pub enum PropertyInlineCacheBufferedStructures {
     Unset,
     Structures(Vec<StructureId>),
     StructuresWithKey(Vec<(StructureId, PropertyKey)>),
+}
+
+/// C++ `WTF::leftShiftWithSaturation` (`wtf/MathExtras.h:577-586`), the
+/// `uint8_t` instantiation `PropertyInlineCache::considerRepatchingCacheImpl`
+/// uses to reseed `countdown` (`PropertyInlineCache.h:274-277`). C++ shifts
+/// `value` after implicit promotion to `int` and treats an overflowing shift
+/// as "didn't recover the original value" (also true when `shiftAmount` is
+/// large enough to itself be UB in C++, which cannot be replicated safely in
+/// Rust); this widens to `u32` first so every shift amount up to 255 is
+/// well-defined and still saturates to `max` exactly when the C++ check
+/// would have.
+fn structure_stub_left_shift_with_saturation(value: u8, shift_amount: u8, max: u8) -> u8 {
+    if shift_amount >= 32 {
+        return max;
+    }
+    let widened = (value as u32) << (shift_amount as u32);
+    if widened > max as u32 {
+        max
+    } else {
+        widened as u8
+    }
+}
+
+impl StructureStubInfo {
+    /// Faithful port of C++
+    /// `PropertyInlineCache::considerRepatchingCacheImpl`
+    /// (`bytecode/PropertyInlineCache.h:248-342`, read in full; confirmed
+    /// against `/Users/bytedance/Dev/WebKit/Source/JavaScriptCore/bytecode/
+    /// PropertyInlineCache.h`). This is the resident "should we even attempt
+    /// to repatch" gate: a per-site cooldown that escalates exponentially
+    /// under repeated repatching, plus a bounded per-cycle dedup buffer so
+    /// the same structure is not buffered twice in one cycle. It does NOT
+    /// memoize permanently-failing candidates — see
+    /// `docs/design/ic-resident-provenance.md`, "the crux finding": a
+    /// candidate that keeps failing for a structural reason (not a cooldown
+    /// reason) is simply reconsidered again once the cooldown/buffering
+    /// windows allow it, exactly like C++.
+    ///
+    /// `structure` mirrors the C++ `Structure*` argument (the base object's
+    /// structure being considered for a new `AccessCase`; `None` mirrors a
+    /// null `Structure*`, e.g. `considerRepatchingCacheMegamorphic`'s call
+    /// with `structure = nullptr`). `key` mirrors the C++ `CacheableIdentifier
+    /// impl` argument, read only on the branch where the site itself has no
+    /// fixed identifier (see `site_has_fixed_identifier`'s doc comment).
+    ///
+    /// Returns `true` when the caller should attempt to generate/attach a
+    /// new `AccessCase` now (either because the cooldown expired and this is
+    /// a genuinely new structure, or because repatching too often forced an
+    /// immediate cool-down reseed); `false` when the site is still counting
+    /// down, still buffering indefinitely, or this exact
+    /// `(structure, key)` pair is already buffered this cycle.
+    pub fn consider_repatching(
+        &mut self,
+        structure: Option<StructureId>,
+        key: Option<PropertyKey>,
+    ) -> bool {
+        // C++ `everConsidered = true;` (`:257`), unconditional.
+        self.ever_considered = true;
+
+        // C++ `if (!countdown) { ... } countdown--; return false;` --
+        // restructured here as an early return for the `countdown != 0`
+        // ("else") arm so the `countdown == 0` arm's body (below) mirrors the
+        // C++ `if` block directly, with every one of ITS paths returning
+        // explicitly, exactly like the source.
+        if self.countdown != 0 {
+            self.countdown -= 1;
+            return false;
+        }
+
+        // C++ `WTF::incrementWithSaturation(repatchCount);` (`:262`).
+        if self.repatch_count != u8::MAX {
+            self.repatch_count += 1;
+        }
+        if self.repatch_count > STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN {
+            // C++ `:263-278`: repatching too frequently -- reset and cool
+            // down for exponentially longer each time.
+            self.repatch_count = 0;
+            // C++ `leftShiftWithSaturation(initialCoolDownCount,
+            // numberOfCoolDowns, uint8_t max - 1)` (`:274-277`): the shift
+            // amount is the OLD `numberOfCoolDowns`, read before the
+            // saturating increment below.
+            self.countdown = structure_stub_left_shift_with_saturation(
+                STRUCTURE_STUB_INITIAL_COOL_DOWN_COUNT,
+                self.number_of_cool_downs,
+                u8::MAX - 1,
+            );
+            // C++ `WTF::incrementWithSaturation(numberOfCoolDowns);` (`:278`).
+            if self.number_of_cool_downs != u8::MAX {
+                self.number_of_cool_downs += 1;
+            }
+            // C++ `bufferingCountdown = 0;` (`:281`): whatever was buffered,
+            // trigger generation now.
+            self.buffering_countdown = 0;
+            return true;
+        }
+
+        // C++ `:285-290`: don't buffer forever.
+        if self.buffering_countdown == 0 {
+            return true;
+        }
+        // C++ `bufferingCountdown--;` (`:292`).
+        self.buffering_countdown -= 1;
+
+        // C++ `if (!structure) return true;` (`:294-295`).
+        let Some(structure) = structure else {
+            return true;
+        };
+
+        self.dedup_buffered_structure(structure, key)
+    }
+
+    /// C++ `if (m_identifier) ... else ...` (`PropertyInlineCache.h:312-315`):
+    /// whether THIS site has a fixed identifier baked in (e.g. a `GetById`
+    /// site always caches property `"foo"`), vs. a keyless site (e.g.
+    /// `GetByVal`) whose identifier varies per occurrence and is supplied via
+    /// the `impl`/`key` call argument instead. Every `StructureStubKind` this
+    /// port currently models (`GetById`, `PutById`, `InById`, `InstanceOf`,
+    /// `PrivateName`, `ModuleNamespace`, `Proxyable`) carries a mandatory
+    /// `key: PropertyKey` field on `StructureStubInfo` itself (never
+    /// `Option`), so this is always `true` today -- there is no keyless kind
+    /// modeled yet. Kept as its own method (rather than inlined `true`) so a
+    /// future keyless (`GetByVal`-shaped) kind has one call site to flip.
+    fn site_has_fixed_identifier(&self) -> bool {
+        true
+    }
+
+    /// C++ `:296-327` (the `Locker`/`WTF::switchOn` block): dedup
+    /// `structure` (plus `key` when the site is keyless) into
+    /// `buffered_structures`, constructing the correct `Variant` alternative
+    /// on first use exactly like C++'s `if (std::holds_alternative<
+    /// std::monostate>(m_bufferedStructures)) { ... }`. Returns whether the
+    /// entry was newly added (C++ `isNewlyAdded`).
+    fn dedup_buffered_structure(
+        &mut self,
+        structure: StructureId,
+        key: Option<PropertyKey>,
+    ) -> bool {
+        if self.site_has_fixed_identifier() {
+            if !matches!(
+                self.buffered_structures,
+                PropertyInlineCacheBufferedStructures::Structures(_)
+            ) {
+                self.buffered_structures =
+                    PropertyInlineCacheBufferedStructures::Structures(Vec::new());
+            }
+            let PropertyInlineCacheBufferedStructures::Structures(structures) =
+                &mut self.buffered_structures
+            else {
+                unreachable!("just constructed the Structures alternative above");
+            };
+            if structures.contains(&structure) {
+                false
+            } else {
+                structures.push(structure);
+                true
+            }
+        } else {
+            // C++ `ASSERT(!m_identifier);` (`:322`) guards this arm; a keyless
+            // site with no `key` supplied has nothing to dedup against, so
+            // mirror the "nothing to protect" outcome of the `structure`-only
+            // arm above: attempt generation.
+            let Some(key) = key else {
+                return true;
+            };
+            if !matches!(
+                self.buffered_structures,
+                PropertyInlineCacheBufferedStructures::StructuresWithKey(_)
+            ) {
+                self.buffered_structures =
+                    PropertyInlineCacheBufferedStructures::StructuresWithKey(Vec::new());
+            }
+            let PropertyInlineCacheBufferedStructures::StructuresWithKey(structures) =
+                &mut self.buffered_structures
+            else {
+                unreachable!("just constructed the StructuresWithKey alternative above");
+            };
+            if structures.iter().any(|(s, k)| *s == structure && *k == key) {
+                false
+            } else {
+                structures.push((structure, key));
+                true
+            }
+        }
+    }
+
+    /// C++ `PropertyInlineCache::clearBufferedStructures`
+    /// (`PropertyInlineCache.h:346-357`): called after every successful stub
+    /// regeneration. Per the C++ doc comment on `m_bufferedStructures`
+    /// (`:434-437`), it is always safe to clear this early -- worst case is a
+    /// redundant `AccessCase` that gets deduped away on the next regenerate.
+    pub fn clear_buffered_structures(&mut self) {
+        match &mut self.buffered_structures {
+            PropertyInlineCacheBufferedStructures::Unset => {}
+            PropertyInlineCacheBufferedStructures::Structures(structures) => structures.clear(),
+            PropertyInlineCacheBufferedStructures::StructuresWithKey(structures) => {
+                structures.clear()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -2100,5 +2301,192 @@ mod structure_stub_info_tests {
             PropertyInlineCacheBufferedStructures::default(),
             PropertyInlineCacheBufferedStructures::Unset
         );
+    }
+
+    // Unit R2: `consider_repatching`'s exact arithmetic, ported from
+    // `PropertyInlineCache::considerRepatchingCacheImpl`
+    // (`PropertyInlineCache.h:248-342`, read in full). A fresh stub's
+    // `countdown` starts at 1 (C++: "Setting 1 for a totally clear stub,
+    // we'll patch it after the first execution."), so the FIRST call is
+    // always throttled; the SECOND call (countdown now 0) is where the
+    // repatch/buffering/dedup decision actually runs. `repatch_count` climbs
+    // by one on every `countdown == 0` call regardless of outcome; once it
+    // exceeds `STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN` (8), the site
+    // cools down: `repatch_count` resets to 0, `countdown` is reseeded to
+    // `20 << numberOfCoolDowns` (saturating), and `numberOfCoolDowns`
+    // increments. This test drives that exact 10-call sequence and pins
+    // every intermediate value.
+    #[test]
+    fn consider_repatching_end_to_end_cool_down_escalation_matches_cxx_arithmetic() {
+        let mut stub = fresh_structure_stub();
+        let s1 = StructureId::new(1);
+
+        // Call 1: countdown 1 -> 0, throttled (C++ `countdown--; return
+        // false;`).
+        assert!(!stub.consider_repatching(Some(s1), None));
+        assert!(stub.ever_considered);
+        assert_eq!(stub.countdown, 0);
+        assert_eq!(stub.repatch_count, 0);
+
+        // Call 2: countdown == 0. repatch_count 0->1 (not > 8). buffering
+        // path: bufferingCountdown 6 != 0 -> 5; structure is genuinely new
+        // -> buffered and `true` returned.
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(stub.repatch_count, 1);
+        assert_eq!(stub.buffering_countdown, 5);
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1])
+        );
+
+        // Calls 3-7: repatch_count climbs 2..=6 (still <= 8); bufferingCountdown
+        // walks 4,3,2,1,0 while `s1` stays buffered (already-seen -> `false`
+        // each time, matching C++'s `isNewlyAdded == false`).
+        for expected_repatch_count in 2u8..=6 {
+            assert!(!stub.consider_repatching(Some(s1), None));
+            assert_eq!(stub.repatch_count, expected_repatch_count);
+        }
+        assert_eq!(stub.buffering_countdown, 0);
+
+        // Call 8: repatch_count 6->7 (not > 8). bufferingCountdown is now 0,
+        // so C++ "don't buffer forever" fires unconditionally: `true`, no
+        // dedup performed, `s1` is untouched.
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(stub.repatch_count, 7);
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1])
+        );
+
+        // Call 9: repatch_count 7->8; 8 is NOT > 8, so still the
+        // "don't buffer forever" `true` arm, not yet the cool-down.
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(stub.repatch_count, 8);
+
+        // Call 10: repatch_count 8->9; 9 > 8 triggers the cool-down:
+        // repatch_count resets to 0, countdown reseeds to
+        // `leftShiftWithSaturation(20, numberOfCoolDowns=0, 254) == 20`,
+        // numberOfCoolDowns becomes 1, bufferingCountdown forced to 0 (was
+        // already 0).
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(stub.repatch_count, 0);
+        assert_eq!(stub.number_of_cool_downs, 1);
+        assert_eq!(stub.countdown, 20);
+        assert_eq!(stub.buffering_countdown, 0);
+    }
+
+    // C++ `leftShiftWithSaturation(initialCoolDownCount, numberOfCoolDowns,
+    // max)` (`PropertyInlineCache.h:274-277`): the shift amount is the OLD
+    // `numberOfCoolDowns`, confirmed directly (without replaying an entire
+    // call sequence) by seeding a stub already mid-cool-down-cycle.
+    #[test]
+    fn consider_repatching_cool_down_shifts_by_prior_number_of_cool_downs() {
+        let mut stub = fresh_structure_stub();
+        stub.countdown = 0;
+        stub.repatch_count = STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN; // 8, about to exceed
+        stub.number_of_cool_downs = 3;
+
+        assert!(stub.consider_repatching(None, None));
+        assert_eq!(stub.repatch_count, 0);
+        assert_eq!(stub.number_of_cool_downs, 4);
+        assert_eq!(stub.countdown, 20u8 << 3); // 160
+    }
+
+    // C++ `leftShiftWithSaturation`'s saturating clamp
+    // (`wtf/MathExtras.h:577-586`, max `uint8_t::max() - 1` == 254 per
+    // `PropertyInlineCache.h:276`) and `WTF::incrementWithSaturation`
+    // (`numberOfCoolDowns` never wraps past `u8::MAX`).
+    #[test]
+    fn consider_repatching_cool_down_saturates_at_the_cxx_bounds() {
+        let mut stub = fresh_structure_stub();
+        stub.countdown = 0;
+        stub.repatch_count = STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN;
+        stub.number_of_cool_downs = 10; // 20 << 10 vastly overflows u8
+
+        assert!(stub.consider_repatching(None, None));
+        assert_eq!(stub.countdown, u8::MAX - 1); // 254
+        assert_eq!(stub.number_of_cool_downs, 11);
+
+        // A `numberOfCoolDowns` already saturated at `u8::MAX` stays there
+        // (`incrementWithSaturation` never wraps to 0).
+        let mut saturated = fresh_structure_stub();
+        saturated.countdown = 0;
+        saturated.repatch_count = STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN;
+        saturated.number_of_cool_downs = u8::MAX;
+        assert!(saturated.consider_repatching(None, None));
+        assert_eq!(saturated.number_of_cool_downs, u8::MAX);
+        assert_eq!(saturated.countdown, u8::MAX - 1);
+    }
+
+    // Test category (b) from the R2 task brief: `buffered_structures` dedups
+    // a structure within one buffering cycle and clears on regeneration
+    // (C++ `clearBufferedStructures`, `PropertyInlineCache.h:346-357`).
+    #[test]
+    fn buffered_structures_dedups_within_a_cycle_and_clears_on_regenerate() {
+        let mut stub = fresh_structure_stub();
+        stub.countdown = 0; // skip the "first execution" throttle
+        let s1 = StructureId::new(1);
+        let s2 = StructureId::new(2);
+
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1])
+        );
+
+        // Same structure again, same cycle: already buffered -> not newly
+        // added.
+        assert!(!stub.consider_repatching(Some(s1), None));
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1])
+        );
+
+        // A different structure in the same cycle dedups independently.
+        assert!(stub.consider_repatching(Some(s2), None));
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1, s2])
+        );
+
+        // Regeneration clears the buffer -- a structure seen before the
+        // clear is "newly added" again afterward, exactly like C++'s doc
+        // comment: "if we clear it prematurely... we'll get rid of the
+        // redundant ones once we regenerate."
+        stub.clear_buffered_structures();
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![])
+        );
+        assert!(stub.consider_repatching(Some(s1), None));
+        assert_eq!(
+            stub.buffered_structures,
+            PropertyInlineCacheBufferedStructures::Structures(vec![s1])
+        );
+    }
+
+    // Test category (c): a previously-failing candidate is throttled by the
+    // decrementing cooldown counter, NOT by a permanent rejection memo --
+    // the design doc's crux finding, answered the JSC way. Cooling down
+    // returns `false` every time until `countdown` reaches 0, at which point
+    // the SAME candidate is reconsidered again (never permanently blocked).
+    #[test]
+    fn consider_repatching_cool_down_throttles_then_resumes_not_permanently_blocked() {
+        let mut stub = fresh_structure_stub();
+        stub.countdown = 0;
+        stub.repatch_count = STRUCTURE_STUB_REPATCH_COUNT_FOR_COOL_DOWN;
+        assert!(stub.consider_repatching(None, None)); // triggers escalation
+        assert_eq!(stub.countdown, 20);
+
+        for _ in 0..19 {
+            assert!(!stub.consider_repatching(None, None));
+        }
+        assert_eq!(stub.countdown, 1);
+        assert!(!stub.consider_repatching(None, None));
+        assert_eq!(stub.countdown, 0);
+
+        // Cooldown expired: reconsidered again, not memoized as permanently
+        // rejected.
+        assert!(stub.consider_repatching(None, None));
     }
 }

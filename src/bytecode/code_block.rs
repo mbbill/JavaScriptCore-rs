@@ -1828,6 +1828,33 @@ impl CodeBlock {
         })
     }
 
+    /// C++ `PropertyInlineCache::considerRepatchingCacheImpl`
+    /// (`bytecode/PropertyInlineCache.h:248-342`), invoked on the resident
+    /// stub at `structure_stub_index`. This is the R2 attach-pipeline gate
+    /// (`docs/design/ic-resident-provenance.md`): the caller consults this
+    /// BEFORE attempting to reserve/link a structure-stub access case, in
+    /// place of the log-based rejection memo it replaces
+    /// (`vm/mod.rs::link_reserved_structure_stub_access_case_for_candidate`).
+    ///
+    /// C++ JSC divergence: `considerRepatchingCacheImpl` mutates the
+    /// `PropertyInlineCache` embedded in the `CodeBlock`'s metadata directly
+    /// (`AssertNoGC`, no lock needed since it runs on the mutator thread
+    /// between safepoints); Rust mutates through the interior-mutable
+    /// `inline_caches` `RefCell` under `&self`, the same shared-`CodeBlock`
+    /// shape `link_structure_stub_access_case` above already uses.
+    pub fn consider_repatching_structure_stub(
+        &self,
+        structure_stub_index: usize,
+        structure: Option<StructureId>,
+        key: Option<PropertyKey>,
+    ) -> Option<bool> {
+        let mut inline_caches = self.side_tables.inline_caches.borrow_mut();
+        let stub = inline_caches
+            .structure_stubs
+            .get_mut(structure_stub_index)?;
+        Some(stub.consider_repatching(structure, key))
+    }
+
     pub fn attached_property_inline_cache_metadata(
         &self,
         request: PropertyInlineCacheAttachedMetadataRequest,

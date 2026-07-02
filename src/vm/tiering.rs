@@ -267,6 +267,23 @@ pub struct VmTieringIntegration {
     property_has_megamorphic_cache: VmPropertyHasMegamorphicCache,
     property_has_megamorphic_cache_records: Vec<VmPropertyHasMegamorphicCacheRecord>,
     structure_stub_repatch_transactions: Vec<VmStructureStubRepatchTransactionRecord>,
+    // R2 of docs/design/ic-resident-provenance.md SCOPE NOTE: R2 retired this
+    // log's REJECTION-MEMO gating role (the "should we re-attempt an
+    // already-tried candidate" question, formerly answered by
+    // `structure_stub_access_case_link_attempt_exists`, deleted) in favor of
+    // the resident `StructureStubInfo::consider_repatching` cooldown/
+    // buffering gate, faithful to C++ `PropertyInlineCache::
+    // considerRepatchingCacheImpl`. This Vec itself is NOT deleted in R2:
+    // it still backs `property_load_access_case_plan_from_structure_stub_
+    // descriptor`'s staleness/provenance validation for the generated
+    // property-load sidecar (`vm/mod.rs`'s "read back what's currently
+    // linked" path), which cross-references `property_inline_cache_
+    // attachment_records`/`property_load_access_case_plans` -- the SAME
+    // still-log-shaped cluster Unit R3 ("property-IC attachment/clear fold")
+    // is scoped to retire. Folding this Vec's remaining read-back role away
+    // requires that same fold (a resident replacement for the whole
+    // attachment/plan cross-reference chain, not just this one link), so it
+    // is left to R3 rather than done piecemeal here.
     structure_stub_access_case_links: Vec<VmStructureStubAccessCaseLinkRecord>,
     generated_guarded_property_load_probe_misses:
         Vec<VmGeneratedGuardedPropertyLoadProbeMissRecord>,
@@ -975,43 +992,23 @@ impl VmTieringIntegration {
             .is_some()
     }
 
-    // Redesign-audit telemetry Unit 4 SCOPE NOTE: a resident-read repoint was
-    // attempted here (checking `candidate.structure_stub_info.access_cases.
-    // contains(&access_case_ref)` instead of scanning this log) and REVERTED on
-    // evidence -- two test failures proved the log captures state a resident
-    // read cannot: (1) `vm_structure_stub_access_case_link_rejection_does_not_
-    // mutate_code_block_access_cases` needs "have we already ATTEMPTED this
-    // exact link, even if it was REJECTED" (a rejection leaves no resident
-    // trace, so a resident-only check would re-attempt -- and re-push a fresh
-    // `VmStructureStubAccessCaseLinkRecord` -- on every safepoint entry for a
-    // permanently-failing candidate, i.e. it would make this vec's growth
-    // WORSE, unbounded-per-dispatch, exactly what this redesign track exists to
-    // prevent); (2) `vm_generated_property_load_sidecar_rejects_structure_stub_
-    // descriptor_without_current_access_case` needs the dedup to stay keyed on
-    // "did we already record linking this," not "is it resident right now" --
-    // a resident-only check self-heals when a test (or a real runtime path)
-    // externally drifts `access_cases`, silently re-establishing a link the
-    // rest of the pipeline had already moved past. Kept the original VM-global
-    // scan; a real fix needs a resident "attempted and rejected" marker on
-    // `StructureStubInfo` itself (JSC has no such log -- PolymorphicAccess
-    // either holds a case or doesn't -- so the faithful correction is a serial
-    // architecture decision to add that resident rejection memo, not a Unit-4
-    // read-repoint).
-    pub(crate) fn structure_stub_access_case_link_attempt_exists(
-        &self,
-        candidate: &VmStructureStubPropertyInlineCacheCandidate,
-        transaction_ordinal: u64,
-        access_case_ref: AccessCaseRef,
-    ) -> bool {
-        self.structure_stub_access_case_links.iter().any(|record| {
-            structure_stub_access_case_link_matches(
-                record,
-                candidate,
-                transaction_ordinal,
-                access_case_ref,
-            )
-        })
-    }
+    // Redesign-audit telemetry Unit 4 SCOPE NOTE (RESOLVED by Unit R2 of
+    // docs/design/ic-resident-provenance.md): this function used to answer
+    // "have we already ATTEMPTED this exact link, even if it was REJECTED"
+    // by scanning `structure_stub_access_case_links` -- a permanent
+    // rejection memo with no C++ analog. R2's investigation of the real C++
+    // (`PropertyInlineCache::considerRepatchingCacheImpl`,
+    // `PropertyInlineCache.h:248-342`) found the faithful answer: JSC has NO
+    // such memo. `PolymorphicAccess::addCases` dedups only against the
+    // CURRENTLY buffered/installed list, never a history of past rejections;
+    // repeated attempts at a permanently-failing candidate are throttled by
+    // the escalating `countdown`/`repatch_count`/`number_of_cool_downs`
+    // cooldown instead (`StructureStubInfo::consider_repatching`,
+    // `bytecode/ic.rs`), which the R2 attach pipeline
+    // (`vm/mod.rs::link_reserved_structure_stub_access_case_for_candidate`)
+    // now consults in place of this function. Deleted as dead code once that
+    // call site was removed (`cargo check --lib` confirmed zero remaining
+    // callers).
 
     pub(crate) fn allocate_structure_stub_repatch_code_id(&mut self) -> JitCodeId {
         let mut raw =
