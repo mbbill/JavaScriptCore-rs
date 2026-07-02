@@ -130,12 +130,14 @@ const STRUCTURE_STUB_REPATCH_CODE_ID_BASE: u64 = 1 << 48;
 // telemetry snapshots (`shell/octane.rs`) and tests. It intentionally does NOT
 // cover vecs that production tiering/IC logic searches for exact-ordinal or
 // "does this already exist" lookups (e.g. `call_link_attachment_plan_records`,
-// `property_load_access_case_plans`, `entry_decisions`): capping those would
-// silently freeze their content once the limit is hit, so lookups against
-// records created after the cap would wrongly see stale/missing state. Those
-// sites are load-bearing and are tracked separately, pending the faithful fix:
-// deleting the VM-global logs in favor of per-CodeBlock fixed-footprint
-// counters, matching JSC's shape.
+// `property_load_access_case_plans`): capping those would silently freeze
+// their content once the limit is hit, so lookups against records created
+// after the cap would wrongly see stale/missing state. Those sites are
+// load-bearing and are tracked separately, pending the faithful fix: deleting
+// the VM-global logs in favor of per-CodeBlock fixed-footprint counters,
+// matching JSC's shape. (`entry_decisions` was one of these load-bearing
+// logs; redesign-audit telemetry Unit 1 deleted it in favor of
+// `RuntimeTierState::last_entry_decision` -- see that field's comment.)
 const HOT_TELEMETRY_RECORD_RETAIN_LIMIT: usize = 1024;
 const PROPERTY_IC_REPATCH_COUNT_FOR_COOLDOWN: u8 = 8;
 const PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE: u8 = 8;
@@ -169,7 +171,19 @@ const PROPERTY_HAS_MEGAMORPHIC_CACHE_SECONDARY_MASK: usize =
 #[derive(Clone, Debug, Default)]
 pub struct VmTieringIntegration {
     states: Vec<RuntimeTierState>,
-    entry_decisions: Vec<TierEntryDecisionRecord>,
+    // Redesign-audit telemetry Unit 1 (deleted the VM-global event log): C++
+    // JSC keeps no log of tier-entry decisions at all -- each CodeBlock just
+    // carries its live `m_llintExecuteCounter`/JIT-code fields
+    // (CodeBlock.h:999-1002) that the NEXT entry consults directly, with no
+    // history retained. `entry_decisions` used to accumulate one
+    // `TierEntryDecisionRecord` per interpreter entry forever; the sole
+    // production reader (`generated_resume_entry_context`,
+    // vm/mod.rs) only ever wanted the MOST RECENT decision for one owner. That
+    // is now `RuntimeTierState::last_entry_decision` (owner-keyed, O(1) per
+    // owner, mirrors the `replace_baseline_entry_artifact` idiom below).
+    // `entry_decision_count` replaces `.len()` reads that only wanted a
+    // monotonic counter, not the retained history.
+    entry_decision_count: u64,
     fallback_records: Vec<OptimizedFallbackRecord>,
     osr_boundaries: Vec<OsrBoundaryRecord>,
     profile_records: Vec<TierProfileRecord>,
@@ -302,6 +316,19 @@ pub struct VmTieringIntegration {
     generated_direct_call_rootless_preferred_native_entry_counts:
         VmGeneratedDirectCallRootlessPreferredNativeEntryCounts,
     baseline_entry_auto_materializations: Vec<BaselineEntryAutoMaterializationRecord>,
+    // Redesign-audit telemetry Unit 1: dedicated cumulative counters for the
+    // two diagnostic aggregates (`baseline_native_lowering_failure_count`,
+    // `baseline_native_semantic_byte_emission_failure_count`) that used to be
+    // derived by filtering the FULL unbounded `baseline_entry_auto_materializations`
+    // history. Unlike the ordinal/owner-scoped lookups on that field (now an
+    // owner-keyed bounded slot, see `replace_baseline_entry_auto_materialization`),
+    // these two want a true cumulative "how many failures ever" count, which
+    // would under-count once the vec is bounded per owner (a retried owner's
+    // earlier failure would be overwritten by its later success). C++ JSC has
+    // no counterpart log; these are Rust-only diagnostic counters, incremented
+    // once per failure event exactly like `data_ic_self_load_slow_path_exit_count`.
+    baseline_native_lowering_failure_count: usize,
+    baseline_native_semantic_byte_emission_failure_count: usize,
     baseline_install_records: Vec<BaselineInstallRecord>,
     next_ordinal: u64,
     next_plan: u64,
@@ -326,8 +353,34 @@ pub struct VmTieringIntegration {
 }
 
 impl VmTieringIntegration {
-    pub fn entry_decisions(&self) -> &[TierEntryDecisionRecord] {
-        &self.entry_decisions
+    // Redesign-audit telemetry Unit 1: owner-scoped replacement for the
+    // deleted `entry_decisions` VM-global log. Mirrors the sole production
+    // reader's own `.iter().rev().find(|record| record.owner == owner)`
+    // idiom (`generated_resume_entry_context`, vm/mod.rs) -- since
+    // `RuntimeTierState::last_entry_decision` is always the most recent
+    // decision for `owner`, this is the same lookup in O(1).
+    pub fn last_entry_decision_for(&self, owner: CodeBlockId) -> Option<&TierEntryDecisionRecord> {
+        self.state_for(owner)?.last_entry_decision.as_ref()
+    }
+
+    // VM-wide monotonic count of tier-entry decisions committed, replacing
+    // `.entry_decisions().len()` reads that only wanted a counter, not the
+    // (now-deleted) retained history. C++ JSC has no counterpart log to count
+    // at all; this exists solely so Rust telemetry/tests can observe "how
+    // many entries happened" without retaining every entry.
+    pub fn entry_decision_count(&self) -> u64 {
+        self.entry_decision_count
+    }
+
+    // Owner-agnostic view for the handful of consumers that scan across ALL
+    // owners (e.g. "did any Construct entry happen") rather than looking up
+    // one owner. Bounded by the number of live owners (one slot per
+    // `RuntimeTierState`, matching JSC's fixed per-CodeBlock footprint), not
+    // by the number of dynamic entries.
+    pub fn entry_decisions_by_owner(&self) -> impl Iterator<Item = &TierEntryDecisionRecord> {
+        self.states
+            .iter()
+            .filter_map(|state| state.last_entry_decision.as_ref())
     }
 
     pub fn fallback_records(&self) -> &[OptimizedFallbackRecord] {
@@ -1962,28 +2015,16 @@ impl VmTieringIntegration {
         &self.baseline_entry_auto_materializations
     }
 
+    // Redesign-audit telemetry Unit 1: reads the dedicated cumulative counter
+    // (see the `baseline_native_lowering_failure_count` field comment)
+    // instead of filtering `baseline_entry_auto_materializations`, which is
+    // now an owner-keyed bounded slot and would under-count a retried owner.
     pub fn baseline_native_lowering_failure_count(&self) -> usize {
-        self.baseline_entry_auto_materializations
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.native_detail,
-                    Some(BaselineEntryAutoNativeMaterializationDetail::Lowering(_))
-                )
-            })
-            .count()
+        self.baseline_native_lowering_failure_count
     }
 
     pub fn baseline_native_semantic_byte_emission_failure_count(&self) -> usize {
-        self.baseline_entry_auto_materializations
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.native_detail,
-                    Some(BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(_))
-                )
-            })
-            .count()
+        self.baseline_native_semantic_byte_emission_failure_count
     }
 
     #[allow(dead_code)]
@@ -2085,6 +2126,19 @@ impl VmTieringIntegration {
             baseline_abi_proof,
             outcome,
         };
+        // Redesign-audit telemetry Unit 1 SCOPE NOTE: `baseline_executable_materializations`
+        // was evaluated for the same owner-keyed bound as the other 4 fields
+        // and REJECTED by evidence -- `validate_baseline_executable_materialization_for_install`
+        // and friends validate a SPECIFIC materialization record (passed back
+        // to the VM by value) is still VM-owned via `.any(|r| r == materialization)`.
+        // `baseline_materialization_rejects_descriptor_mismatches` (this file)
+        // deliberately creates several REJECTED materialization attempts for
+        // the SAME owner and later re-validates an earlier (non-latest) one;
+        // an owner-keyed bound evicts it, breaking that VM-ownership check
+        // with a false "not VM owned" instead of the real rejection reason.
+        // This is a Rust-only concern (a stand-in for identity/pointer
+        // validation C++ gets for free); still unbounded, deferred pending a
+        // redesign that preserves per-attempt receipt validity.
         self.baseline_executable_materializations
             .push(record.clone());
         record
@@ -2215,6 +2269,20 @@ impl VmTieringIntegration {
             callable,
             outcome,
         };
+        // Redesign-audit telemetry Unit 1 SCOPE NOTE: `baseline_native_entry_readiness_records`
+        // was evaluated for the same owner-keyed bound as the other 4 fields
+        // and REJECTED by evidence: (1) `install_p6_x86_64_semantic_baseline_native_entry`
+        // (vm/mod.rs) legitimately records TWO readiness records for the SAME
+        // owner in one call (a disabled probe, then an enabled one) and finds
+        // the new one via `.get(readiness_count_before..)` -- an owner-keyed
+        // bound collapses both into one slot, so the length-based mark no
+        // longer isolates the fresh record and the call spuriously fails with
+        // `DisabledReadinessMissing`; (2) `p6_semantic_install_side_effect_counts`
+        // (vm/mod.rs, used by dozens of tests) reads `.len()` as a true
+        // cumulative "how many readiness records were created" counter, which
+        // an owner-keyed bound under-counts. Still unbounded, deferred
+        // pending a redesign that separates "current readiness for owner"
+        // from "how many readiness events occurred".
         self.baseline_native_entry_readiness_records
             .push(record.clone());
         record
@@ -2574,7 +2642,11 @@ impl VmTieringIntegration {
             source: request.source,
             outcome,
         };
-        self.baseline_generated_code_invalidations.push(record);
+        // Redesign-audit telemetry Unit 1: was an unbounded `.push(..)`. C++
+        // JSC's `CodeBlock::m_isJettisoned` (CodeBlock.cpp:2293) is a single
+        // sticky bool set once in `jettison()` and never reset; mirror that
+        // with an owner-keyed slot via `replace_baseline_generated_code_invalidation`.
+        self.replace_baseline_generated_code_invalidation(record.clone());
         record
     }
 
@@ -3048,7 +3120,16 @@ impl VmTieringIntegration {
                 selected_plan,
             });
         }
-        self.entry_decisions.push(record.clone());
+        // Redesign-audit telemetry Unit 1: was `self.entry_decisions.push(..)`
+        // (unbounded VM-global log). C++ JSC retains no entry-decision
+        // history; store only the most recent decision, owner-keyed on
+        // `RuntimeTierState`, matching `CodeBlock`'s single live JIT-code
+        // field (CodeBlock.h:999-1002). `entry_decision_count` keeps the
+        // monotonic "how many entries happened" counter for callers that only
+        // wanted `.len()`.
+        self.state_for_mut(request.owner, policy)
+            .last_entry_decision = Some(record.clone());
+        self.entry_decision_count = self.entry_decision_count.saturating_add(1);
         record
     }
 
@@ -6460,6 +6541,7 @@ impl VmTieringIntegration {
                 thresholds,
                 counters: zero_tier_counters(),
             },
+            last_entry_decision: None,
         });
         &mut self.states[index]
     }
@@ -6557,6 +6639,83 @@ impl VmTieringIntegration {
         }
     }
 
+    // Redesign-audit telemetry Unit 1: owner-keyed update-or-insert, mirroring
+    // `replace_baseline_entry_artifact` above exactly. Bounds
+    // `baseline_entry_auto_materializations` to one record per live owner
+    // (matching JSC's single per-CodeBlock materialization outcome) instead
+    // of one record per attempt ever. Production readers already only look at
+    // the OWNER'S MOST RECENT record (`.iter().rev().find(owner)` retry-decision
+    // sites in vm/mod.rs, e.g. `p15_supplemental_native_install_should_retry_generated_owner`),
+    // which this preserves exactly. Cumulative failure-kind diagnostics that
+    // would be lossy under this bound are NOT read from this vec; see
+    // `baseline_native_lowering_failure_count`/
+    // `baseline_native_semantic_byte_emission_failure_count`'s dedicated
+    // counters.
+    fn replace_baseline_entry_auto_materialization(
+        &mut self,
+        record: BaselineEntryAutoMaterializationRecord,
+    ) {
+        if let Some(existing) = self
+            .baseline_entry_auto_materializations
+            .iter_mut()
+            .find(|existing| existing.owner == record.owner)
+        {
+            *existing = record;
+        } else {
+            self.baseline_entry_auto_materializations.push(record);
+        }
+    }
+
+    // Redesign-audit telemetry Unit 1: owner-scoped accessor mirroring
+    // `last_entry_decision_for`. Since `baseline_entry_auto_materializations`
+    // is now bounded to one record per owner, this is simply "does this owner
+    // have a record, and what is it" -- the natural replacement for the
+    // `[mark..].find(owner)` "did a NEW record appear for owner since I
+    // captured this mark" test idiom: because the vec holds only the
+    // CURRENT record per owner, reading it after an operation always reflects
+    // that operation's outcome for `owner`, whether or not `owner` already
+    // had a record before the mark.
+    #[allow(dead_code)]
+    pub(crate) fn baseline_entry_auto_materialization_for(
+        &self,
+        owner: CodeBlockId,
+    ) -> Option<&BaselineEntryAutoMaterializationRecord> {
+        self.baseline_entry_auto_materializations
+            .iter()
+            .find(|record| record.owner == owner)
+    }
+
+    // Redesign-audit telemetry Unit 1: owner-keyed update-or-insert, "sticky"
+    // on an already-`Accepted` invalidation for the SAME `artifact_id` --
+    // mirrors C++ JSC's `CodeBlock::m_isJettisoned` (CodeBlock.cpp:2293), a
+    // bool that is set once in `jettison()` and never reset. A later
+    // duplicate-invalidation attempt against the same artifact (outcome
+    // `AlreadyInvalidated`, checked by
+    // `baseline_generated_code_invalidation_for_artifact` BEFORE this call)
+    // must not overwrite the durable "yes, invalidated" state. A new
+    // `artifact_id` for this owner (a fresh generated-code install cycle) is
+    // a genuinely new fact and does replace the slot.
+    fn replace_baseline_generated_code_invalidation(
+        &mut self,
+        record: BaselineGeneratedCodeInvalidationRecord,
+    ) {
+        if let Some(existing) = self
+            .baseline_generated_code_invalidations
+            .iter()
+            .find(|existing| existing.owner == record.owner)
+        {
+            let downgrades_sticky_accept = existing.outcome
+                == BaselineGeneratedCodeInvalidationOutcome::Accepted
+                && existing.artifact_id == record.artifact_id;
+            if downgrades_sticky_accept {
+                return;
+            }
+        }
+        self.baseline_generated_code_invalidations
+            .retain(|existing| existing.owner != record.owner);
+        self.baseline_generated_code_invalidations.push(record);
+    }
+
     #[allow(dead_code)]
     fn take_baseline_entry_artifact(
         &mut self,
@@ -6598,8 +6757,28 @@ impl VmTieringIntegration {
             generated: request.generated,
             generated_detail: request.generated_detail,
         };
-        self.baseline_entry_auto_materializations
-            .push(record.clone());
+        // Cumulative failure-kind counters (see the field comments): counted
+        // at creation time so a later retry/success for the same owner
+        // (which replaces this owner's slot below) never loses the failure
+        // event from the diagnostic total.
+        match record.native_detail {
+            Some(BaselineEntryAutoNativeMaterializationDetail::Lowering(_)) => {
+                self.baseline_native_lowering_failure_count = self
+                    .baseline_native_lowering_failure_count
+                    .saturating_add(1);
+            }
+            Some(BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(_)) => {
+                self.baseline_native_semantic_byte_emission_failure_count = self
+                    .baseline_native_semantic_byte_emission_failure_count
+                    .saturating_add(1);
+            }
+            Some(BaselineEntryAutoNativeMaterializationDetail::BackendContract(_)) | None => {}
+        }
+        // Redesign-audit telemetry Unit 1: was an unbounded `.push(..)`. C++
+        // JSC's per-CodeBlock JIT-code fields hold exactly one live
+        // materialization outcome at a time; mirror that with the same
+        // owner-keyed update-or-insert idiom as `replace_baseline_entry_artifact`.
+        self.replace_baseline_entry_auto_materialization(record.clone());
         record
     }
 
@@ -6753,10 +6932,23 @@ impl VmTieringIntegration {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Redesign-audit telemetry Unit 1: `last_entry_decision` replaces the deleted
+// `VmTieringIntegration::entry_decisions` VM-global log. C++ JSC keeps no
+// entry-decision history at all -- the next entry just reads the CodeBlock's
+// live `m_jitCode`/JIT-code fields directly (CodeBlock.h:999-1002); there is
+// nothing to look back at. This field is the O(1) per-owner mirror of that:
+// the single most-recent `TierEntryDecisionRecord` for this owner, updated in
+// place by `commit_interpreter_entry_decision`. `TierEntryDecisionRecord`
+// carries non-`Copy` fields (e.g. `profile: TierExecutionProfile`,
+// `baseline_entry_gate: Option<BaselineEntryGateRecord>`), so this struct can
+// no longer derive `Copy`; all production access is through
+// `state_for`/`state_for_mut`, which already hand out references, so this is
+// not a behavioral change for any caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTierState {
     pub owner: CodeBlockId,
     pub tiering: TieringState,
+    pub last_entry_decision: Option<TierEntryDecisionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20183,10 +20375,14 @@ mod tests {
     #[test]
     fn baseline_native_failure_counts_split_lowering_and_semantic_byte_emission() {
         let mut tiering = VmTieringIntegration::default();
-        tiering
-            .baseline_entry_auto_materializations
-            .push(BaselineEntryAutoMaterializationRecord {
-                ordinal: 1,
+        // Redesign-audit telemetry Unit 1: routed through the production
+        // `record_baseline_entry_auto_materialization` entry point (rather
+        // than pushing raw records into the now owner-keyed-bounded
+        // `baseline_entry_auto_materializations` field directly) so the
+        // dedicated cumulative failure counters this test asserts on are
+        // exercised the same way production code updates them.
+        tiering.record_baseline_entry_auto_materialization(
+            BaselineEntryAutoMaterializationRequest {
                 owner: CodeBlockId(CellId(1)),
                 requested_tier: JitType::Baseline,
                 native: BaselineEntryAutoNativeMaterializationOutcome::Failed {
@@ -20202,44 +20398,129 @@ mod tests {
                 )),
                 generated: None,
                 generated_detail: None,
-            });
-        tiering
-            .baseline_entry_auto_materializations
-            .push(BaselineEntryAutoMaterializationRecord {
-                ordinal: 2,
-                owner: CodeBlockId(CellId(2)),
-                requested_tier: JitType::Baseline,
-                native: BaselineEntryAutoNativeMaterializationOutcome::Failed {
-                    reason: BaselineEntryAutoNativeMaterializationFailure::SemanticByteEmission,
-                    generated_fallback_allowed: true,
-                },
-                native_detail: Some(
-                    BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(
-                        BaselineNativeSemanticByteEmissionFailureDetail::PropertyNativeExitRequiresCallable {
-                            bytecode_index: BytecodeIndex::from_offset(5),
-                        },
-                    ),
+            },
+        );
+        tiering.record_baseline_entry_auto_materialization(BaselineEntryAutoMaterializationRequest {
+            owner: CodeBlockId(CellId(2)),
+            requested_tier: JitType::Baseline,
+            native: BaselineEntryAutoNativeMaterializationOutcome::Failed {
+                reason: BaselineEntryAutoNativeMaterializationFailure::SemanticByteEmission,
+                generated_fallback_allowed: true,
+            },
+            native_detail: Some(
+                BaselineEntryAutoNativeMaterializationDetail::SemanticByteEmission(
+                    BaselineNativeSemanticByteEmissionFailureDetail::PropertyNativeExitRequiresCallable {
+                        bytecode_index: BytecodeIndex::from_offset(5),
+                    },
                 ),
-                generated: None,
-                generated_detail: None,
-            });
-        tiering
-            .baseline_entry_auto_materializations
-            .push(BaselineEntryAutoMaterializationRecord {
-                ordinal: 3,
+            ),
+            generated: None,
+            generated_detail: None,
+        });
+        tiering.record_baseline_entry_auto_materialization(
+            BaselineEntryAutoMaterializationRequest {
                 owner: CodeBlockId(CellId(3)),
                 requested_tier: JitType::Baseline,
                 native: BaselineEntryAutoNativeMaterializationOutcome::Installed,
                 native_detail: None,
                 generated: None,
                 generated_detail: None,
-            });
+            },
+        );
 
         assert_eq!(tiering.baseline_native_lowering_failure_count(), 1);
         assert_eq!(
             tiering.baseline_native_semantic_byte_emission_failure_count(),
             1
         );
+    }
+
+    // Redesign-audit telemetry Unit 1 regression: N `record_*` calls for the
+    // SAME owner must leave O(1) retained state per field, not grow a vec --
+    // this is the behavioral difference between the deleted VM-global logs
+    // and the owner-keyed replacement state. Exercises the 3 fields this
+    // batch actually bounds (`entry_decisions`, `baseline_entry_auto_materializations`,
+    // `baseline_generated_code_invalidations`). `baseline_executable_materializations`
+    // and `baseline_native_entry_readiness_records` are deliberately EXCLUDED
+    // from this batch -- see the SCOPE NOTE comments at their `record_*`
+    // writers for the evidence (real production/test breakage) that ruled out
+    // the same bound for them.
+    #[test]
+    fn telemetry_redesign_unit1_repeated_owner_entries_stay_o1() {
+        let mut tiering = VmTieringIntegration::default();
+        let owner = CodeBlockId(CellId(42));
+        let other_owner = CodeBlockId(CellId(43));
+
+        for i in 0..10u64 {
+            let selection = TierEntryPlanSelection {
+                request: TierEntryRequest {
+                    owner,
+                    entry_kind: ExecutionEntryKind::Program,
+                    bytecode_index: None,
+                    frame: None,
+                    stack_frame: None,
+                    bytecode_size: None,
+                    inline_cache_count: 0,
+                    policy: TieringPolicy::InterpreterOnly,
+                },
+                selected_plan: None,
+                current_tier: JitType::None,
+                counters: zero_tier_counters(),
+                thresholds: default_thresholds(),
+            };
+            tiering.commit_interpreter_entry_decision(selection, || {
+                // `TieringPolicy::InterpreterOnly` always decides `Interpret`
+                // (never `FallbackToInterpreter`), so this thunk is never
+                // actually invoked; the placeholder snapshot just needs to
+                // type-check.
+                FallbackBoundarySnapshot::from_roots(HeapId(0), Ok(Vec::new()), 0, 0, 0)
+            });
+            assert_eq!(tiering.entry_decision_count(), i + 1);
+            // O(1): exactly one owner has ever entered, so exactly one state
+            // slot exists, regardless of how many times it entered.
+            assert_eq!(tiering.states.len(), 1);
+        }
+        assert!(tiering.last_entry_decision_for(owner).is_some());
+        assert!(tiering.last_entry_decision_for(other_owner).is_none());
+
+        for i in 0..10u64 {
+            tiering.replace_baseline_entry_auto_materialization(
+                BaselineEntryAutoMaterializationRecord {
+                    ordinal: i,
+                    owner: other_owner,
+                    requested_tier: JitType::Baseline,
+                    native: BaselineEntryAutoNativeMaterializationOutcome::Installed,
+                    native_detail: None,
+                    generated: None,
+                    generated_detail: None,
+                },
+            );
+        }
+        assert_eq!(tiering.baseline_entry_auto_materializations().len(), 1);
+        assert_eq!(
+            tiering
+                .baseline_entry_auto_materialization_for(other_owner)
+                .map(|record| record.ordinal),
+            Some(9)
+        );
+        assert!(tiering
+            .baseline_entry_auto_materialization_for(owner)
+            .is_none());
+
+        for i in 0..10u64 {
+            tiering.replace_baseline_generated_code_invalidation(
+                BaselineGeneratedCodeInvalidationRecord {
+                    ordinal: i,
+                    owner: other_owner,
+                    artifact_id: None,
+                    bytecode_snapshot: None,
+                    reason: CodeInvalidationReason::WatchpointFired,
+                    source: BaselineGeneratedCodeInvalidationSource::Explicit,
+                    outcome: BaselineGeneratedCodeInvalidationOutcome::NoMatchingArtifact,
+                },
+            );
+        }
+        assert_eq!(tiering.baseline_generated_code_invalidations().len(), 1);
     }
 
     fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
@@ -32420,7 +32701,8 @@ mod tests {
         let original_guarded_probe_misses = tiering
             .generated_guarded_property_load_probe_misses()
             .to_vec();
-        let original_entry_decisions = tiering.entry_decisions().to_vec();
+        let original_entry_decision = tiering.last_entry_decision_for(plan.owner).cloned();
+        let original_entry_decision_count = tiering.entry_decision_count();
         let original_install_records = tiering.baseline_install_records().to_vec();
 
         let table = tiering
@@ -32459,7 +32741,14 @@ mod tests {
             tiering.generated_guarded_property_load_probe_misses(),
             original_guarded_probe_misses
         );
-        assert_eq!(tiering.entry_decisions(), original_entry_decisions);
+        assert_eq!(
+            tiering.last_entry_decision_for(plan.owner),
+            original_entry_decision.as_ref()
+        );
+        assert_eq!(
+            tiering.entry_decision_count(),
+            original_entry_decision_count
+        );
         assert_eq!(tiering.baseline_install_records(), original_install_records);
         assert_eq!(
             tiering.baseline_generated_code_artifact_for(plan.owner),

@@ -16753,10 +16753,7 @@ impl Vm {
         owner: CodeBlockId,
     ) -> (crate::interpreter::ExecutionEntryKind, JitType) {
         self.tiering
-            .entry_decisions()
-            .iter()
-            .rev()
-            .find(|record| record.owner == owner)
+            .last_entry_decision_for(owner)
             .map(|record| (record.entry_kind, record.current_tier))
             .unwrap_or((
                 crate::interpreter::ExecutionEntryKind::Program,
@@ -21247,8 +21244,7 @@ mod tests {
     ) {
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P6 callable native entry decision");
         assert_eq!(entry_decision.owner, owner);
         assert_eq!(
@@ -21307,8 +21303,7 @@ mod tests {
     ) {
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P6 callable side-exit entry decision");
         assert_eq!(entry_decision.owner, owner);
         assert_eq!(
@@ -34202,10 +34197,7 @@ mod tests {
     ) {
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .rev()
-            .find(|decision| decision.owner == owner)
+            .last_entry_decision_for(owner)
             .expect("generated entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -34246,8 +34238,7 @@ mod tests {
     ) {
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("generated entry decision");
         assert_eq!(entry_decision.owner, owner);
         assert_eq!(
@@ -35109,11 +35100,17 @@ mod tests {
             ExecutionCompletion::Returned(RuntimeValue::from_i32(17))
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[0].requested_tier,
+            vm.tiering_integration()
+                .last_entry_decision_for(code_block_id)
+                .unwrap()
+                .requested_tier,
             Some(JitType::Baseline)
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[0].execution_path,
+            vm.tiering_integration()
+                .last_entry_decision_for(code_block_id)
+                .unwrap()
+                .execution_path,
             TierEntryExecutionPath::Interpreter
         );
         assert_eq!(
@@ -38740,8 +38737,7 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
         let generated_artifact = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .and_then(|record| record.baseline_entry_gate.as_ref())
             .and_then(|gate| gate.generated_artifact.clone())
             .expect("generated artifact evidence");
@@ -38802,8 +38798,7 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
         let generated_artifact = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .and_then(|record| record.baseline_entry_gate.as_ref())
             .and_then(|gate| gate.generated_artifact.clone())
             .expect("generated artifact evidence");
@@ -38904,8 +38899,7 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
         let generated_artifact = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .and_then(|record| record.baseline_entry_gate.as_ref())
             .and_then(|gate| gate.generated_artifact.clone())
             .expect("generated artifact evidence");
@@ -39508,8 +39502,7 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
         let generated_artifact = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .and_then(|record| record.baseline_entry_gate.as_ref())
             .and_then(|gate| gate.generated_artifact.clone())
             .expect("generated artifact evidence");
@@ -39582,8 +39575,7 @@ mod tests {
         assert_latest_generated_entry_evidence(&vm, owner, artifact);
         let generated_artifact = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .and_then(|record| record.baseline_entry_gate.as_ref())
             .and_then(|gate| gate.generated_artifact.clone())
             .expect("generated artifact evidence");
@@ -41149,11 +41141,6 @@ mod tests {
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 2_261);
         let bytecode_snapshot = artifact.eligibility_proof.bytecode_snapshot_fingerprint();
         let counts_before = p6_semantic_install_side_effect_counts(&vm);
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
 
         let (completion, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -41188,19 +41175,16 @@ mod tests {
         );
         let supplemental_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == owner)
+            .baseline_entry_auto_materialization_for(owner)
             .expect("P16c generated caller supplemental native materialization");
         assert_eq!(
             supplemental_record.native,
             BaselineEntryAutoNativeMaterializationOutcome::Installed
         );
         assert_eq!(supplemental_record.generated, None);
-        let callee_decision = vm.tiering_integration().entry_decisions()
-            [entry_decision_count_before..]
-            .iter()
-            .find(|decision| decision.owner == callee_owner)
+        let callee_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(callee_owner)
             .expect("P16c cold generated callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -41262,10 +41246,6 @@ mod tests {
         let owner = register_test_code_block(&mut vm, code_block.clone());
         let artifact = install_typed_baseline_for_test(&mut vm, owner, 2_262);
         let counts_before = p6_semantic_install_side_effect_counts(&vm);
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
 
         let (completion, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -41307,9 +41287,7 @@ mod tests {
         );
         let supplemental_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == owner)
+            .baseline_entry_auto_materialization_for(owner)
             .expect("unvalidated callee path supplemental caller native materialization");
         assert_eq!(
             supplemental_record.native,
@@ -41318,8 +41296,7 @@ mod tests {
         assert_eq!(supplemental_record.generated, None);
         assert!(
             vm.tiering_integration()
-                .entry_decisions()
-                .iter()
+                .entry_decisions_by_owner()
                 .all(|decision| decision.entry_kind != ExecutionEntryKind::Function),
             "unvalidated callee fallback must not enter through the VM Function entry"
         );
@@ -41379,7 +41356,15 @@ mod tests {
         );
 
         let counts_before_direct = p6_semantic_install_side_effect_counts(&vm);
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        // Redesign-audit telemetry Unit 1: the deleted `entry_decisions` log
+        // let this test count "how many NEW callee decisions since mark"; the
+        // owner-keyed replacement only retains the latest decision per owner,
+        // so the equivalent check is "the callee's last decision ordinal is
+        // unchanged", proving no fresh decision was committed for it.
+        let callee_entry_decision_ordinal_before = vm
+            .tiering_integration()
+            .last_entry_decision_for(callee_owner)
+            .map(|decision| decision.ordinal);
         let diagnostic_count_before = vm.tiering_integration().diagnostics().len();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
@@ -41416,11 +41401,10 @@ mod tests {
             "P16c cold generated handoff should already have installed the callee native entry"
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[entry_decision_count_before..]
-                .iter()
-                .filter(|decision| decision.owner == callee_owner)
-                .count(),
-            0,
+            vm.tiering_integration()
+                .last_entry_decision_for(callee_owner)
+                .map(|decision| decision.ordinal),
+            callee_entry_decision_ordinal_before,
             "authorized generated direct calls should reuse the validated callee entry without a fresh tier-entry decision"
         );
         assert_eq!(
@@ -41496,7 +41480,10 @@ mod tests {
             "slot installation should not count as a cached route hit"
         );
 
-        let entry_decision_count_before_hot = vm.tiering_integration().entry_decisions().len();
+        let callee_entry_decision_ordinal_before_hot = vm
+            .tiering_integration()
+            .last_entry_decision_for(callee_owner)
+            .map(|decision| decision.ordinal);
         let diagnostic_count_before_hot = vm.tiering_integration().diagnostics().len();
         let rootless_rejections_before_hot = vm
             .tiering_integration()
@@ -41602,11 +41589,10 @@ mod tests {
             "hot-slot validation should still enter the callee through native entry"
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[entry_decision_count_before_hot..]
-                .iter()
-                .filter(|decision| decision.owner == callee_owner)
-                .count(),
-            0,
+            vm.tiering_integration()
+                .last_entry_decision_for(callee_owner)
+                .map(|decision| decision.ordinal),
+            callee_entry_decision_ordinal_before_hot,
             "hot-slot direct calls should not record a fresh callee tier-entry decision"
         );
         assert_eq!(
@@ -41644,14 +41630,12 @@ mod tests {
         assert_eq!(vm.heap().no_gc_scope_depth(), 0);
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .any(|decision| {
-                decision.owner == owner
-                    && decision.decision
-                        == (TierEntryDecision::EnterOptimized {
-                            tier: JitType::Baseline,
-                        })
+            .last_entry_decision_for(owner)
+            .is_some_and(|decision| {
+                decision.decision
+                    == (TierEntryDecision::EnterOptimized {
+                        tier: JitType::Baseline,
+                    })
                     && decision.execution_path
                         == TierEntryExecutionPath::GeneratedCode(JitType::Baseline)
                     && decision
@@ -42065,10 +42049,6 @@ mod tests {
             .baseline_generated_code_artifact_for(callee_owner)
             .is_none());
 
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
         let fallback_count_before = vm
             .tiering_integration()
             .generated_direct_call_callee_fallback_records()
@@ -42097,9 +42077,7 @@ mod tests {
         );
         let callee_auto_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .baseline_entry_auto_materialization_for(callee_owner)
             .expect("host-blocked native callee generated materialization");
         assert_eq!(
             callee_auto_record.native,
@@ -42302,10 +42280,6 @@ mod tests {
             cache.mutation_authority = InlineCacheMutationAuthority::BaselineJit;
         }
 
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
         host.clear_observations();
         let second = execute_registered_code_block_with_host_and_arguments(
             &mut vm,
@@ -42321,9 +42295,7 @@ mod tests {
         );
         let callee_auto_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .baseline_entry_auto_materialization_for(callee_owner)
             .expect("host-blocked property callee generated materialization");
         assert_eq!(
             callee_auto_record.native,
@@ -49927,7 +49899,6 @@ mod tests {
         );
         let counts_before = p6_semantic_install_side_effect_counts(&vm);
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
         let bytecode_snapshot = fixture
             .readiness
             .bytecode_snapshot
@@ -49968,10 +49939,9 @@ mod tests {
                 provenance: counts_before.provenance + 1,
             }
         );
-        let callee_decision = vm.tiering_integration().entry_decisions()
-            [entry_decision_count_before..]
-            .iter()
-            .find(|decision| decision.owner == callee_owner)
+        let callee_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(callee_owner)
             .expect("P16c P9 callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -50680,7 +50650,6 @@ mod tests {
         );
         let counts_before = p6_semantic_install_side_effect_counts(&vm);
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
 
         let (completion, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -50714,10 +50683,9 @@ mod tests {
                 provenance: counts_before.provenance + 1,
             }
         );
-        let construct_decision = vm.tiering_integration().entry_decisions()
-            [entry_decision_count_before..]
-            .iter()
-            .find(|decision| decision.owner == construct_owner)
+        let construct_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(construct_owner)
             .expect("P9 construct callee entry decision");
         assert_eq!(construct_decision.entry_kind, ExecutionEntryKind::Construct);
         assert_eq!(
@@ -51757,7 +51725,7 @@ mod tests {
         ] {
             host.clear_observations();
             let targeted_roots_before = vm.heap().targeted_roots().records().to_vec();
-            let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+            let entry_decision_count_before = vm.tiering_integration().entry_decision_count();
             assert_eq!(
                 dispatch_generated_direct_call_handoff_for_test(
                     &mut vm,
@@ -51780,7 +51748,7 @@ mod tests {
                 targeted_roots_before.as_slice()
             );
             assert_eq!(
-                vm.tiering_integration().entry_decisions().len(),
+                vm.tiering_integration().entry_decision_count(),
                 entry_decision_count_before,
                 "forged direct-call handoff must reject before callee entry"
             );
@@ -51821,10 +51789,6 @@ mod tests {
             },
             CellType::String,
         );
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
         host.clear_observations();
         let (second_completion, boundary_snapshot) =
             execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -51861,9 +51825,7 @@ mod tests {
         );
         let callee_auto_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .baseline_entry_auto_materialization_for(callee_owner)
             .expect("missing native gate callee should prepare generated entry");
         assert_eq!(
             callee_auto_record.native,
@@ -53926,9 +53888,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::MulInt32)));
         let getter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == getter_owner)
+            .last_entry_decision_for(getter_owner)
             .expect("P17b generated getter Function entry decision");
         assert_eq!(getter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_load_observations();
@@ -54262,9 +54222,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::LoadUndefined)));
         let setter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == setter_owner)
+            .last_entry_decision_for(setter_owner)
             .expect("P17b generated setter Function entry decision");
         assert_eq!(setter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_store_observations();
@@ -54320,9 +54278,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::LoadUndefined)));
         let trap_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == trap_owner)
+            .last_entry_decision_for(trap_owner)
             .expect("P17b generated proxy set Function entry decision");
         assert_eq!(trap_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_store_observations();
@@ -61998,8 +61954,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("generated entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -62054,8 +62009,7 @@ mod tests {
 
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(auto_records[0].owner)
             .expect("native baseline entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -62106,8 +62060,7 @@ mod tests {
 
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(auto_records[0].owner)
             .expect("generated baseline entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -62180,8 +62133,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("generated entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -62294,8 +62246,7 @@ mod tests {
             .expect("generated artifact for disabled-native owner");
         assert_eq!(
             vm.tiering_integration()
-                .entry_decisions()
-                .last()
+                .last_entry_decision_for(owner)
                 .expect("generated P6 semantic entry decision")
                 .decision,
             TierEntryDecision::EnterOptimized {
@@ -62304,8 +62255,7 @@ mod tests {
         );
         assert_eq!(
             vm.tiering_integration()
-                .entry_decisions()
-                .last()
+                .last_entry_decision_for(owner)
                 .and_then(|decision| decision.baseline_entry_gate.as_ref())
                 .and_then(|gate| gate.generated_artifact.clone()),
             Some(generated_artifact)
@@ -62506,8 +62456,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("ARM64 native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -63985,7 +63934,7 @@ mod tests {
             p6_semantic_install_side_effect_counts(&vm);
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let profile_count_before = vm.tiering_integration().profile_records().len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decision_count();
         let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
         let mut host = InterpreterDispatchMustNotRun;
 
@@ -64002,7 +63951,7 @@ mod tests {
             fallback_count_before
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions().len(),
+            vm.tiering_integration().entry_decision_count(),
             entry_decision_count_before + 1
         );
         let backedge_records = vm
@@ -64153,7 +64102,7 @@ mod tests {
             policy: vm.config.tiering_policy(),
         });
         let profile_count_before = vm.tiering_integration().profile_records().len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decision_count();
         let mut host = InterpreterDispatchMustNotRun;
 
         let handoff = match vm.execute_interpreter_code_block_in_current_region(
@@ -64194,11 +64143,10 @@ mod tests {
         );
         let handoff_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("LoopHint handoff entry decision");
         assert_eq!(
-            vm.tiering_integration().entry_decisions().len(),
+            vm.tiering_integration().entry_decision_count(),
             entry_decision_count_before + 1
         );
         assert_eq!(
@@ -64265,7 +64213,7 @@ mod tests {
             inline_cache_count: inline_cache_count(&code_block),
             policy: vm.config.tiering_policy(),
         });
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decision_count();
         let mut host = CoreOpcodeDispatchHost::new();
 
         let handoff = match vm.execute_interpreter_code_block_in_current_region(
@@ -64312,13 +64260,12 @@ mod tests {
             TierEntryExecutionPath::GeneratedCode(JitType::Baseline)
         );
         assert_eq!(
-            vm.tiering_integration().entry_decisions().len(),
+            vm.tiering_integration().entry_decision_count(),
             entry_decision_count_before + 1
         );
         let handoff_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("runtime-helper LoopHint handoff entry decision");
         assert_eq!(
             handoff_decision.bytecode_index,
@@ -64414,7 +64361,7 @@ mod tests {
             policy: vm.config.tiering_policy(),
         });
         let profile_count_before = vm.tiering_integration().profile_records().len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
+        let entry_decision_count_before = vm.tiering_integration().entry_decision_count();
         let fallback_count_before = vm.tiering_integration().fallback_records().len();
         let mut host = CoreOpcodeDispatchHost::new();
 
@@ -64450,7 +64397,7 @@ mod tests {
         }
         vm.execution.leave(entry).unwrap();
         assert_eq!(
-            vm.tiering_integration().entry_decisions().len(),
+            vm.tiering_integration().entry_decision_count(),
             entry_decision_count_before
         );
         assert_eq!(
@@ -65269,12 +65216,15 @@ mod tests {
             auto_record.native,
             BaselineEntryAutoNativeMaterializationOutcome::Installed
         );
-        let [entry_decision] = vm.tiering_integration().entry_decisions() else {
-            panic!(
-                "expected exactly one committed P15 entry decision, found {}",
-                vm.tiering_integration().entry_decisions().len()
-            );
-        };
+        assert_eq!(
+            vm.tiering_integration().entry_decision_count(),
+            1,
+            "expected exactly one committed P15 entry decision"
+        );
+        let entry_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(owner)
+            .expect("expected exactly one committed P15 entry decision, for `owner`");
 
         if vm.can_execute_p6_x86_64_emitted_native_entry() {
             assert_eq!(auto_record.generated, None);
@@ -65363,12 +65313,15 @@ mod tests {
             execute_registered_code_block_with_host(&mut vm, owner, &code_block, &mut host);
 
         assert_eq!(completion, expected);
-        let [entry_decision] = vm.tiering_integration().entry_decisions() else {
-            panic!(
-                "expected exactly one committed P15 entry decision, found {}",
-                vm.tiering_integration().entry_decisions().len()
-            );
-        };
+        assert_eq!(
+            vm.tiering_integration().entry_decision_count(),
+            1,
+            "expected exactly one committed P15 entry decision"
+        );
+        let entry_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(owner)
+            .expect("expected exactly one committed P15 entry decision, for `owner`");
         assert!(vm.tiering_integration().fallback_records().is_empty());
         assert_eq!(
             p6_semantic_install_side_effect_counts(&vm),
@@ -65452,9 +65405,7 @@ mod tests {
         );
         let callee_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .last_entry_decision_for(callee_owner)
             .expect("callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -65548,9 +65499,7 @@ mod tests {
         );
         let callee_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .last_entry_decision_for(callee_owner)
             .expect("callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -65649,9 +65598,7 @@ mod tests {
         );
         let construct_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == construct_owner)
+            .last_entry_decision_for(construct_owner)
             .expect("callee Construct entry decision");
         assert_eq!(construct_decision.entry_kind, ExecutionEntryKind::Construct);
         assert_eq!(
@@ -65698,19 +65645,13 @@ mod tests {
         );
         let call_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == call_owner)
+            .last_entry_decision_for(call_owner)
             .expect("callee Function entry decision");
         assert_eq!(call_decision.entry_kind, ExecutionEntryKind::Function);
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .all(|record| {
-                record.owner != construct_owner
-                    || record.entry_kind != ExecutionEntryKind::Construct
-            }));
+            .last_entry_decision_for(construct_owner)
+            .is_none_or(|record| record.entry_kind != ExecutionEntryKind::Construct));
     }
 
     #[test]
@@ -65775,8 +65716,7 @@ mod tests {
         );
         assert!(
             vm.tiering_integration()
-                .entry_decisions()
-                .iter()
+                .entry_decisions_by_owner()
                 .filter(|record| record.entry_kind == ExecutionEntryKind::Construct)
                 .count()
                 >= 1
@@ -65916,8 +65856,7 @@ mod tests {
             );
             assert!(
                 vm.tiering_integration()
-                    .entry_decisions()
-                    .iter()
+                    .entry_decisions_by_owner()
                     .all(|decision| decision.entry_kind != ExecutionEntryKind::Construct),
                 "{case:?} fallback must not enter through the VM Construct entry"
             );
@@ -65961,8 +65900,7 @@ mod tests {
         );
         assert!(
             vm.tiering_integration()
-                .entry_decisions()
-                .iter()
+                .entry_decisions_by_owner()
                 .all(|decision| decision.entry_kind != ExecutionEntryKind::Construct),
             "proxy construct fallback must not enter through the VM Construct entry"
         );
@@ -66011,8 +65949,7 @@ mod tests {
         );
         assert!(explicit
             .tiering_integration()
-            .entry_decisions()
-            .iter()
+            .entry_decisions_by_owner()
             .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
         assert_eq!(explicit.execution_context_stack().frame_depth(), 0);
         assert_eq!(explicit.execution_context_stack().entry_depth(), 0);
@@ -66033,8 +65970,7 @@ mod tests {
         );
         assert!(default_derived
             .tiering_integration()
-            .entry_decisions()
-            .iter()
+            .entry_decisions_by_owner()
             .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
         assert_eq!(default_derived.execution_context_stack().frame_depth(), 0);
         assert_eq!(default_derived.execution_context_stack().entry_depth(), 0);
@@ -66061,8 +65997,7 @@ mod tests {
         );
         assert!(
             vm.tiering_integration()
-                .entry_decisions()
-                .iter()
+                .entry_decisions_by_owner()
                 .filter(|record| record.entry_kind == ExecutionEntryKind::Construct)
                 .count()
                 >= 1
@@ -66093,8 +66028,7 @@ mod tests {
         );
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
+            .entry_decisions_by_owner()
             .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
         assert_eq!(vm.execution_context_stack().frame_depth(), 0);
         assert_eq!(vm.execution_context_stack().entry_depth(), 0);
@@ -66240,8 +66174,7 @@ mod tests {
         assert_eq!(vm.exception_state().pending(), Some(pending));
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
+            .entry_decisions_by_owner()
             .any(|record| record.entry_kind == ExecutionEntryKind::Construct));
         assert_eq!(vm.execution_context_stack().frame_depth(), 0);
         assert_eq!(vm.execution_context_stack().entry_depth(), 0);
@@ -66290,9 +66223,7 @@ mod tests {
         );
         let callee_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .last_entry_decision_for(callee_owner)
             .expect("P17 Function.prototype.call callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -66351,9 +66282,7 @@ mod tests {
         );
         let callee_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == callee_owner)
+            .last_entry_decision_for(callee_owner)
             .expect("P17 Reflect.apply callee Function entry decision");
         assert_eq!(callee_decision.entry_kind, ExecutionEntryKind::Function);
         assert_eq!(
@@ -66404,9 +66333,7 @@ mod tests {
         );
         let getter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == getter_owner)
+            .last_entry_decision_for(getter_owner)
             .expect("P17b Reflect.get getter Function entry decision");
         assert_eq!(getter_decision.entry_kind, ExecutionEntryKind::Function);
         assert!(!host
@@ -66450,9 +66377,7 @@ mod tests {
         );
         let setter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == setter_owner)
+            .last_entry_decision_for(setter_owner)
             .expect("P17b Reflect.set setter Function entry decision");
         assert_eq!(setter_decision.entry_kind, ExecutionEntryKind::Function);
         assert!(!host
@@ -66504,9 +66429,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::MulInt32)));
         let getter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == getter_owner)
+            .last_entry_decision_for(getter_owner)
             .expect("P17b proxy Reflect.get target getter Function entry decision");
         assert_eq!(getter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_load_observations();
@@ -66563,9 +66486,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::LoadUndefined)));
         let setter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == setter_owner)
+            .last_entry_decision_for(setter_owner)
             .expect("P17b proxy Reflect.set target setter Function entry decision");
         assert_eq!(setter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_store_observations();
@@ -66901,9 +66822,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::MulInt32)));
         let getter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == getter_owner)
+            .last_entry_decision_for(getter_owner)
             .expect("P17b no-trap proxy target getter Function entry decision");
         assert_eq!(getter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_load_observations();
@@ -66958,9 +66877,7 @@ mod tests {
             .any(|(_, _, opcode)| *opcode == Some(CoreOpcode::LoadUndefined)));
         let setter_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .find(|record| record.owner == setter_owner)
+            .last_entry_decision_for(setter_owner)
             .expect("P17b no-trap proxy target setter Function entry decision");
         assert_eq!(setter_decision.entry_kind, ExecutionEntryKind::Function);
         let observations = vm.tiering_integration().property_store_observations();
@@ -67016,9 +66933,8 @@ mod tests {
         assert_eq!(p6_semantic_install_side_effect_counts(&vm), counts_before);
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .all(|record| record.owner != getter_owner));
+            .last_entry_decision_for(getter_owner)
+            .is_none());
         assert!(host
             .dispatches
             .iter()
@@ -67065,9 +66981,8 @@ mod tests {
         assert_eq!(p6_semantic_install_side_effect_counts(&vm), counts_before);
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .all(|record| record.owner != setter_owner));
+            .last_entry_decision_for(setter_owner)
+            .is_none());
         assert!(host
             .dispatches
             .iter()
@@ -67107,9 +67022,8 @@ mod tests {
         assert_eq!(p6_semantic_install_side_effect_counts(&vm), counts_before);
         assert!(vm
             .tiering_integration()
-            .entry_decisions()
-            .iter()
-            .all(|record| record.owner != CodeBlockId(CellId(50_000))));
+            .last_entry_decision_for(CodeBlockId(CellId(50_000)))
+            .is_none());
         assert!(host
             .dispatches
             .iter()
@@ -67184,11 +67098,6 @@ mod tests {
             .baseline_generated_code_artifacts()
             .to_vec();
         let entry_artifact_count_before = vm.tiering_integration().baseline_entry_artifacts().len();
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
 
         let completion = execute_registered_code_block_with_host_and_arguments(
             &mut vm,
@@ -67204,9 +67113,7 @@ mod tests {
         );
         let supplemental_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == owner)
+            .baseline_entry_auto_materialization_for(owner)
             .expect("P15 supplemental owner-native materialization record");
         assert_eq!(
             supplemental_record.native,
@@ -67227,10 +67134,9 @@ mod tests {
             .baseline_entry_artifacts()
             .iter()
             .any(|artifact| artifact.owner == owner));
-        let entry_decision = vm.tiering_integration().entry_decisions()
-            [entry_decision_count_before..]
-            .iter()
-            .find(|decision| decision.owner == owner)
+        let entry_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(owner)
             .expect("supplemental generated owner entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -67280,14 +67186,9 @@ mod tests {
             .baseline_generated_code_artifacts()
             .to_vec();
         let entry_artifact_count_before = vm.tiering_integration().baseline_entry_artifacts().len();
-        let auto_count_before = vm
-            .tiering_integration()
-            .baseline_entry_auto_materializations()
-            .len();
         let lowering_failure_count_before = vm
             .tiering_integration()
             .baseline_native_lowering_failure_count();
-        let entry_decision_count_before = vm.tiering_integration().entry_decisions().len();
 
         let completion = execute_registered_code_block_with_host_and_arguments(
             &mut vm,
@@ -67303,9 +67204,7 @@ mod tests {
         );
         let supplemental_record = vm
             .tiering_integration()
-            .baseline_entry_auto_materializations()[auto_count_before..]
-            .iter()
-            .find(|record| record.owner == owner)
+            .baseline_entry_auto_materialization_for(owner)
             .expect("P15 supplemental owner-native bitand materialization record");
         assert_eq!(
             supplemental_record.native,
@@ -67337,10 +67236,9 @@ mod tests {
                 .baseline_generated_code_artifact_for(owner),
             Some(generated_artifact)
         );
-        let entry_decision = vm.tiering_integration().entry_decisions()
-            [entry_decision_count_before..]
-            .iter()
-            .find(|decision| decision.owner == owner)
+        let entry_decision = vm
+            .tiering_integration()
+            .last_entry_decision_for(owner)
             .expect("supplemental bitand generated owner entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -67583,10 +67481,6 @@ mod tests {
             };
             let owner = register_test_code_block(&mut vm, code_block.clone());
             install_typed_baseline_for_test(&mut vm, owner, 2_308 + case_index as u64);
-            let auto_count_before = vm
-                .tiering_integration()
-                .baseline_entry_auto_materializations()
-                .len();
 
             let (first_completion, _) =
                 execute_registered_code_block_with_boundary_snapshot_and_arguments(
@@ -67604,9 +67498,7 @@ mod tests {
             );
             let supplemental_record = vm
                 .tiering_integration()
-                .baseline_entry_auto_materializations()[auto_count_before..]
-                .iter()
-                .find(|record| record.owner == owner)
+                .baseline_entry_auto_materialization_for(owner)
                 .expect("P15 supplemental generated-origin owner native record");
             assert_eq!(
                 supplemental_record.native,
@@ -67748,8 +67640,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P15 reused native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -67805,12 +67696,11 @@ mod tests {
             vm.entry_state().launch_descriptors().len(),
             launch_descriptor_count_before
         );
-        assert_eq!(vm.tiering_integration().entry_decisions().len(), 1);
+        assert_eq!(vm.tiering_integration().entry_decision_count(), 1);
         assert_eq!(vm.tiering_integration().fallback_records().len(), 1);
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P15 unsupported entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -67852,7 +67742,10 @@ mod tests {
         assert_eq!(p6_semantic_install_side_effect_counts(&vm), counts_before);
         assert!(vm.tiering_integration().fallback_records().is_empty());
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[0].decision,
+            vm.tiering_integration()
+                .last_entry_decision_for(owner)
+                .unwrap()
+                .decision,
             TierEntryDecision::Interpret {
                 reason: TierEntryInterpretReason::PolicyRequiresInterpreter
             }
@@ -67894,10 +67787,13 @@ mod tests {
             vm.entry_state().launch_descriptors().len(),
             launch_descriptor_count_before
         );
-        assert_eq!(vm.tiering_integration().entry_decisions().len(), 1);
+        assert_eq!(vm.tiering_integration().entry_decision_count(), 1);
         assert_eq!(vm.tiering_integration().fallback_records().len(), 1);
         assert_eq!(
-            vm.tiering_integration().entry_decisions()[0].decision,
+            vm.tiering_integration()
+                .last_entry_decision_for(owner)
+                .unwrap()
+                .decision,
             TierEntryDecision::FallbackToInterpreter {
                 attempted_tier: JitType::Baseline,
                 reason: TierEntryFallbackReason::Tier(TierFallbackReason::UnsupportedTier),
@@ -67949,8 +67845,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P6 callable native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -70336,8 +70231,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("P6 callable side-exit decision");
         assert_eq!(
             entry_decision.decision,
@@ -70503,8 +70397,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("stale P6 callable native entry decision");
         assert_eq!(
             entry_decision
@@ -70623,8 +70516,7 @@ mod tests {
         );
         assert_eq!(
             vm.tiering_integration()
-                .entry_decisions()
-                .last()
+                .last_entry_decision_for(owner)
                 .expect("descriptor-only native entry decision")
                 .decision,
             TierEntryDecision::EnterNative {
@@ -70743,8 +70635,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("entry decision after install");
         assert_eq!(
             entry_decision
@@ -70864,8 +70755,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -70955,8 +70845,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("platform-backed native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -71029,8 +70918,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("stale native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -71138,8 +71026,7 @@ mod tests {
         );
         let entry_decision = vm
             .tiering_integration()
-            .entry_decisions()
-            .last()
+            .last_entry_decision_for(owner)
             .expect("stale disabled native entry decision");
         assert_eq!(
             entry_decision.decision,
@@ -71245,8 +71132,7 @@ mod tests {
         );
         assert_eq!(
             vm.tiering_integration()
-                .entry_decisions()
-                .last()
+                .last_entry_decision_for(owner)
                 .expect("native fallback entry decision")
                 .execution_path,
             TierEntryExecutionPath::NativeCode(JitType::Baseline)
@@ -73131,18 +73017,31 @@ mod tests {
             .tiering_integration()
             .fallback_records()
             .is_empty());
+        let interpreter_owner = interpreter_vm.tiering_integration().diagnostics()[0].owner;
         assert_eq!(
-            interpreter_vm.tiering_integration().entry_decisions()[0].decision,
+            interpreter_vm
+                .tiering_integration()
+                .last_entry_decision_for(interpreter_owner)
+                .unwrap()
+                .decision,
             TierEntryDecision::Interpret {
                 reason: TierEntryInterpretReason::PolicyRequiresInterpreter
             }
         );
         assert_eq!(
-            interpreter_vm.tiering_integration().entry_decisions()[0].execution_path,
+            interpreter_vm
+                .tiering_integration()
+                .last_entry_decision_for(interpreter_owner)
+                .unwrap()
+                .execution_path,
             TierEntryExecutionPath::Interpreter
         );
 
-        let baseline_decision = &baseline_vm.tiering_integration().entry_decisions()[0];
+        let baseline_owner = baseline_vm.tiering_integration().diagnostics()[0].owner;
+        let baseline_decision = baseline_vm
+            .tiering_integration()
+            .last_entry_decision_for(baseline_owner)
+            .unwrap();
         assert_eq!(baseline_decision.requested_tier, Some(JitType::Baseline));
         if baseline_vm.can_execute_p6_x86_64_emitted_native_entry() {
             assert_eq!(
