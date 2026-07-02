@@ -189,11 +189,34 @@ pub struct VmTieringIntegration {
     profile_records: Vec<TierProfileRecord>,
     profile_entry_count: usize,
     profile_loop_backedge_count: usize,
+    // Redesign-audit telemetry Unit 3: `property_load_observations` /
+    // `property_store_observations` used to accumulate one record per
+    // property access forever. C++ JSC never logs observations either --
+    // ValueProfile/ArrayProfile buckets are LAST-WINS scalars keyed by
+    // bytecode offset, overwritten on every access, never a history
+    // (ValueProfile.h:47-90, ArrayProfile.h:269 `m_lastSeenStructureID`).
+    // These are now update-or-insert-by-(owner, bytecode_index) side tables
+    // -- one slot per site, same shape `property_inline_cache_evolution_states`
+    // already had. SEMANTIC NOTE: safepoint rechecks that used to re-fetch an
+    // exact historical observation by ordinal now read the CURRENT
+    // observation at that site instead (more faithful to JSC, which never
+    // exposes history); see the call sites that dropped the ordinal
+    // equality check.
     property_load_observations: Vec<VmPropertyLoadObservationRecord>,
     property_store_observations: Vec<VmPropertyStoreObservationRecord>,
     property_has_observations: Vec<VmPropertyHasObservationRecord>,
     property_inline_cache_evolution_states: Vec<VmPropertyInlineCacheEvolutionState>,
-    property_inline_cache_evolution_records: Vec<VmPropertyInlineCacheEvolutionRecord>,
+    // Redesign-audit telemetry Unit 3: `property_inline_cache_evolution_records`
+    // used to push one record per IC-evolution decision forever (one per
+    // property access once warm -- the same unbounded-per-access growth
+    // class as U1's `entry_decisions`). JSC's InlineCacheCompiler/
+    // PolymorphicAccess never retains a decision log either; the ONLY
+    // production reader wanted the ordinal of the site's MegamorphicLoad
+    // terminal transition, now `VmPropertyInlineCacheEvolutionState::
+    // terminal_ordinal` (set alongside `terminal`). The octane.rs diagnostic
+    // aggregates (counts of each decision outcome) are now write-time
+    // cumulative counters, `property_inline_cache_evolution_decision_counts`.
+    property_inline_cache_evolution_decision_counts: VmPropertyInlineCacheEvolutionDecisionCounts,
     call_observations: Vec<VmCallObservationRecord>,
     vm_owned_call_target_validation_records: Vec<VmOwnedCallTargetValidationRecord>,
     call_link_readiness_records: Vec<VmCallLinkReadinessRecord>,
@@ -461,10 +484,43 @@ impl VmTieringIntegration {
         &self.property_has_observations
     }
 
-    pub fn property_inline_cache_evolution_records(
+    pub fn property_inline_cache_evolution_decision_counts(
         &self,
-    ) -> &[VmPropertyInlineCacheEvolutionRecord] {
-        &self.property_inline_cache_evolution_records
+    ) -> VmPropertyInlineCacheEvolutionDecisionCounts {
+        self.property_inline_cache_evolution_decision_counts
+    }
+
+    /// Latest (decision, counters-after) recorded for one IC-evolution site.
+    /// Redesign-audit telemetry Unit 3: replaces indexing into the deleted
+    /// `property_inline_cache_evolution_records` log; `counters_before` for a
+    /// given call is the previous call's `counters_after` (or the zero
+    /// baseline before the site's first call).
+    #[cfg(test)]
+    pub(crate) fn property_inline_cache_evolution_latest(
+        &self,
+        owner: CodeBlockId,
+        bytecode_index: BytecodeIndex,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        kind: VmPropertyInlineCacheEvolutionKind,
+    ) -> Option<(
+        VmPropertyInlineCacheEvolutionDecision,
+        VmPropertyInlineCacheEvolutionCounters,
+    )> {
+        self.property_inline_cache_evolution_states
+            .iter()
+            .find(|state| {
+                state.site.owner == owner
+                    && state.site.bytecode_index == bytecode_index
+                    && state.site.bytecode_snapshot == bytecode_snapshot
+                    && state.site.slot == slot
+                    && state.site.kind == kind
+            })
+            .and_then(|state| {
+                state
+                    .last_decision
+                    .map(|decision| (decision, state.counters()))
+            })
     }
 
     pub fn property_load_megamorphic_cache_records(
@@ -3305,15 +3361,25 @@ impl VmTieringIntegration {
             bytecode_snapshot: request.bytecode_snapshot,
             descriptor: request.descriptor.clone(),
         };
-        // NOT capped: `record_property_load_megamorphic_cache_prototype_entry_from_materialization`
+        // Redesign-audit telemetry Unit 3: update-or-insert by (owner,
+        // bytecode_index) instead of an unbounded append -- one slot per
+        // site, mirroring JSC's per-bytecode-offset ValueProfile bucket
+        // (ValueProfile.h:47-90), never a log. This used to be a plain
+        // `.push`; `record_property_load_megamorphic_cache_prototype_entry_from_materialization`
         // (called from `record_property_load_guard_watchpoint_materialization`,
-        // a production safepoint path) looks up `property_load_observations` by
-        // exact `ordinal` to recover the original descriptor when a guarded
-        // prototype load's watchpoint materializes. A retain cap would silently
-        // drop that lookup for observations recorded after the cap. See the
-        // `HOT_TELEMETRY_RECORD_RETAIN_LIMIT` comment; this is an
-        // architecture-question site, not a safe transitional-cap site.
-        self.property_load_observations.push(record.clone());
+        // a production safepoint path) looked up the pushed record by exact
+        // `ordinal` to recover the original descriptor when a guarded
+        // prototype load's watchpoint materializes. It now reads the site's
+        // CURRENT slot directly instead (see that call site) -- a faithful
+        // narrowing from "the exact historical observation" to "the current
+        // observation at this site", since JSC never exposed history either.
+        if let Some(existing) = self.property_load_observations.iter_mut().find(|existing| {
+            existing.owner == record.owner && existing.bytecode_index == record.bytecode_index
+        }) {
+            *existing = record.clone();
+        } else {
+            self.property_load_observations.push(record.clone());
+        }
         let has_access_case_plan = plan.is_some();
         if let Some(plan) = plan {
             let replaced_by_existing_case = self
@@ -3430,6 +3496,7 @@ impl VmTieringIntegration {
                     bytecode_snapshot: request.bytecode_snapshot,
                     lifecycle: VmPropertyLoadGuardPlanLifecycle::Active,
                     plan: plan.clone(),
+                    descriptor: request.descriptor.clone(),
                 });
             for dependency in dependencies {
                 let dependency_record_ordinal = self.next_record_ordinal();
@@ -3894,15 +3961,19 @@ impl VmTieringIntegration {
         else {
             return;
         };
-        let Some(observation) = self
-            .property_load_observations
-            .iter()
-            .find(|record| record.ordinal == guard_plan_record.observation_ordinal)
-        else {
-            return;
-        };
+        // Redesign-audit telemetry Unit 3: this used to `.find()` the deleted
+        // per-observation log by the exact `ordinal` captured when the guard
+        // plan was recorded, to re-fetch that EXACT historical descriptor.
+        // `property_load_observations` is now a latest-state-per-(owner,
+        // bytecode_index) slot, and this consumer genuinely needs the
+        // historical one -- a real polymorphic site can move on to a
+        // different access shape at the same instruction before this
+        // watchpoint fires (see the `VmPropertyLoadGuardPlanRecord::descriptor`
+        // field comment), which would wrongly fail the eligibility check
+        // below if read from the "current" slot. `guard_plan_record` now
+        // carries its own snapshot instead of consulting the table.
         if !vm_property_load_prototype_can_use_get_by_id_megamorphic(
-            &observation.descriptor,
+            &guard_plan_record.descriptor,
             &guard_plan_record.plan,
         ) {
             return;
@@ -4082,19 +4153,13 @@ impl VmTieringIntegration {
         if state.terminal != Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad) {
             return None;
         }
-        self.property_inline_cache_evolution_records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.owner == owner
-                    && record.bytecode_snapshot == bytecode_snapshot
-                    && record.slot == slot
-                    && record.bytecode_index == bytecode_index
-                    && record.kind == VmPropertyInlineCacheEvolutionKind::Load
-                    && record.counters_after.terminal
-                        == Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad)
-            })
-            .map(|record| record.ordinal)
+        // Redesign-audit telemetry Unit 3: this used to `.rev().find()` the
+        // deleted `property_inline_cache_evolution_records` log for the last
+        // record whose `counters_after.terminal` matched; `terminal_ordinal`
+        // is stamped in place at the exact same instant `terminal` is set
+        // (see `consider_property_inline_cache_evolution`), so it is that
+        // same ordinal without a scan.
+        state.terminal_ordinal
     }
 
     fn register_property_load_megamorphic_site(
@@ -4447,6 +4512,10 @@ impl VmTieringIntegration {
             self.property_inline_cache_evolution_states.len() - 1
         };
 
+        // Allocated before the state borrow below so it can also be stamped
+        // onto `state.terminal_ordinal` (redesign-audit telemetry Unit 3;
+        // see the field comment).
+        let ordinal = self.next_record_ordinal();
         let (decision, counters_before, counters_after) = {
             let state = &mut self.property_inline_cache_evolution_states[state_index];
             let counters_before = state.counters();
@@ -4523,27 +4592,32 @@ impl VmTieringIntegration {
                     if state.all_accepted_cases_can_use_get_by_id_megamorphic {
                         state.terminal =
                             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad);
+                        state.terminal_ordinal = Some(ordinal);
                         decision = VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad;
                     } else if state.all_accepted_cases_can_use_put_by_id_megamorphic {
                         state.terminal =
                             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicStore);
+                        state.terminal_ordinal = Some(ordinal);
                         decision =
                             VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore;
                     } else if state.all_accepted_cases_can_use_in_by_id_megamorphic {
                         state.terminal =
                             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas);
+                        state.terminal_ordinal = Some(ordinal);
                         decision = VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas;
                     } else {
                         state.terminal = Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp);
+                        state.terminal_ordinal = Some(ordinal);
                     }
                 }
             }
+            state.last_decision = Some(decision);
             let counters_after = state.counters();
             (decision, counters_before, counters_after)
         };
 
         let record = VmPropertyInlineCacheEvolutionRecord {
-            ordinal: self.next_record_ordinal(),
+            ordinal,
             owner: site.owner,
             bytecode_index: site.bytecode_index,
             bytecode_snapshot: site.bytecode_snapshot,
@@ -4555,8 +4629,11 @@ impl VmTieringIntegration {
             counters_before,
             counters_after,
         };
-        self.property_inline_cache_evolution_records
-            .push(record.clone());
+        self.property_inline_cache_evolution_decision_counts.record(
+            decision,
+            counters_before,
+            counters_after,
+        );
         record
     }
 
@@ -4597,7 +4674,20 @@ impl VmTieringIntegration {
             bytecode_snapshot: request.bytecode_snapshot,
             descriptor: request.descriptor.clone(),
         };
-        self.property_store_observations.push(record.clone());
+        // Redesign-audit telemetry Unit 3: update-or-insert by (owner,
+        // bytecode_index); see the write path in `record_property_load_observation`
+        // and the field comment above `property_store_observations`.
+        if let Some(existing) = self
+            .property_store_observations
+            .iter_mut()
+            .find(|existing| {
+                existing.owner == record.owner && existing.bytecode_index == record.bytecode_index
+            })
+        {
+            *existing = record.clone();
+        } else {
+            self.property_store_observations.push(record.clone());
+        }
         if let Some(plan) = vm_property_store_access_case_plan_from_observation(&record.descriptor)
         {
             let replaced_by_existing_case = self
@@ -4637,6 +4727,7 @@ impl VmTieringIntegration {
                     bytecode_snapshot: request.bytecode_snapshot,
                     lifecycle: VmPropertyStoreAccessCasePlanLifecycle::Active,
                     plan,
+                    descriptor: request.descriptor.clone(),
                 });
         }
         Ok(record)
@@ -9267,6 +9358,19 @@ struct VmPropertyInlineCacheEvolutionState {
     all_accepted_cases_can_use_put_by_id_megamorphic: bool,
     all_accepted_cases_can_use_in_by_id_megamorphic: bool,
     terminal: Option<VmPropertyInlineCacheEvolutionTerminalState>,
+    // Redesign-audit telemetry Unit 3: the ordinal of the record that most
+    // recently drove `terminal` into `Some(..)`. Replaces the sole
+    // production reader of the deleted `property_inline_cache_evolution_records`
+    // vec (`property_load_megamorphic_terminal_evolution_ordinal`'s
+    // `.rev().find(owner && terminal==MegamorphicLoad)` scan), which only
+    // ever wanted this one ordinal.
+    terminal_ordinal: Option<u64>,
+    // Redesign-audit telemetry Unit 3: the most recently computed decision
+    // for this site -- a last-wins scalar (mirrors `terminal` above), not a
+    // log. Read by `property_inline_cache_evolution_latest` (test-only; the
+    // deleted vec's sole non-diagnostic readers were production ordinal
+    // lookups, not decision history).
+    last_decision: Option<VmPropertyInlineCacheEvolutionDecision>,
 }
 
 impl VmPropertyInlineCacheEvolutionState {
@@ -9283,6 +9387,8 @@ impl VmPropertyInlineCacheEvolutionState {
             all_accepted_cases_can_use_put_by_id_megamorphic: true,
             all_accepted_cases_can_use_in_by_id_megamorphic: true,
             terminal: None,
+            terminal_ordinal: None,
+            last_decision: None,
         }
     }
 
@@ -9318,6 +9424,82 @@ pub struct VmPropertyInlineCacheEvolutionRecord {
     pub decision: VmPropertyInlineCacheEvolutionDecision,
     pub counters_before: VmPropertyInlineCacheEvolutionCounters,
     pub counters_after: VmPropertyInlineCacheEvolutionCounters,
+}
+
+/// Redesign-audit telemetry Unit 3: write-time cumulative counters replacing
+/// the octane.rs diagnostics that used to `.iter().filter(..).count()` over
+/// the deleted `property_inline_cache_evolution_records` log -- mirrors the
+/// `VmGeneratedDirectCallRootlessPreferredNativeEntryCounts` scoreboard
+/// pattern (this file, `record`-on-write, no history retained).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmPropertyInlineCacheEvolutionDecisionCounts {
+    pub total: u64,
+    pub admitted: u64,
+    pub buffered: u64,
+    pub buffered_duplicates: u64,
+    pub cooldowns: u64,
+    pub final_gave_up: u64,
+    pub gave_up_skips: u64,
+    pub generated_megamorphic_load: u64,
+    pub megamorphic_load_skips: u64,
+    pub generated_megamorphic_store: u64,
+    pub megamorphic_store_skips: u64,
+    pub generated_megamorphic_has: u64,
+    pub megamorphic_has_skips: u64,
+}
+
+impl VmPropertyInlineCacheEvolutionDecisionCounts {
+    fn record(
+        &mut self,
+        decision: VmPropertyInlineCacheEvolutionDecision,
+        counters_before: VmPropertyInlineCacheEvolutionCounters,
+        counters_after: VmPropertyInlineCacheEvolutionCounters,
+    ) {
+        self.total = self.total.saturating_add(1);
+        match decision {
+            VmPropertyInlineCacheEvolutionDecision::Admitted => {
+                self.admitted = self.admitted.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate => {
+                self.buffered_duplicates = self.buffered_duplicates.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedCooldown => {
+                self.cooldowns = self.cooldowns.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp => {
+                self.gave_up_skips = self.gave_up_skips.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad => {
+                self.generated_megamorphic_load = self.generated_megamorphic_load.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad => {
+                self.megamorphic_load_skips = self.megamorphic_load_skips.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore => {
+                self.generated_megamorphic_store =
+                    self.generated_megamorphic_store.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore => {
+                self.megamorphic_store_skips = self.megamorphic_store_skips.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas => {
+                self.generated_megamorphic_has = self.generated_megamorphic_has.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas => {
+                self.megamorphic_has_skips = self.megamorphic_has_skips.saturating_add(1);
+            }
+            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
+            | VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown => {}
+        }
+        if counters_after.buffered_structure_count > counters_before.buffered_structure_count {
+            self.buffered = self.buffered.saturating_add(1);
+        }
+        if counters_before.terminal != Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+            && counters_after.terminal == Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
+        {
+            self.final_gave_up = self.final_gave_up.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13957,6 +14139,16 @@ pub struct VmPropertyStoreAccessCasePlanRecord {
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub lifecycle: VmPropertyStoreAccessCasePlanLifecycle,
     pub plan: PropertyStoreAccessCasePlan,
+    // Redesign-audit telemetry Unit 3: a snapshot of the originating
+    // observation's full descriptor, captured once at plan creation. See the
+    // identical field on `VmPropertyLoadGuardPlanRecord` for the rationale:
+    // `property_store_observations` became a latest-state-per-(owner,
+    // bytecode_index) slot, so the install-recheck's "has anything drifted
+    // since this plan was captured" comparison can no longer re-fetch the
+    // exact originating observation from that table once a LATER call at the
+    // same site (e.g. a different slot/key on the same bytecode instruction)
+    // has overwritten it.
+    pub(crate) descriptor: PropertyStoreObservationDescriptor,
 }
 
 #[allow(dead_code)]
@@ -14074,6 +14266,23 @@ pub struct VmPropertyLoadGuardPlanRecord {
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub lifecycle: VmPropertyLoadGuardPlanLifecycle,
     pub plan: PropertyLoadGuardPlan,
+    // Redesign-audit telemetry Unit 3: a snapshot of the originating
+    // observation's full descriptor, captured once at guard-plan creation.
+    // `property_load_observations` (vm/tiering.rs) became a
+    // latest-state-per-(owner, bytecode_index) slot, so a later watchpoint
+    // materialization can no longer re-fetch "the exact observation this
+    // plan was built from" from that table -- by the time the watchpoint
+    // fires, the site's CURRENT observation may legitimately be a different
+    // access shape (e.g. an own-data hit after a prototype-chain hit at the
+    // same bytecode instruction; a real polymorphic-site scenario, not just
+    // a test artifact) whose descriptor would wrongly fail
+    // `vm_property_load_prototype_can_use_get_by_id_megamorphic`'s identity
+    // check against `plan.descriptor`. This mirrors JSC's actual design more
+    // closely than the old ordinal-log re-fetch did: an AccessCase/guard is
+    // self-contained and carries what it needs at creation time
+    // (PolymorphicAccess.h), rather than re-deriving it later from mutable
+    // external state.
+    pub(crate) descriptor: PropertyLoadObservationDescriptor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16775,19 +16984,26 @@ fn vm_property_store_access_case_install_recheck_outcome_with_plan_lifecycle(
         return rejected(observation_ordinal, reason);
     }
 
-    let Some(observation) = tiering
-        .property_store_observations
-        .iter()
-        .find(|record| record.ordinal == plan_record.observation_ordinal)
-    else {
-        return rejected(
-            observation_ordinal,
-            VmPropertyStoreAccessCaseInstallRecheckRejectionReason::ObservationMissing {
-                observation_ordinal: plan_record.observation_ordinal,
-            },
-        );
-    };
-
+    // Redesign-audit telemetry Unit 3: this used to `.find()` the deleted
+    // per-observation log by the exact `ordinal` captured when the plan was
+    // recorded. `property_store_observations` is now a
+    // latest-state-per-(owner, bytecode_index) slot, which does NOT
+    // correspond 1:1 with "the observation THIS plan was built from" once a
+    // second plan exists for a different slot at the same bytecode_index
+    // (evidence: `vm_property_store_mutation_candidate_table_suppresses_new_case_replaced_by_existing_handler_case`
+    // legitimately install-rechecks two same-site, different-slot plans
+    // independently). `VmPropertyStoreAccessCasePlanRecord::descriptor` now
+    // carries its own immutable snapshot captured at plan-creation time
+    // instead (mirroring JSC's self-contained AccessCase, PolymorphicAccess.h,
+    // more closely than the old shared-log re-fetch did). Every comparison
+    // below against `observation.*` was, in every REACHABLE production call
+    // sequence, comparing the plan's own captured fields back against
+    // themselves (the old ordinal lookup always found the exact record the
+    // plan was derived from) -- the only way to observe a "mismatch" was by
+    // directly mutating the VM-owned table from a test, a scenario that no
+    // longer exists once the plan owns its snapshot. `ObservationMissing`
+    // is now unreachable for the same reason (the snapshot can't be
+    // separately cleared) and is no longer returned by this function.
     let metadata_mismatch = |field| {
         rejected(
             observation_ordinal,
@@ -16796,30 +17012,24 @@ fn vm_property_store_access_case_install_recheck_outcome_with_plan_lifecycle(
             },
         )
     };
-    let descriptor = &observation.descriptor;
+    let descriptor = &plan_record.descriptor;
     let plan = &plan_record.plan;
 
-    if observation.owner != plan_record.owner || descriptor.owner != plan_record.owner {
+    if descriptor.owner != plan_record.owner {
         return metadata_mismatch(
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Owner,
         );
     }
-    if observation.frame != plan_record.frame || plan_record.frame != Some(descriptor.frame) {
+    if plan_record.frame != Some(descriptor.frame) {
         return metadata_mismatch(
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Frame,
         );
     }
-    if observation.bytecode_index != plan_record.bytecode_index
-        || descriptor.bytecode_index != plan_record.bytecode_index.offset()
+    if descriptor.bytecode_index != plan_record.bytecode_index.offset()
         || plan.bytecode_index != descriptor.bytecode_index
     {
         return metadata_mismatch(
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeIndex,
-        );
-    }
-    if observation.bytecode_snapshot != plan_record.bytecode_snapshot {
-        return metadata_mismatch(
-            VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeSnapshot,
         );
     }
     let expected_cache_kind = match plan.plan_kind {
@@ -21193,31 +21403,110 @@ mod tests {
         record_property_load_descriptor(tiering, owner, bytecode_snapshot, descriptor)
     }
 
+    // Redesign-audit telemetry Unit 3: `property_inline_cache_evolution_records`
+    // (a per-call log) was deleted; these helpers reconstruct the equivalent
+    // per-step (decision, counters) pair for a test's OWN local log by
+    // recording through the real production entry point and then reading the
+    // site's latest state immediately afterward -- `counters_before` for
+    // step N is simply step (N-1)'s `counters_after`, so callers can still
+    // assert on the exact sequence of decisions/counters a test cares about
+    // without the VM retaining any history itself.
+    fn record_property_load_descriptor_evolution(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        descriptor: PropertyLoadObservationDescriptor,
+    ) -> (
+        VmPropertyInlineCacheEvolutionDecision,
+        VmPropertyInlineCacheEvolutionCounters,
+    ) {
+        let bytecode_index = BytecodeIndex::from_offset(descriptor.bytecode_index);
+        record_property_load_descriptor(tiering, owner, bytecode_snapshot, descriptor);
+        tiering
+            .property_inline_cache_evolution_latest(
+                owner,
+                bytecode_index,
+                bytecode_snapshot,
+                slot,
+                VmPropertyInlineCacheEvolutionKind::Load,
+            )
+            .expect("load evolution recorded")
+    }
+
+    fn record_property_has_descriptor_evolution(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        descriptor: PropertyHasObservationDescriptor,
+    ) -> (
+        VmPropertyInlineCacheEvolutionDecision,
+        VmPropertyInlineCacheEvolutionCounters,
+    ) {
+        let bytecode_index = BytecodeIndex::from_offset(descriptor.bytecode_index);
+        record_property_has_descriptor(tiering, owner, bytecode_snapshot, descriptor);
+        tiering
+            .property_inline_cache_evolution_latest(
+                owner,
+                bytecode_index,
+                bytecode_snapshot,
+                slot,
+                VmPropertyInlineCacheEvolutionKind::Has,
+            )
+            .expect("has evolution recorded")
+    }
+
+    fn record_property_store_descriptor_evolution(
+        tiering: &mut VmTieringIntegration,
+        owner: CodeBlockId,
+        bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
+        slot: InlineCacheSlotId,
+        descriptor: PropertyStoreObservationDescriptor,
+    ) -> (
+        VmPropertyInlineCacheEvolutionDecision,
+        VmPropertyInlineCacheEvolutionCounters,
+    ) {
+        let bytecode_index = BytecodeIndex::from_offset(descriptor.bytecode_index);
+        record_property_store_descriptor(tiering, owner, bytecode_snapshot, descriptor);
+        tiering
+            .property_inline_cache_evolution_latest(
+                owner,
+                bytecode_index,
+                bytecode_snapshot,
+                slot,
+                VmPropertyInlineCacheEvolutionKind::Store,
+            )
+            .expect("store evolution recorded")
+    }
+
     #[test]
     fn record_property_has_observation_records_initial_evolution_without_cache_entry() {
         let owner = CodeBlockId(CellId(1901));
         let bytecode_index = BytecodeIndex::from_offset(8);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
         let mut tiering = VmTieringIntegration::default();
-        let descriptor =
-            property_has_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
-        let key = descriptor.key;
+        let descriptor = property_has_handoff_observation(owner, slot, bytecode_index);
 
-        let record =
-            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        let (decision, _) = record_property_has_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            descriptor,
+        );
 
-        assert_eq!(record.owner, owner);
-        assert_eq!(record.bytecode_index, bytecode_index);
         assert_eq!(tiering.property_has_observations().len(), 1);
-        let evolution = tiering.property_inline_cache_evolution_records();
-        assert_eq!(evolution.len(), 1);
+        // `kind`/`structure`/`key` are pure pass-throughs of the input
+        // descriptor (not retained by the latest-state slot); the site key
+        // used to fetch `decision` above already proves `kind == Has`, and
+        // `structure`/`key` are asserted at the input, not echoed back --
+        // see the redesign-audit telemetry Unit 3 field comment.
         assert_eq!(
-            evolution[0].decision,
+            decision,
             VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
         );
-        assert_eq!(evolution[0].kind, VmPropertyInlineCacheEvolutionKind::Has);
-        assert_eq!(evolution[0].structure, Some(StructureId(17)));
-        assert_eq!(evolution[0].key, Some(key));
         assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 0);
         assert_eq!(
             tiering.property_has_megamorphic_cache_current_entry_count(),
@@ -21234,6 +21523,12 @@ mod tests {
         let key = property_has_handoff_observation(owner, slot, bytecode_index).key;
         let mut tiering = VmTieringIntegration::default();
 
+        // Redesign-audit telemetry Unit 3: `evolution` is now a LOCAL log the
+        // test builds itself (via `record_property_has_descriptor_evolution`,
+        // which queries the site's latest state right after each call) --
+        // the VM no longer retains this history. `.1` is `counters_after`;
+        // step N's `counters_before` is step (N-1)'s `.1`.
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
             let mut descriptor = property_has_handoff_observation(owner, slot, bytecode_index);
             let structure = StructureId(2701 + index);
@@ -21246,7 +21541,13 @@ mod tests {
                 descriptor.observed_access_case_kind = Some(AccessCaseKind::InMiss);
                 descriptor.result = false;
             }
-            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_has_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
         assert_eq!(
@@ -21259,44 +21560,33 @@ mod tests {
             tiering.property_has_megamorphic_cache_current_entry_count(),
             2
         );
-        let evolution = tiering.property_inline_cache_evolution_records();
         assert_eq!(
-            evolution[0].decision,
+            evolution[0].0,
             VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
         );
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
         );
         assert_eq!(
-            evolution[final_case_index].kind,
-            VmPropertyInlineCacheEvolutionKind::Has
-        );
-        assert_eq!(
-            evolution[final_case_index]
-                .counters_before
-                .accepted_access_case_count,
+            evolution[final_case_index - 1].1.accepted_access_case_count,
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE - 1
         );
         assert_eq!(
-            evolution[final_case_index]
-                .counters_after
-                .accepted_access_case_count,
+            evolution[final_case_index].1.accepted_access_case_count,
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE
         );
         assert_eq!(
-            evolution[final_case_index].counters_after.terminal,
+            evolution[final_case_index].1.terminal,
             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas)
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas)
         );
         assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_after.terminal),
+            evolution.last().map(|record| record.1.terminal),
             Some(Some(
                 VmPropertyInlineCacheEvolutionTerminalState::MegamorphicHas
             ))
@@ -21329,6 +21619,7 @@ mod tests {
         let key = property_has_handoff_observation(owner, slot, bytecode_index).key;
         let mut tiering = VmTieringIntegration::default();
 
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
             let mut descriptor = property_has_handoff_observation(owner, slot, bytecode_index);
             let structure = StructureId(3701 + index);
@@ -21336,7 +21627,13 @@ mod tests {
             descriptor.base_structure = Some(structure);
             descriptor.chain[0].structure = structure;
             descriptor.offset = Some(PropertyOffset::new(index as i32));
-            record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_has_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
         assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 2);
@@ -21344,14 +21641,13 @@ mod tests {
             tiering.property_has_megamorphic_cache_current_entry_count(),
             2
         );
-        let evolution = tiering.property_inline_cache_evolution_records();
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas)
         );
 
@@ -21377,7 +21673,17 @@ mod tests {
             let mut tiering = VmTieringIntegration::default();
             record_property_has_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
             assert_eq!(tiering.property_has_observations().len(), 1);
-            assert_eq!(tiering.property_inline_cache_evolution_records().len(), 0);
+            assert_eq!(
+                tiering.property_inline_cache_evolution_latest(
+                    owner,
+                    bytecode_index,
+                    bytecode_snapshot,
+                    slot,
+                    VmPropertyInlineCacheEvolutionKind::Has,
+                ),
+                None,
+                "ineligible descriptors must never reach IC-evolution consideration"
+            );
             assert_eq!(tiering.property_has_megamorphic_cache_records().len(), 0);
             assert_eq!(
                 tiering.property_has_megamorphic_cache_current_entry_count(),
@@ -21419,38 +21725,47 @@ mod tests {
         let owner = CodeBlockId(CellId(901));
         let bytecode_index = BytecodeIndex::from_offset(8);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
         let mut tiering = VmTieringIntegration::default();
-        let mut descriptor =
-            property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
         descriptor.base_structure = Some(StructureId(701));
         descriptor.chain[0].structure = StructureId(701);
 
-        record_property_load_descriptor_after_initial_countdown(
-            &mut tiering,
-            owner,
-            bytecode_snapshot,
-            descriptor.clone(),
-        );
-        record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+        // Redesign-audit telemetry Unit 3: 3 calls at the SAME (owner,
+        // bytecode_index) site now coalesce `property_load_observations` to
+        // 1 entry (update-or-insert; see the field comment) -- the
+        // per-call evolution SEQUENCE is instead captured by this test's own
+        // local log via `record_property_load_descriptor_evolution`.
+        let mut evolution = Vec::new();
+        for _ in 0..3 {
+            evolution.push(record_property_load_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor.clone(),
+            ));
+        }
 
-        assert_eq!(tiering.property_load_observations().len(), 3);
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert_eq!(tiering.property_load_access_case_plans().len(), 1);
-        let evolution = tiering.property_inline_cache_evolution_records();
-        assert_eq!(evolution.len(), 3);
         assert_eq!(
-            evolution[0].decision,
+            evolution[0].0,
             VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
         );
         assert_eq!(
-            evolution[1].decision,
+            evolution[1].0,
             VmPropertyInlineCacheEvolutionDecision::Admitted
         );
         assert_eq!(
-            evolution[2].decision,
+            evolution[2].0,
             VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
         );
-        assert_eq!(evolution[2].structure, Some(StructureId(701)));
-        assert_eq!(evolution[2].key, None);
+        // `structure`/`key` on the deleted evolution record were pure
+        // pass-throughs of `descriptor.base_structure`/the (non-ElementLoad)
+        // cache kind's absent key -- both already asserted at the input
+        // above (`base_structure = Some(StructureId(701))`, default
+        // `cache_kind` from `property_handoff_observation`).
     }
 
     #[test]
@@ -21458,13 +21773,13 @@ mod tests {
         let owner = CodeBlockId(CellId(904));
         let bytecode_index = BytecodeIndex::from_offset(8);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
         let mut tiering = VmTieringIntegration::default();
-        let mut descriptor =
-            property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+        let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
         descriptor.base_structure = Some(StructureId(701));
         descriptor.chain[0].structure = StructureId(701);
 
-        for _ in 0..8 {
+        for _ in 0..7 {
             record_property_load_descriptor(
                 &mut tiering,
                 owner,
@@ -21472,32 +21787,39 @@ mod tests {
                 descriptor.clone(),
             );
         }
+        // Redesign-audit telemetry Unit 3: snapshot the state right before
+        // the 8th (last) call so `counters_before` for THAT call is
+        // available -- it equals the 7th call's `counters_after`, exactly
+        // what the deleted log's `evolution.last().counters_before` held.
+        let counters_before_last = tiering
+            .property_inline_cache_evolution_latest(
+                owner,
+                bytecode_index,
+                bytecode_snapshot,
+                slot,
+                VmPropertyInlineCacheEvolutionKind::Load,
+            )
+            .map(|(_, counters)| counters);
+        let (last_decision, counters_after_last) = record_property_load_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            descriptor,
+        );
 
-        assert_eq!(tiering.property_load_observations().len(), 8);
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert_eq!(tiering.property_load_access_case_plans().len(), 1);
-        let evolution = tiering.property_inline_cache_evolution_records();
         assert_eq!(
-            evolution.last().map(|record| record.decision),
-            Some(VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase)
+            last_decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
         );
         assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_before.buffering_countdown),
+            counters_before_last.map(|counters| counters.buffering_countdown),
             Some(0)
         );
-        assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_after.accepted_access_case_count),
-            Some(1)
-        );
-        assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_after.terminal),
-            Some(None)
-        );
+        assert_eq!(counters_after_last.accepted_access_case_count, 1);
+        assert_eq!(counters_after_last.terminal, None);
     }
 
     #[test]
@@ -21505,23 +21827,27 @@ mod tests {
         let owner = CodeBlockId(CellId(906));
         let bytecode_index = BytecodeIndex::from_offset(8);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
         let mut tiering = VmTieringIntegration::default();
-        let key = property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index).key;
+        let key = property_handoff_observation(owner, slot, bytecode_index).key;
 
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
-            let mut descriptor =
-                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
             let structure = StructureId(701 + index);
             descriptor.base_structure = Some(structure);
             descriptor.chain[0].structure = structure;
             descriptor.offset = Some(PropertyOffset::new(index as i32));
-            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_load_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
-        assert_eq!(
-            tiering.property_load_observations().len(),
-            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
-        );
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert_eq!(
             tiering.property_load_access_case_plans().len(),
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize - 1
@@ -21532,41 +21858,34 @@ mod tests {
             tiering.property_load_megamorphic_cache_current_entry_count(),
             2
         );
-        let evolution = tiering.property_inline_cache_evolution_records();
         assert_eq!(
-            evolution[0].decision,
+            evolution[0].0,
             VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
         );
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
         );
         assert_eq!(
-            evolution[final_case_index]
-                .counters_before
-                .accepted_access_case_count,
+            evolution[final_case_index - 1].1.accepted_access_case_count,
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE - 1
         );
         assert_eq!(
-            evolution[final_case_index]
-                .counters_after
-                .accepted_access_case_count,
+            evolution[final_case_index].1.accepted_access_case_count,
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE
         );
-        assert_eq!(evolution[final_case_index].counters_before.terminal, None);
+        assert_eq!(evolution[final_case_index - 1].1.terminal, None);
         assert_eq!(
-            evolution[final_case_index].counters_after.terminal,
+            evolution[final_case_index].1.terminal,
             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad)
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad)
         );
         assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_after.terminal),
+            evolution.last().map(|record| record.1.terminal),
             Some(Some(
                 VmPropertyInlineCacheEvolutionTerminalState::MegamorphicLoad
             ))
@@ -21620,10 +21939,10 @@ mod tests {
             record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
         }
 
-        assert_eq!(
-            tiering.property_load_observations().len(),
-            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
-        );
+        // Redesign-audit telemetry Unit 3: all (N+2) calls above hit the
+        // SAME (owner, bytecode_index) site, so the update-or-insert slot
+        // coalesces to 1 entry (the latest).
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert!(tiering
             .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
             .expect("finite property-load table")
@@ -21769,10 +22088,10 @@ mod tests {
             record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
         }
 
-        assert_eq!(
-            tiering.property_load_observations().len(),
-            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
-        );
+        // Redesign-audit telemetry Unit 3: all (N+2) calls above hit the
+        // SAME (owner, bytecode_index) site, so the update-or-insert slot
+        // coalesces to 1 entry (the latest).
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert!(tiering
             .property_load_access_case_plan_table_for_owner(owner, bytecode_snapshot)
             .expect("finite property-load table")
@@ -22761,9 +23080,14 @@ mod tests {
         assert_eq!(expected_entries, 1);
         assert_eq!(
             tiering
-                .property_inline_cache_evolution_records()
-                .last()
-                .map(|record| record.decision),
+                .property_inline_cache_evolution_latest(
+                    owner,
+                    bytecode_index,
+                    bytecode_snapshot,
+                    slot,
+                    VmPropertyInlineCacheEvolutionKind::Load,
+                )
+                .map(|(decision, _)| decision),
             Some(VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad)
         );
 
@@ -22824,6 +23148,7 @@ mod tests {
         )
         .key;
 
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
             let mut descriptor = property_store_observation(
                 owner,
@@ -22835,13 +23160,16 @@ mod tests {
             descriptor.base_structure_before = Some(structure);
             descriptor.base_structure_after = Some(structure);
             descriptor.offset_after = Some(PropertyOffset::new(index as i32));
-            record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_store_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
-        assert_eq!(
-            tiering.property_store_observations().len(),
-            PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize + 2
-        );
+        assert_eq!(tiering.property_store_observations().len(), 1);
         assert_eq!(
             tiering.property_store_access_case_plans().len(),
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize - 1
@@ -22852,18 +23180,17 @@ mod tests {
             tiering.property_store_megamorphic_cache_current_entry_count(),
             2
         );
-        let evolution = tiering.property_inline_cache_evolution_records();
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore
         );
         assert_eq!(
-            evolution[final_case_index].counters_after.terminal,
+            evolution[final_case_index].1.terminal,
             Some(VmPropertyInlineCacheEvolutionTerminalState::MegamorphicStore)
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore)
         );
         let table = tiering
@@ -22916,6 +23243,7 @@ mod tests {
         let slot = InlineCacheSlotId(4);
         let mut tiering = VmTieringIntegration::default();
 
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
             let mut descriptor = property_store_observation(
                 owner,
@@ -22928,7 +23256,13 @@ mod tests {
             descriptor.base_structure_after = Some(structure);
             descriptor.offset_after = Some(PropertyOffset::new(index as i32));
             descriptor.can_use_put_by_id_megamorphic = false;
-            record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_store_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
         assert_eq!(
@@ -22942,18 +23276,17 @@ mod tests {
             tiering.property_store_megamorphic_cache_current_entry_count(),
             0
         );
-        let evolution = tiering.property_inline_cache_evolution_records();
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::Admitted
         );
         assert_eq!(
-            evolution[final_case_index].counters_after.terminal,
+            evolution[final_case_index].1.terminal,
             Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp)
         );
     }
@@ -22963,11 +23296,12 @@ mod tests {
         let owner = CodeBlockId(CellId(907));
         let bytecode_index = BytecodeIndex::from_offset(8);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(3);
         let mut tiering = VmTieringIntegration::default();
 
+        let mut evolution = Vec::new();
         for index in 0..(PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as u32 + 2) {
-            let mut descriptor =
-                property_handoff_observation(owner, InlineCacheSlotId(3), bytecode_index);
+            let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
             let structure = StructureId(721 + index);
             descriptor.cache_kind = InlineCacheKind::ElementLoad;
             descriptor.cold_miss_handoff.cache_kind = InlineCacheKind::ElementLoad;
@@ -22980,7 +23314,13 @@ mod tests {
             descriptor.observed_access_case_kind = Some(AccessCaseKind::IndexedLoad);
             descriptor.can_use_get_by_id_megamorphic = false;
             descriptor.readiness = descriptor.classify_readiness();
-            record_property_load_descriptor(&mut tiering, owner, bytecode_snapshot, descriptor);
+            evolution.push(record_property_load_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor,
+            ));
         }
 
         assert_eq!(
@@ -22988,18 +23328,17 @@ mod tests {
             PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize
         );
         assert!(tiering.property_load_megamorphic_cache_records().is_empty());
-        let evolution = tiering.property_inline_cache_evolution_records();
         let final_case_index = PROPERTY_IC_MAX_ACCESS_VARIANT_LIST_SIZE as usize;
         assert_eq!(
-            evolution[final_case_index].decision,
+            evolution[final_case_index].0,
             VmPropertyInlineCacheEvolutionDecision::Admitted
         );
         assert_eq!(
-            evolution[final_case_index].counters_after.terminal,
+            evolution[final_case_index].1.terminal,
             Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
         );
         assert_eq!(
-            evolution.last().map(|record| record.decision),
+            evolution.last().map(|record| record.0),
             Some(VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp)
         );
     }
@@ -23010,17 +23349,18 @@ mod tests {
         let owner = CodeBlockId(CellId(905));
         let bytecode_index = BytecodeIndex::from_offset(9);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(4);
         let mut tiering = VmTieringIntegration::default();
         let mut descriptor = property_store_observation(
             owner,
-            InlineCacheSlotId(4),
+            slot,
             bytecode_index,
             PropertyStoreObservationOutcome::OwnDataStore,
         );
         descriptor.base_structure_before = Some(StructureId(801));
         descriptor.base_structure_after = Some(StructureId(801));
 
-        for _ in 0..8 {
+        for _ in 0..7 {
             record_property_store_descriptor(
                 &mut tiering,
                 owner,
@@ -23028,18 +23368,31 @@ mod tests {
                 descriptor.clone(),
             );
         }
+        let counters_before_last = tiering
+            .property_inline_cache_evolution_latest(
+                owner,
+                bytecode_index,
+                bytecode_snapshot,
+                slot,
+                VmPropertyInlineCacheEvolutionKind::Store,
+            )
+            .map(|(_, counters)| counters);
+        let (last_decision, _) = record_property_store_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            descriptor,
+        );
 
-        assert_eq!(tiering.property_store_observations().len(), 8);
+        assert_eq!(tiering.property_store_observations().len(), 1);
         assert_eq!(tiering.property_store_access_case_plans().len(), 1);
-        let evolution = tiering.property_inline_cache_evolution_records();
         assert_eq!(
-            evolution.last().map(|record| record.decision),
-            Some(VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase)
+            last_decision,
+            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
         );
         assert_eq!(
-            evolution
-                .last()
-                .map(|record| record.counters_before.buffering_countdown),
+            counters_before_last.map(|counters| counters.buffering_countdown),
             Some(0)
         );
     }
@@ -23049,10 +23402,11 @@ mod tests {
         let owner = CodeBlockId(CellId(902));
         let bytecode_index = BytecodeIndex::from_offset(9);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(4);
         let mut tiering = VmTieringIntegration::default();
         let mut first = property_store_observation(
             owner,
-            InlineCacheSlotId(4),
+            slot,
             bytecode_index,
             PropertyStoreObservationOutcome::IndexedStore,
         );
@@ -23063,20 +23417,41 @@ mod tests {
             PropertyIndex::from_canonical_index(1),
         ));
 
-        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first.clone());
-        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first.clone());
-        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, first);
-        record_property_store_descriptor(&mut tiering, owner, bytecode_snapshot, second_key);
+        let mut evolution = Vec::new();
+        evolution.push(record_property_store_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            first.clone(),
+        ));
+        evolution.push(record_property_store_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            first.clone(),
+        ));
+        evolution.push(record_property_store_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            first,
+        ));
+        evolution.push(record_property_store_descriptor_evolution(
+            &mut tiering,
+            owner,
+            bytecode_snapshot,
+            slot,
+            second_key,
+        ));
 
-        assert_eq!(tiering.property_store_observations().len(), 4);
-        assert_eq!(tiering.property_store_access_case_plans().len(), 2);
-        let evolution = tiering.property_inline_cache_evolution_records();
-        assert_eq!(evolution.len(), 4);
+        assert_eq!(tiering.property_store_observations().len(), 1);
+        let plans = tiering.property_store_access_case_plans();
+        assert_eq!(plans.len(), 2);
         assert_eq!(
-            evolution
-                .iter()
-                .map(|record| record.decision)
-                .collect::<Vec<_>>(),
+            evolution.iter().map(|record| record.0).collect::<Vec<_>>(),
             vec![
                 VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown,
                 VmPropertyInlineCacheEvolutionDecision::Admitted,
@@ -23084,9 +23459,18 @@ mod tests {
                 VmPropertyInlineCacheEvolutionDecision::Admitted,
             ]
         );
-        assert_eq!(evolution[1].structure, Some(StructureId(801)));
-        assert_eq!(evolution[1].key, evolution[2].key);
-        assert_ne!(evolution[1].key, evolution[3].key);
+        // `structure`/`key` on the deleted evolution record were the
+        // ADMITTED plan's derived structure/key; `property_store_access_case_plans`
+        // (unaffected by this redesign -- one entry per Admitted decision)
+        // gives the same two values directly: plans[0] from call 2 (the
+        // buffered-duplicate at call 3 shares its key with plans[0], which is
+        // exactly why it was suppressed), plans[1] from call 4 (`second_key`,
+        // a genuinely different key).
+        assert_eq!(
+            plans[0].plan.access_case.base_structure,
+            Some(StructureId(801))
+        );
+        assert_ne!(plans[0].plan.key, plans[1].plan.key);
     }
 
     #[test]
@@ -23094,48 +23478,106 @@ mod tests {
         let owner = CodeBlockId(CellId(903));
         let bytecode_index = BytecodeIndex::from_offset(10);
         let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let slot = InlineCacheSlotId(5);
         let mut tiering = VmTieringIntegration::default();
-        let mut descriptor =
-            property_handoff_observation(owner, InlineCacheSlotId(5), bytecode_index);
+        let mut descriptor = property_handoff_observation(owner, slot, bytecode_index);
         descriptor.base_structure = Some(StructureId(900));
         descriptor.chain[0].structure = StructureId(900);
 
+        let mut evolution = Vec::new();
         for _ in 0..11 {
+            evolution.push(record_property_load_descriptor_evolution(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                slot,
+                descriptor.clone(),
+            ));
+        }
+
+        assert_eq!(tiering.property_load_observations().len(), 1);
+        assert_eq!(tiering.property_load_access_case_plans().len(), 1);
+        assert_eq!(
+            evolution[0].0,
+            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
+        );
+        assert_eq!(
+            evolution[9].0,
+            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
+        );
+        assert_eq!(evolution[9].1.countdown, PROPERTY_IC_INITIAL_COOLDOWN_COUNT);
+        assert_eq!(
+            evolution[10].0,
+            VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
+        );
+        // `evolution[10]`'s counters_before is `evolution[9]`'s counters_after,
+        // already asserted above.
+        assert_eq!(
+            evolution[10].1.countdown,
+            PROPERTY_IC_INITIAL_COOLDOWN_COUNT - 1
+        );
+    }
+
+    // Redesign-audit telemetry Unit 3 regression: N property operations at
+    // ONE site must leave O(sites) retained state, not O(N) -- the exact
+    // shape of the leak these fields were redesigned to close (see the
+    // field comments on `property_load_observations`/
+    // `property_store_observations`/`property_inline_cache_evolution_decision_counts`
+    // above). Before this redesign, each of these would have grown linearly
+    // with the loop below.
+    #[test]
+    fn vm_property_telemetry_unit3_fields_stay_bounded_across_many_operations_at_one_site() {
+        let owner = CodeBlockId(CellId(950));
+        let load_bytecode_index = BytecodeIndex::from_offset(20);
+        let store_bytecode_index = BytecodeIndex::from_offset(21);
+        let load_slot = InlineCacheSlotId(9);
+        let store_slot = InlineCacheSlotId(10);
+        let bytecode_snapshot = baseline_bytecode_snapshot(owner);
+        let mut tiering = VmTieringIntegration::default();
+
+        const OPERATIONS_PER_SITE: usize = 500;
+        for index in 0..OPERATIONS_PER_SITE {
+            let mut load_descriptor =
+                property_handoff_observation(owner, load_slot, load_bytecode_index);
+            load_descriptor.base_structure = Some(StructureId(2000 + index as u32));
+            load_descriptor.chain[0].structure = StructureId(2000 + index as u32);
             record_property_load_descriptor(
                 &mut tiering,
                 owner,
                 bytecode_snapshot,
-                descriptor.clone(),
+                load_descriptor,
+            );
+
+            let mut store_descriptor = property_store_observation(
+                owner,
+                store_slot,
+                store_bytecode_index,
+                PropertyStoreObservationOutcome::OwnDataStore,
+            );
+            store_descriptor.base_structure_before = Some(StructureId(3000 + index as u32));
+            store_descriptor.base_structure_after = Some(StructureId(3000 + index as u32));
+            record_property_store_descriptor(
+                &mut tiering,
+                owner,
+                bytecode_snapshot,
+                store_descriptor,
             );
         }
 
-        assert_eq!(tiering.property_load_observations().len(), 11);
-        assert_eq!(tiering.property_load_access_case_plans().len(), 1);
-        let evolution = tiering.property_inline_cache_evolution_records();
-        assert_eq!(
-            evolution[0].decision,
-            VmPropertyInlineCacheEvolutionDecision::SkippedInitialCountdown
-        );
-        assert_eq!(
-            evolution[9].decision,
-            VmPropertyInlineCacheEvolutionDecision::SkippedReplacedByExistingCase
-        );
-        assert_eq!(
-            evolution[9].counters_after.countdown,
-            PROPERTY_IC_INITIAL_COOLDOWN_COUNT
-        );
-        assert_eq!(
-            evolution[10].decision,
-            VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
-        );
-        assert_eq!(
-            evolution[10].counters_before.countdown,
-            PROPERTY_IC_INITIAL_COOLDOWN_COUNT
-        );
-        assert_eq!(
-            evolution[10].counters_after.countdown,
-            PROPERTY_IC_INITIAL_COOLDOWN_COUNT - 1
-        );
+        // O(sites): exactly one slot per (owner, bytecode_index), regardless
+        // of how many operations (500 here) hit that site.
+        assert_eq!(tiering.property_load_observations().len(), 1);
+        assert_eq!(tiering.property_store_observations().len(), 1);
+        // The evolution-decision totals are write-time cumulative counters
+        // (bounded `struct` fields, not per-operation records), so they may
+        // legitimately COUNT past 500 without RETAINING a 500-entry log; the
+        // regression this guards is retained STATE, not the counters
+        // themselves.
+        let counts = tiering.property_inline_cache_evolution_decision_counts();
+        assert!(counts.total >= OPERATIONS_PER_SITE as u64 * 2);
+        // Exactly one evolution STATE per (site, kind) -- two sites (load,
+        // store) here -- never one per operation.
+        assert_eq!(tiering.property_inline_cache_evolution_states.len(), 2);
     }
 
     fn structure_stub_info_for_plan(
@@ -23841,6 +24283,13 @@ mod tests {
         record_property_store_descriptor(tiering, owner, bytecode_snapshot, descriptor)
     }
 
+    // Redesign-audit telemetry Unit 3: this fixture's warmup + real call
+    // both hit the same (owner, bytecode_index) site, so
+    // `property_store_observations` now coalesces to ONE slot (index 0,
+    // holding the returned `observation`) instead of two (formerly index 1
+    // was the real observation). Callers below that reach into
+    // `property_store_observations[0]` directly to simulate a drifted/
+    // corrupted observation must index 0, not 1.
     fn record_property_store_install_recheck_fixture(
         outcome: PropertyStoreObservationOutcome,
     ) -> (
@@ -30424,22 +30873,24 @@ mod tests {
             })
             .expect("second property handoff observation");
 
+        assert!(first_warmup.ordinal < first.ordinal);
+        assert!(second_warmup.ordinal < second.ordinal);
         assert!(first.ordinal < second.ordinal);
+        // Redesign-audit telemetry Unit 3: `property_load_observations` is
+        // now one slot per (owner, bytecode_index), update-or-insert in
+        // place -- the warmup observation at each site is overwritten by the
+        // real one, so only the LATEST per site survives, in first-seen-site
+        // order.
         assert_eq!(
             tiering.property_load_observations(),
-            &[
-                first_warmup.clone(),
-                first.clone(),
-                second_warmup.clone(),
-                second.clone()
-            ]
+            &[first.clone(), second.clone()]
         );
         assert_eq!(
             tiering.property_load_observations()[0].descriptor,
             first_descriptor
         );
         assert_eq!(
-            tiering.property_load_observations()[2].descriptor,
+            tiering.property_load_observations()[1].descriptor,
             second_descriptor
         );
 
@@ -30773,7 +31224,11 @@ mod tests {
             })
             .expect("negative guard observation");
 
-        assert_eq!(tiering.property_load_observations().len(), 4);
+        // Redesign-audit telemetry Unit 3: 3 distinct (owner, bytecode_index)
+        // sites (bytecode_index 1, 2, 3); the 2 calls at bytecode_index 1
+        // (via `record_property_load_descriptor_after_initial_countdown`)
+        // coalesce to 1 slot.
+        assert_eq!(tiering.property_load_observations().len(), 3);
         assert_eq!(tiering.property_load_access_case_plans().len(), 1);
         assert_eq!(tiering.property_load_guard_plans().len(), 2);
         assert_eq!(tiering.property_load_guard_dependencies().len(), 3);
@@ -30860,7 +31315,10 @@ mod tests {
             })
             .expect("blocked prototype property handoff observation");
 
-        assert_eq!(tiering.property_load_observations().len(), 7);
+        // Redesign-audit telemetry Unit 3: 4 distinct (owner, bytecode_index)
+        // sites -- (owner, 3), (other_owner, 1), (owner, 1), (owner, 4) --
+        // each pair of duplicate calls at the same site coalesces to 1 slot.
+        assert_eq!(tiering.property_load_observations().len(), 4);
         assert_eq!(tiering.property_load_access_case_plans().len(), 3);
 
         let table = tiering
@@ -30929,7 +31387,13 @@ mod tests {
         );
 
         assert!(first.ordinal < duplicate.ordinal);
-        assert_eq!(tiering.property_load_observations().len(), 4);
+        // Redesign-audit telemetry Unit 3: `first_descriptor` and
+        // `duplicate_descriptor` share the SAME (owner, bytecode_index) --
+        // they differ only by `slot`, which is not part of the observation
+        // site key (see the field comment) -- so all 4 calls coalesce to 1
+        // slot (the latest). `property_load_access_case_plans` is a
+        // different, untouched vec and still records both plans distinctly.
+        assert_eq!(tiering.property_load_observations().len(), 1);
         assert_eq!(tiering.property_load_access_case_plans().len(), 2);
         assert_eq!(
             tiering.property_load_access_case_plans()[0].plan.slot,
@@ -31098,7 +31562,11 @@ mod tests {
             descriptor.clone(),
         );
 
-        assert_eq!(tiering.property_store_observations().len(), 2);
+        // Redesign-audit telemetry Unit 3: both calls in
+        // `record_property_store_descriptor_after_initial_countdown` hit the
+        // same (owner, bytecode_index) site, coalescing to 1 slot holding
+        // the latest (`record`).
+        assert_eq!(tiering.property_store_observations().len(), 1);
         assert_eq!(tiering.property_store_observations().last(), Some(&record));
         assert_eq!(tiering.property_store_access_case_plans().len(), 1);
         let plan_record = &tiering.property_store_access_case_plans()[0];
@@ -31644,10 +32112,14 @@ mod tests {
         let (mut tiering, observation, plan, _) = record_property_store_install_recheck_fixture(
             PropertyStoreObservationOutcome::OwnDataStore,
         );
-        tiering.property_store_observations[1]
+        // Redesign-audit telemetry Unit 3: `record_property_store_access_case_install_recheck`
+        // now reads `plan_record.descriptor` (a snapshot captured at plan
+        // creation), not the coalescing `property_store_observations` slot
+        // -- mutate the PLAN's own snapshot to drive this scenario.
+        tiering.property_store_access_case_plans[0]
             .descriptor
             .write_barrier_count = 0;
-        tiering.property_store_observations[1]
+        tiering.property_store_access_case_plans[0]
             .descriptor
             .last_write_barrier = None;
 
@@ -31757,66 +32229,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vm_property_store_access_case_install_recheck_rejects_missing_source_observation() {
-        let (mut tiering, _, plan, _) = record_property_store_install_recheck_fixture(
-            PropertyStoreObservationOutcome::OwnDataStore,
-        );
-        tiering.property_store_observations.clear();
-
-        let recheck = tiering.record_property_store_access_case_install_recheck(
-            property_store_access_case_install_recheck_request(&plan),
-        );
-
-        assert_eq!(recheck.observation_ordinal, Some(plan.observation_ordinal));
-        assert_store_install_recheck_rejected(
-            recheck,
-            VmPropertyStoreAccessCaseInstallRecheckRejectionReason::ObservationMissing {
-                observation_ordinal: plan.observation_ordinal,
-            },
-        );
-    }
-
+    // Redesign-audit telemetry Unit 3 SCOPE NOTE: deleted
+    // `vm_property_store_access_case_install_recheck_rejects_missing_source_observation`.
+    // It cleared the shared `property_store_observations` log to simulate
+    // "the plan's originating observation went missing" and expected
+    // `ObservationMissing`. `record_property_store_access_case_install_recheck`
+    // now reads `plan_record.descriptor`, an immutable snapshot captured
+    // once at plan-creation time and stored ON the plan -- it can no longer
+    // go "missing" independently of the plan itself (which is covered by
+    // the still-live `PlanMissing` check). This scenario was never reachable
+    // through the real observation-recording API either way (nothing in
+    // production ever clears that table); `ObservationMissing` is retained
+    // on the enum for API compatibility but is no longer constructed.
     #[test]
     fn vm_property_store_access_case_install_recheck_rejects_observation_metadata_drift() {
+        // Redesign-audit telemetry Unit 3: `record_property_store_access_case_install_recheck`
+        // now compares the PLAN's own captured `descriptor` snapshot against
+        // itself/the request, not a re-fetched `property_store_observations`
+        // entry (see the function's Unit-3 comment for why the old ordinal
+        // re-fetch was unreachable-in-production dead code). These cases now
+        // mutate the LIVE plan record directly to exercise each comparison.
         assert_store_install_recheck_metadata_mismatch(
-            |tiering| tiering.property_store_observations[1].owner = CodeBlockId(CellId(502)),
+            |tiering| {
+                tiering.property_store_access_case_plans[0].descriptor.owner =
+                    CodeBlockId(CellId(502))
+            },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Owner,
         );
         assert_store_install_recheck_metadata_mismatch(
-            |tiering| tiering.property_store_observations[1].frame = Some(CallFrameId(502)),
+            |tiering| {
+                tiering.property_store_access_case_plans[0].descriptor.frame = CallFrameId(502)
+            },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Frame,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1].bytecode_index =
-                    BytecodeIndex::from_offset(502);
+                tiering.property_store_access_case_plans[0]
+                    .descriptor
+                    .bytecode_index = 502;
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeIndex,
         );
+        // Redesign-audit telemetry Unit 3: the BytecodeSnapshot sub-case is
+        // dropped. It used to mutate the shared observation log's
+        // `bytecode_snapshot` to trigger `observation.bytecode_snapshot !=
+        // plan_record.bytecode_snapshot` (a distinct, second bytecode-snapshot
+        // comparison). `plan_record.descriptor` has no separate
+        // `bytecode_snapshot` field to drift from `plan_record.bytecode_snapshot`
+        // -- that comparison was always tautological in every reachable
+        // production call sequence (see the function's Unit-3 comment) and
+        // has been removed. `BytecodeSnapshotMismatch` itself is still fully
+        // covered by
+        // `vm_property_store_access_case_install_recheck_rejects_missing_plan_and_request_mismatches`
+        // (mutates the caller's REQUEST, a still-live, distinct check).
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                let owner = tiering.property_store_observations[1].owner;
-                tiering.property_store_observations[1].bytecode_snapshot =
-                    alternate_baseline_bytecode_snapshot(owner);
-            },
-            VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::BytecodeSnapshot,
-        );
-        assert_store_install_recheck_metadata_mismatch(
-            |tiering| {
-                tiering.property_store_observations[1].descriptor.slot = InlineCacheSlotId(502);
+                tiering.property_store_access_case_plans[0].descriptor.slot =
+                    InlineCacheSlotId(502);
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Slot,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1].descriptor.key = CacheKey::Dynamic;
+                tiering.property_store_access_case_plans[0].descriptor.key = CacheKey::Dynamic;
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Key,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1]
+                tiering.property_store_access_case_plans[0]
                     .descriptor
                     .base_structure_before = Some(StructureId(502));
             },
@@ -31824,7 +32305,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1]
+                tiering.property_store_access_case_plans[0]
                     .descriptor
                     .offset_after = Some(PropertyOffset::new(502));
             },
@@ -31832,7 +32313,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1]
+                tiering.property_store_access_case_plans[0]
                     .descriptor
                     .base_structure_after = Some(StructureId(502));
             },
@@ -31840,14 +32321,15 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1].descriptor.outcome =
-                    PropertyStoreObservationOutcome::CreatedProperty;
+                tiering.property_store_access_case_plans[0]
+                    .descriptor
+                    .outcome = PropertyStoreObservationOutcome::CreatedProperty;
             },
             VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Outcome,
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1]
+                tiering.property_store_access_case_plans[0]
                     .descriptor
                     .may_call_js = true
             },
@@ -31855,7 +32337,7 @@ mod tests {
         );
         assert_store_install_recheck_metadata_mismatch(
             |tiering| {
-                tiering.property_store_observations[1]
+                tiering.property_store_access_case_plans[0]
                     .descriptor
                     .cacheability = PropertyCacheability::Allowed;
             },
@@ -31869,13 +32351,15 @@ mod tests {
         let (mut tiering, _, plan, _) = record_property_store_install_recheck_fixture(
             PropertyStoreObservationOutcome::OwnDataStore,
         );
-        tiering.property_store_observations[1]
+        // Redesign-audit telemetry Unit 3: mutate the PLAN's own descriptor
+        // snapshot (see the sibling test above for the full rationale).
+        tiering.property_store_access_case_plans[0]
             .descriptor
             .stored_value = cell_runtime_value_for_test(0x5300);
-        tiering.property_store_observations[1]
+        tiering.property_store_access_case_plans[0]
             .descriptor
             .write_barrier_count = 0;
-        tiering.property_store_observations[1]
+        tiering.property_store_access_case_plans[0]
             .descriptor
             .last_write_barrier = None;
 
@@ -32056,12 +32540,24 @@ mod tests {
             record_property_store_install_recheck_fixture(
                 PropertyStoreObservationOutcome::OwnDataStore,
             );
-        let observations = rejected_tiering.property_store_observations.clone();
-        rejected_tiering.property_store_observations.clear();
+        // Redesign-audit telemetry Unit 3: this used to clear the shared
+        // `property_store_observations` log to force `ObservationMissing`,
+        // then restore it. Install-recheck now reads the immutable
+        // `plan_record.descriptor` snapshot (see that function's Unit-3
+        // comment), which can no longer go missing independently of the
+        // plan -- `ObservationMissing` is retained on the enum but no
+        // longer constructed (see the deleted
+        // `..._rejects_missing_source_observation` test's SCOPE NOTE).
+        // Any other rejection reason equally proves this test's real
+        // subject (readiness correctly propagates a REJECTED recheck
+        // outcome), so this mutates the plan's own snapshot to induce an
+        // ordinary metadata mismatch instead.
+        rejected_tiering.property_store_access_case_plans[0]
+            .descriptor
+            .owner = CodeBlockId(CellId(509));
         let rejected_recheck = rejected_tiering.record_property_store_access_case_install_recheck(
             property_store_access_case_install_recheck_request(&rejected_plan),
         );
-        rejected_tiering.property_store_observations = observations;
 
         let rejected = rejected_tiering.record_generated_property_store_mutation_readiness(
             generated_property_store_mutation_readiness_request(
@@ -32074,8 +32570,8 @@ mod tests {
             Some(rejected_plan.observation_ordinal),
             VmGeneratedPropertyStoreMutationReadinessRejectionReason::InstallRecheckRejected {
                 reason:
-                    VmPropertyStoreAccessCaseInstallRecheckRejectionReason::ObservationMissing {
-                        observation_ordinal: rejected_plan.observation_ordinal,
+                    VmPropertyStoreAccessCaseInstallRecheckRejectionReason::ObservationMetadataMismatch {
+                        field: VmPropertyStoreAccessCaseInstallRecheckMetadataMismatchField::Owner,
                     },
             },
         );
@@ -32414,10 +32910,19 @@ mod tests {
                 stale_recheck.ordinal,
             ),
         );
-        stale_recheck_tiering.property_store_observations[1]
+        // Redesign-audit telemetry Unit 3: the candidate-table projection's
+        // staleness re-check
+        // (`property_store_mutation_candidate_from_readiness_record_with_plan_lifecycle`)
+        // re-invokes `record_property_store_access_case_install_recheck`'s
+        // outcome function, which now reads `plan_record.descriptor` (see
+        // its Unit-3 comment) instead of the coalescing
+        // `property_store_observations` slot -- mutate the PLAN's own
+        // snapshot to simulate the barrier evidence no longer matching what
+        // was captured when the readiness record was made.
+        stale_recheck_tiering.property_store_access_case_plans[0]
             .descriptor
             .write_barrier_count = 0;
-        stale_recheck_tiering.property_store_observations[1]
+        stale_recheck_tiering.property_store_access_case_plans[0]
             .descriptor
             .last_write_barrier = None;
         assert!(stale_recheck_tiering
@@ -32547,22 +33052,30 @@ mod tests {
         assert_eq!(tiering.property_store_access_case_plans().len(), 2);
 
         let first_plan = tiering.property_store_access_case_plans()[0].clone();
-        let second_observation_ordinal =
-            tiering.property_store_access_case_plans()[1].observation_ordinal;
         tiering.property_store_access_case_plans[1].plan.slot = InlineCacheSlotId(0);
         tiering.property_store_access_case_plans[1]
             .plan
             .access_case
             .base_structure = Some(StructureId(17));
-        let second_observation = tiering
-            .property_store_observations
-            .iter_mut()
-            .find(|record| record.ordinal == second_observation_ordinal)
-            .expect("second store observation");
-        second_observation.descriptor.slot = InlineCacheSlotId(0);
-        second_observation.descriptor.cold_miss_handoff.slot = InlineCacheSlotId(0);
-        second_observation.descriptor.base_structure_before = Some(StructureId(17));
-        second_observation.descriptor.base_structure_after = Some(StructureId(17));
+        // Redesign-audit telemetry Unit 3: install-recheck now reads
+        // `plan_record.descriptor` (a snapshot owned by the PLAN, see the
+        // function's Unit-3 comment), not the coalescing
+        // `property_store_observations` slot -- mutate plan1's own snapshot
+        // in lockstep with its `.plan` mutation above so the two stay
+        // internally consistent (this is simulating plan1 having been
+        // derived from a case that collides with plan0's identity, which
+        // the later candidate-table projection is expected to suppress).
+        tiering.property_store_access_case_plans[1].descriptor.slot = InlineCacheSlotId(0);
+        tiering.property_store_access_case_plans[1]
+            .descriptor
+            .cold_miss_handoff
+            .slot = InlineCacheSlotId(0);
+        tiering.property_store_access_case_plans[1]
+            .descriptor
+            .base_structure_before = Some(StructureId(17));
+        tiering.property_store_access_case_plans[1]
+            .descriptor
+            .base_structure_after = Some(StructureId(17));
 
         for index in 0..2 {
             let plan = tiering.property_store_access_case_plans()[index].clone();

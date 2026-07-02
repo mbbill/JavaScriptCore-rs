@@ -347,7 +347,7 @@ pub use tiering::{
     VmPropertyInlineCacheAttachmentRecord, VmPropertyInlineCacheAttachmentRejectionReason,
     VmPropertyInlineCacheClearOutcome, VmPropertyInlineCacheClearRecord,
     VmPropertyInlineCacheClearRejectionReason, VmPropertyInlineCacheEvolutionDecision,
-    VmPropertyInlineCacheEvolutionRecord, VmPropertyInlineCacheEvolutionTerminalState,
+    VmPropertyInlineCacheEvolutionKind, VmPropertyInlineCacheEvolutionTerminalState,
     VmPropertyLoadAccessCasePlanLifecycle, VmPropertyLoadAccessCasePlanRecord,
     VmPropertyLoadGuardPlanRecord, VmPropertyLoadObservationRecord,
     VmPropertyStoreAccessCasePlanLifecycle, VmPropertyStoreAccessCasePlanRecord,
@@ -19043,12 +19043,21 @@ impl Vm {
         &self,
         plan: &VmPropertyStoreAccessCasePlanRecord,
     ) -> Option<crate::value::ValueKind> {
+        // Redesign-audit telemetry Unit 3: `property_store_observations` is
+        // now a latest-state-per-(owner, bytecode_index) slot (vm/tiering.rs),
+        // not a log, so the `plan.observation_ordinal` equality check is
+        // dropped -- the slot no longer retains the exact historical record
+        // to match it against. The lookup reads the site's CURRENT
+        // observation instead, gated by the same owner/bytecode_index/
+        // bytecode_snapshot the plan was captured against (a faithful
+        // narrowing from "the exact historical observation" to "the current
+        // observation at this site"; JSC's ValueProfile buckets never
+        // exposed history either).
         self.tiering
             .property_store_observations()
             .iter()
             .find(|observation| {
-                observation.ordinal == plan.observation_ordinal
-                    && observation.owner == plan.owner
+                observation.owner == plan.owner
                     && observation.bytecode_index == plan.bytecode_index
                     && observation.bytecode_snapshot == plan.bytecode_snapshot
             })
@@ -53643,9 +53652,12 @@ mod tests {
             !host.core.has_property_lookup_record(),
             "generated property handoff should drain the local lookup record"
         );
+        // Redesign-audit telemetry Unit 3: the warmup and real execution both
+        // hit the same (owner, bytecode_index) site, coalescing to 1 slot
+        // (the latest -- the real execution's observation).
         let observations = vm.tiering_integration().property_load_observations();
-        assert_eq!(observations.len(), 2);
-        let observation = &observations[1];
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
         assert_eq!(
             observation.bytecode_snapshot,
             BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block).unwrap()
@@ -53803,9 +53815,11 @@ mod tests {
             host.property_load_probes.is_empty(),
             "same-execution resume should use the newly attached load metadata without recording another generated load probe"
         );
+        // Redesign-audit telemetry Unit 3: both loop iterations hit the same
+        // (owner, bytecode_index) site, coalescing to 1 slot.
         assert_eq!(
             vm.tiering_integration().property_load_observations().len(),
-            2
+            1
         );
         assert_eq!(
             vm.tiering_integration()
@@ -53932,9 +53946,12 @@ mod tests {
             !host.core.has_property_store_record(),
             "generated property store handoff should drain the local store record"
         );
+        // Redesign-audit telemetry Unit 3: the warmup and real execution both
+        // hit the same (owner, bytecode_index) site, coalescing to 1 slot
+        // (the latest -- the real execution's observation).
         let store_observations = vm.tiering_integration().property_store_observations();
-        assert_eq!(store_observations.len(), 2);
-        let observation = &store_observations[1];
+        assert_eq!(store_observations.len(), 1);
+        let observation = &store_observations[0];
         let bytecode_snapshot =
             BaselineBytecodeEligibilityProof::fingerprint_code_block_snapshot(&code_block).unwrap();
         assert_eq!(observation.bytecode_snapshot, bytecode_snapshot);
@@ -56528,15 +56545,23 @@ mod tests {
             vec![(BytecodeIndex::from_offset(1), Some(CoreOpcode::GetByName))]
         );
 
+        // Redesign-audit telemetry Unit 3: `property_load_observations` is
+        // now one slot per (owner, bytecode_index) -- NOT per generation --
+        // update-or-insert in place, so all 4 calls above (2 per generation)
+        // coalesce to the single LATEST observation (the replacement
+        // generation's `second`). This is safe for the "stale plan must not
+        // be probed" behavior under test: that guarantee is enforced by
+        // `property_load_access_case_plans`/the plan table (asserted below,
+        // unaffected by this redesign), which every production consumer
+        // gates on an explicit `bytecode_snapshot` equality check -- the
+        // observation slot being generation-agnostic does not leak a stale
+        // plan across a rebaseline.
         let observations = vm.tiering_integration().property_load_observations();
-        assert_eq!(observations.len(), 4);
-        assert_eq!(observations[0].bytecode_snapshot, original_snapshot);
-        assert_eq!(observations[1].bytecode_snapshot, original_snapshot);
-        assert_eq!(observations[2].bytecode_snapshot, replacement_snapshot);
-        assert_eq!(observations[3].bytecode_snapshot, replacement_snapshot);
-        assert_eq!(observations[3].owner, owner);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].bytecode_snapshot, replacement_snapshot);
+        assert_eq!(observations[0].owner, owner);
         assert_eq!(
-            observations[3].bytecode_index,
+            observations[0].bytecode_index,
             BytecodeIndex::from_offset(1)
         );
 
@@ -57011,14 +57036,24 @@ mod tests {
                 .len(),
             0
         );
-        let evolution = vm
+        // Redesign-audit telemetry Unit 3: the deleted
+        // `property_inline_cache_evolution_records` log is replaced by a
+        // latest-state-per-site query; `plans[0]` (asserted non-empty above)
+        // gives the site's (bytecode_index, slot) key.
+        let evolution_site_plan = plans.first().expect("one property-load access-case plan");
+        let evolution_decision = vm
             .tiering_integration()
-            .property_inline_cache_evolution_records();
+            .property_inline_cache_evolution_latest(
+                owner,
+                evolution_site_plan.bytecode_index,
+                bytecode_snapshot,
+                evolution_site_plan.plan.slot,
+                VmPropertyInlineCacheEvolutionKind::Load,
+            )
+            .expect("duplicate load evolution record")
+            .0;
         assert_eq!(
-            evolution
-                .last()
-                .expect("duplicate load evolution record")
-                .decision,
+            evolution_decision,
             VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
         );
         assert!(!vm

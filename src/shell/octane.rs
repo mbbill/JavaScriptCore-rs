@@ -28,7 +28,6 @@ use crate::vm::{
     VmGeneratedDirectCallRootlessRetainedSideExitCount,
     VmGeneratedDirectCallRootlessUnsupportedBodyOpcodeCount,
     VmGeneratedDirectCallRouteOpportunitySummary, VmGeneratedDirectCallTransactionSummary,
-    VmPropertyInlineCacheEvolutionDecision, VmPropertyInlineCacheEvolutionTerminalState,
 };
 
 pub const OCTANE_DEFAULT_ITERATION_COUNT: usize = 120;
@@ -479,95 +478,33 @@ pub struct OctaneTieringSummary {
 impl OctaneTieringSummary {
     fn from_vm(vm: &Vm) -> Self {
         let tiering = vm.tiering_integration();
-        let property_inline_cache_evolution_records =
-            tiering.property_inline_cache_evolution_records();
-        let property_inline_cache_evolution_admitted = property_inline_cache_evolution_records
-            .iter()
-            .filter(|record| record.decision == VmPropertyInlineCacheEvolutionDecision::Admitted)
-            .count();
-        let property_inline_cache_evolution_buffered = property_inline_cache_evolution_records
-            .iter()
-            .filter(|record| {
-                record.counters_after.buffered_structure_count
-                    > record.counters_before.buffered_structure_count
-            })
-            .count();
+        // Redesign-audit telemetry Unit 3: these used to `.iter().filter(..).count()`
+        // over the deleted `property_inline_cache_evolution_records` log (an
+        // unbounded per-property-access vec); they now read write-time
+        // cumulative counters (`VmPropertyInlineCacheEvolutionDecisionCounts`,
+        // the `VmGeneratedDirectCallRootlessPreferredNativeEntryCounts`
+        // scoreboard pattern) instead.
+        let evolution_counts = tiering.property_inline_cache_evolution_decision_counts();
+        let property_inline_cache_evolution_records = evolution_counts.total as usize;
+        let property_inline_cache_evolution_admitted = evolution_counts.admitted as usize;
+        let property_inline_cache_evolution_buffered = evolution_counts.buffered as usize;
         let property_inline_cache_evolution_buffered_duplicates =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::SkippedBufferedDuplicate
-                })
-                .count();
-        let property_inline_cache_evolution_cooldowns = property_inline_cache_evolution_records
-            .iter()
-            .filter(|record| {
-                record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedCooldown
-            })
-            .count();
-        let property_inline_cache_evolution_final_gave_up = property_inline_cache_evolution_records
-            .iter()
-            .filter(|record| {
-                record.counters_before.terminal
-                    != Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
-                    && record.counters_after.terminal
-                        == Some(VmPropertyInlineCacheEvolutionTerminalState::GaveUp)
-            })
-            .count();
-        let property_inline_cache_evolution_gave_up_skips = property_inline_cache_evolution_records
-            .iter()
-            .filter(|record| {
-                record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedGaveUp
-            })
-            .count();
+            evolution_counts.buffered_duplicates as usize;
+        let property_inline_cache_evolution_cooldowns = evolution_counts.cooldowns as usize;
+        let property_inline_cache_evolution_final_gave_up = evolution_counts.final_gave_up as usize;
+        let property_inline_cache_evolution_gave_up_skips = evolution_counts.gave_up_skips as usize;
         let property_inline_cache_evolution_generated_megamorphic_load =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicLoad
-                })
-                .count();
+            evolution_counts.generated_megamorphic_load as usize;
         let property_inline_cache_evolution_megamorphic_load_skips =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicLoad
-                })
-                .count();
+            evolution_counts.megamorphic_load_skips as usize;
         let property_inline_cache_evolution_generated_megamorphic_store =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicStore
-                })
-                .count();
+            evolution_counts.generated_megamorphic_store as usize;
         let property_inline_cache_evolution_megamorphic_store_skips =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicStore
-                })
-                .count();
+            evolution_counts.megamorphic_store_skips as usize;
         let property_inline_cache_evolution_generated_megamorphic_has =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision
-                        == VmPropertyInlineCacheEvolutionDecision::GeneratedMegamorphicHas
-                })
-                .count();
+            evolution_counts.generated_megamorphic_has as usize;
         let property_inline_cache_evolution_megamorphic_has_skips =
-            property_inline_cache_evolution_records
-                .iter()
-                .filter(|record| {
-                    record.decision == VmPropertyInlineCacheEvolutionDecision::SkippedMegamorphicHas
-                })
-                .count();
+            evolution_counts.megamorphic_has_skips as usize;
         Self {
             entry_decisions: tiering.entry_decision_count() as usize,
             fallback_records: tiering.fallback_records().len(),
@@ -660,7 +597,7 @@ impl OctaneTieringSummary {
                 .len(),
             property_load_observations: tiering.property_load_observations().len(),
             property_store_observations: tiering.property_store_observations().len(),
-            property_inline_cache_evolution_records: property_inline_cache_evolution_records.len(),
+            property_inline_cache_evolution_records,
             property_inline_cache_evolution_admitted,
             property_inline_cache_evolution_buffered,
             property_inline_cache_evolution_buffered_duplicates,
