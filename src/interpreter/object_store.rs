@@ -29,6 +29,11 @@ use crate::value::CellValue;
 // `VisitChildren` method-table boundary; `CellPtr` is the carried arena cell address the
 // membership gate (`MarkedSpace::is_arena_cell`) admits. See `mark_live_set`.
 use crate::gc::{CellPtr, MarkedSpace, SlotVisitor, VisitChildren};
+// GC-U7.0 re-home (ratified): the WeakRegistry (heap/WeakSet.h + WeakBlock.h slot-metadata
+// machinery) is owned by the LIVE collector — this store — so the end-of-cycle reap seam
+// (`Heap::runEndPhase` -> reapWeakHandles, heap/Heap.cpp:1750) can reach it. See the
+// `CoreObjectStore::weak` field.
+use crate::gc::WeakRegistry;
 
 pub(crate) fn can_use_get_by_id_megamorphic_property_name(text: &str) -> bool {
     !matches!(text, "length" | "name" | "prototype" | "__proto__")
@@ -268,6 +273,27 @@ pub(crate) struct CoreObjectStore {
     // aux-slab POD expedient, gc-r4 SD-4) must dereference ONLY an address this set vouches
     // for. Keyed by interpreter pointer bits — no DoS surface — so the int hasher.
     pub(crate) live_object_addrs: HashSet<usize, FxIntBuildHasher>,
+    // GC-U7.0 re-home (ratified): the `WeakRegistry` — Weak<T>-handle slot metadata (the
+    // heap/WeakSet.h + WeakBlock.h machinery, aggregated in gc/weak.rs + gc/heap.rs) — is
+    // OWNED by the live collector. C++ JSC owns it on the SAME Heap whose cycle reaps it
+    // (Heap::runEndPhase -> reapWeakHandles(), heap/Heap.cpp:1750); it previously hung off
+    // the descriptor-layer `gc::Heap`, which the live collection cycle never touches — a
+    // divergence that left the registry unreachable from the only collector that could reap
+    // it. No live registrations exist yet (nothing outside gc/heap.rs's own tests consumed
+    // the old field); when Weak<T> handles gain live users, `finalize_unconditional_
+    // finalizers`'s seam drives the reap over THIS registry.
+    pub(crate) weak: WeakRegistry,
+    // GC-U7.1 — the `Heap::m_weakMapSpace` / `m_weakSetSpace` IsoSubspace-membership analog
+    // (heap/Heap.h; populated per-cell in JSWeakMap.h/JSWeakSet.h subspaceFor<>): the arena
+    // addresses of every live JSWeakMap / JSWeakSet cell. The Output marking constraint
+    // iterates m_weakMapSpace's MARKED cells (Heap::addCoreConstraints "O", Heap.cpp:
+    // 3127-3158) and finalizeUnconditionalFinalizers iterates both spaces' MARKED cells
+    // (Heap.cpp:815-818). Registered at `allocate_weak_map`/`allocate_weak_set`; a DEAD
+    // member is dropped by `finalize_unconditional_finalizers` (its cell is then reclaimed
+    // by the reconcile+sweep) — the analog of IsoSubspace membership dying with the cell —
+    // so no stale (recyclable) address ever survives a cycle here.
+    pub(crate) weak_map_space_addrs: Vec<usize>,
+    pub(crate) weak_set_space_addrs: Vec<usize>,
     // gc-r4-completion U1 (string-cell GC) — scratch list the pre-sweep reconcile fills with
     // every DEAD (unmarked) LEAF cell's arena address (String now; Symbol/BigInt at U2/U3).
     // The shared arena is ONE Heap with multiple subspaces (HeapUtil.h): object AND leaf cells
@@ -2866,8 +2892,19 @@ impl CoreObjectStore {
                 }
             }
         }
-        // Map/WeakMap insertion-ordered entries: visit BOTH the key and the value.
-        if cell.map_entries != AuxiliaryHandle::INVALID {
+        // Map insertion-ordered entries: visit BOTH the key and the value (the strong
+        // JSMap table — OrderedHashTable storage is a visited JSCellButterfly).
+        //
+        // GC-U7.1 — a WeakMap is EXCLUDED: WeakMapImpl::visitChildrenImpl visits ONLY
+        // Base (runtime/WeakMapImpl.cpp:49-57) — a bucket's KEY is weak (never marked
+        // through the map) and its VALUE is marked only when the key is independently
+        // marked, by the Output-constraint fixpoint (`visit_weak_map_output_constraints`,
+        // the WeakMapImpl::visitOutputConstraints analog, WeakMapImpl.cpp:82-98); entries
+        // whose key stays unmarked are dropped by `finalize_unconditional_finalizers`
+        // (WeakMapImpl::finalizeUnconditionally, WeakMapImplInlines.h:109-128). The prior
+        // unconditional key+value visit here was the strong-key divergence (a live spec
+        // violation + unbounded leak).
+        if cell.map_entries != AuxiliaryHandle::INVALID && cell.kind != CoreObjectKind::WeakMap {
             if let Some(entries) = self.map_entry_lists.get(cell.map_entries.0) {
                 for &(key, value) in entries {
                     trace_value_edge(key, visitor);
@@ -2875,8 +2912,14 @@ impl CoreObjectStore {
                 }
             }
         }
-        // Set/WeakSet insertion-ordered values.
-        if cell.set_values != AuxiliaryHandle::INVALID {
+        // Set insertion-ordered values (the strong JSSet table).
+        //
+        // GC-U7.1 — a WeakSet is EXCLUDED for the same reason: its stored values ARE weak
+        // keys (WeakMapBucketDataKey has only `key`, WeakMapImpl.h:46-49), never marked
+        // through the set (visitChildrenImpl visits only Base) and it has NO output
+        // constraint (WeakMapImpl.cpp:68-80, "Only JSWeakMap needs to harvest value
+        // references"); dead members are dropped by `finalize_unconditional_finalizers`.
+        if cell.set_values != AuxiliaryHandle::INVALID && cell.kind != CoreObjectKind::WeakSet {
             if let Some(values) = self.set_value_lists.get(cell.set_values.0) {
                 for &value in values {
                     trace_value_edge(value, visitor);
@@ -3110,6 +3153,29 @@ impl CellEdgeVisitor for ObjectEdgeMarker<'_, '_> {
     }
 }
 
+/// GC-U7.1 — `isMarked(bucket->key())`, the weak-collection KEY liveness test shared by
+/// the mark-time output constraint (`visitor.isMarked`, WeakMapImpl.cpp:94) and the
+/// end-of-cycle reap (`vm.heap.isMarked`, WeakMapImplInlines.h:117). A free fn (not a
+/// `&self` method) so the reap can call it while `map_entry_lists`/`set_value_lists` are
+/// mutably borrowed (disjoint-field borrow of `space`).
+///
+/// C++ keys are always `JSCell*` (canBeHeldWeakly gates WeakMap.set/WeakSet.add,
+/// WeakMapImplInlines.h:50-58; the port's natives reject non-object keys with "Invalid
+/// value used as weak collection key"). Port envelope, retain-only safe: a NON-cell key
+/// (defensive; unreachable via the natives) and a cell OUTSIDE the arena (a foreign
+/// leaf-store cell this collector neither marks nor sweeps — it cannot be proven dead)
+/// count as MARKED, so their entries are retained; an arena cell key is live iff its
+/// mark bit is set.
+fn weak_collection_key_is_marked(space: &MarkedSpace, key: RuntimeValue) -> bool {
+    let Some(addr) = key.as_cell().map(|c| c.pointer_payload_bits()) else {
+        return true;
+    };
+    match space.is_arena_cell(addr) {
+        Some(cp) => space.collector_is_marked(cp),
+        None => true,
+    }
+}
+
 // gc-r4 R4b-mark authored-but-unwired (the live driver/safepoint is R4b-sweep, gc-r4.md
 // decision 6): these methods are exercised by the tests + the future driver, dead in the
 // non-test lib build. `#[allow(dead_code)]` on the impl applies to every method.
@@ -3275,10 +3341,94 @@ impl CoreObjectStore {
         let mut visitor = SlotVisitor::new();
         // SlotVisitor::append(ConservativeRoots) then drain (Heap::markToFixpoint).
         visitor.mark_from_roots(&seeds, &marker);
+        // GC-U7.1 — JSC's "O"/Output MARKING CONSTRAINT, run to fixpoint: after the drain
+        // converges, harvest each marked WeakMap's values whose keys got marked, and drain
+        // again until a full pass harvests nothing (the ephemeron key->value chain
+        // fixpoint). See `visit_weak_map_output_constraints` for the C++ mapping.
+        self.visit_weak_map_output_constraints(&mut visitor, &marker);
         MarkStats {
             marked_cells: visitor.visit_count(),
             seeded_roots,
             bytes_visited: visitor.bytes_visited(),
+        }
+    }
+
+    /// GC-U7.1 — the WeakMap OUTPUT-CONSTRAINT fixpoint. C++ mapping:
+    ///
+    /// - `WeakMapImpl<WeakMapBucket<WeakMapBucketDataKeyValue>>::visitOutputConstraints`
+    ///   (runtime/WeakMapImpl.cpp:82-98): for every non-empty bucket of a JSWeakMap, if
+    ///   `visitor.isMarked(bucket->key())`, `bucket->visitAggregate(visitor)` appends the
+    ///   VALUE (WeakMapImpl.h:153-157) — the key itself is never appended.
+    /// - The constraint is registered as the "O"/"Output" core marking constraint over
+    ///   `m_weakMapSpace`'s MARKED cells (Heap::addCoreConstraints, heap/Heap.cpp:
+    ///   3127-3158) with `ConstraintVolatility::GreyedByMarking` (ConstraintVolatility.h:49),
+    ///   so `MarkingConstraintSet::executeConvergence` re-executes it each convergence
+    ///   round of the marking fixpoint until a round visits nothing new
+    ///   (MarkingConstraintSet.cpp:97-164: "Return true if we've converged. That happens
+    ///   if we did not visit anything."). That re-execution is what resolves key->value
+    ///   DEPENDENCY CHAINS (a WeakMap value that is itself the key of another entry).
+    /// - JSWeakSet has NO output constraint (WeakMapImpl.cpp:68-80: "Only JSWeakMap needs
+    ///   to harvest value references"), so `weak_set_space_addrs` is not consulted here.
+    ///
+    /// STW SINGLE-THREAD REDUCTION (equivalent, commented per the unit brief): C++
+    /// interleaves constraint execution with parallel draining inside `runFixpointPhase`;
+    /// this port's mark loop is a single-threaded drain, so the SAME convergence is: scan
+    /// all marked WeakMaps once (appending values of marked keys), drain the newly greyed
+    /// cells, and repeat until one full scan appends nothing. `append_unbarriered` sets
+    /// the mark bit at append time (test-and-set, SlotVisitorInlines.h:43), so a scan
+    /// pass already observes keys marked earlier in the SAME pass; the loop only spins
+    /// for chains ordered against the scan (proven by the reversed-order chain test).
+    /// The registered-member walk gates on `is_arena_cell` MEMBERSHIP + the mark bit —
+    /// the `forEachMarkedCell` analog — and never derefs an unvouched address.
+    fn visit_weak_map_output_constraints(
+        &self,
+        visitor: &mut SlotVisitor,
+        marker: &ObjectGraphMarker<'_>,
+    ) {
+        loop {
+            let before = visitor.visit_count();
+            for &addr in &self.weak_map_space_addrs {
+                // forEachMarkedCell over m_weakMapSpace (Heap.cpp:3151-3155): only a
+                // MARKED WeakMap harvests; a dead one's entries die with it.
+                let Some(cp) = self.space.is_arena_cell(addr) else {
+                    continue;
+                };
+                if !self.space.collector_is_marked(cp) {
+                    continue;
+                }
+                let Some(cell) = self.arena_cell_for_mark(cp) else {
+                    continue;
+                };
+                debug_assert_eq!(
+                    cell.kind,
+                    CoreObjectKind::WeakMap,
+                    "weak_map_space_addrs member is not a WeakMap cell"
+                );
+                if cell.map_entries == AuxiliaryHandle::INVALID {
+                    continue;
+                }
+                let Some(entries) = self.map_entry_lists.get(cell.map_entries.0) else {
+                    continue;
+                };
+                let mut edges = ObjectEdgeMarker {
+                    visitor,
+                    space: &self.space,
+                };
+                for &(key, value) in entries {
+                    // visitor.isMarked(bucket->key()) (WeakMapImpl.cpp:94).
+                    if weak_collection_key_is_marked(&self.space, key) {
+                        // bucket->visitAggregate(visitor): append the VALUE only
+                        // (WeakMapImpl.h:153-157).
+                        trace_value_edge(value, &mut edges);
+                    }
+                }
+            }
+            if visitor.visit_count() == before {
+                return; // converged: the constraint pass visited nothing new
+            }
+            // Newly appended values may transitively mark other entries' keys; drain
+            // them and run another constraint round (executeConvergence's re-execution).
+            visitor.drain(marker);
         }
     }
 
@@ -3702,13 +3852,20 @@ impl CoreObjectStore {
     ///
     /// PHASE ORDER IS LOAD-BEARING:
     ///   1. `mark_live_set_from_addrs` clears all marks (begin-marking) then marks the live
-    ///      closure (membership-gated; survives ≥2 collections — the landmine).
-    ///   2. `reconcile_dead_cells_before_sweep` frees dead cells' slabs + reverse-index
-    ///      while their bytes are still intact — BEFORE step 3 clobbers them.
-    ///   3. `sweep_all_object_blocks` reclaims dead cells' atoms into the directories'
+    ///      closure (membership-gated; survives ≥2 collections — the landmine), including
+    ///      the WeakMap output-constraint fixpoint (GC-U7.1).
+    ///   2. `finalize_unconditional_finalizers` — GC-U7.0 the REAP->FINALIZE SEAM, the
+    ///      `Heap::runEndPhase` position (heap/Heap.cpp:1705: after `endMarking`, before
+    ///      the sweep, the C++ collector runs `reapWeakHandles()` :1750 and
+    ///      `finalizeUnconditionalFinalizers()` :1754): drop each marked WeakMap/WeakSet's
+    ///      dead-key entries while liveness == this cycle's marks.
+    ///   3. `reconcile_dead_cells_before_sweep` frees dead cells' slabs + reverse-index
+    ///      while their bytes are still intact — BEFORE step 4 clobbers them.
+    ///   4. `sweep_all_object_blocks` reclaims dead cells' atoms into the directories'
     ///      combined FreeLists (DoesNotHave; post-sweep liveness == marks alone).
     pub(crate) fn force_collect(&mut self, root_addrs: &[usize]) -> CollectStats {
         let mark = self.mark_live_set_from_addrs(root_addrs);
+        self.finalize_unconditional_finalizers();
         let reconcile = self.reconcile_dead_cells_before_sweep();
         let sweep = self.space.sweep_all_object_blocks();
         // Post-reconcile, the authoritative live set must be EXACTLY the marked survivors
@@ -3725,6 +3882,134 @@ impl CoreObjectStore {
             slab_slots_freed: reconcile.slab_slots_freed,
             atoms_reclaimed: sweep.freed_cells,
         }
+    }
+
+    /// GC-U7.0 (the SEAM) + U7.1 (WeakMap/WeakSet) — `Heap::finalizeUnconditionalFinalizers()`
+    /// (heap/Heap.cpp:783), at its `Heap::runEndPhase` position (heap/Heap.cpp:1705: after
+    /// `endMarking`, BEFORE the sweep — while liveness is exactly this cycle's mark bits and
+    /// dead cells' bytes are still intact). Returns the number of weak-collection entries
+    /// dropped.
+    ///
+    /// TODAY'S FINALIZERS — JSWeakMap + JSWeakSet (Heap.cpp:815-818 →
+    /// `WeakMapImpl::finalizeUnconditionally`, runtime/WeakMapImplInlines.h:109-128): for
+    /// every MARKED weak collection, drop each entry whose key is not marked
+    /// (`vm.heap.isMarked(bucket->key())` → `makeDeleted()`). The Vec `retain` also
+    /// compacts, subsuming the `shouldShrink()` → `rehash(RemoveBatching)` tail
+    /// (WeakMapImplInlines.h:126-127) under the module's documented Vec-instead-of-
+    /// open-addressing POD expedient. A DEAD (unmarked) member is dropped from the space
+    /// membership instead — the IsoSubspace-membership-dies-with-the-cell analog — and its
+    /// storage (cell atom + entry slab) is reclaimed by the following reconcile+sweep, so
+    /// no recyclable address survives a cycle in `weak_{map,set}_space_addrs`.
+    ///
+    /// THE SEAM IS SHARED (GC-U7.0, ratified): future end-of-cycle weak processing plugs
+    /// into THIS step, in the C++ runEndPhase order —
+    ///  - `reapWeakHandles()` (Heap.cpp:1750) over the re-homed `self.weak` WeakRegistry
+    ///    once Weak<T> handles gain live registrations (none exist yet; nothing to reap);
+    ///  - `CodeBlock::finalizeUnconditionally`'s IC weak-structure reset (the
+    ///    `StructureStubInfo::reset_by_gc` consumer, bytecode/ic.rs:941 — INERT today,
+    ///    deliberately NOT wired by this unit).
+    pub(crate) fn finalize_unconditional_finalizers(&mut self) -> usize {
+        // ---- JSWeakMap (m_weakMapSpace, Heap.cpp:817) ----
+        // Phase 1 (read-only walk of the membership): prune DEAD members; collect each
+        // MARKED member's entry-slab handle. Mirrors `forEachMarkedCell` over the space.
+        let mut live_weak_map_entry_handles: Vec<usize> = Vec::new();
+        {
+            let space = &self.space;
+            let live = &self.live_object_addrs;
+            let handles = &mut live_weak_map_entry_handles;
+            self.weak_map_space_addrs.retain(|&addr| {
+                // Deref ONLY addresses the authoritative live set vouches for (the same
+                // read-safety rule as the reconcile). Membership is registered at
+                // allocation and pruned here every cycle, so a stale entry cannot occur
+                // in the force_collect order; drop defensively if it ever does.
+                if !live.contains(&addr) {
+                    debug_assert!(false, "weak_map_space_addrs member not in the live set");
+                    return false;
+                }
+                if !space.is_addr_marked(addr) {
+                    return false; // DEAD weak map: membership dies with the cell
+                }
+                // SAFETY: `addr` is in the authoritative `live_object_addrs` set => a
+                // byte-intact, once-exposed, initialized POD `CoreObjectCell` not yet
+                // swept (the sweep runs after this step); only shared borrows of
+                // disjoint store fields are live, so no `&mut` to this cell coexists;
+                // the `&` is dropped at closure end.
+                let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
+                debug_assert_eq!(
+                    cell.kind,
+                    CoreObjectKind::WeakMap,
+                    "weak_map_space_addrs member is not a WeakMap cell"
+                );
+                if cell.map_entries != AuxiliaryHandle::INVALID {
+                    handles.push(cell.map_entries.0);
+                }
+                true
+            });
+        }
+        // Phase 2 (mutate): WeakMapImpl::finalizeUnconditionally per marked map — drop
+        // every entry whose key is unmarked.
+        let mut entries_dropped = 0usize;
+        for handle in live_weak_map_entry_handles {
+            let space = &self.space;
+            if let Some(entries) = self.map_entry_lists.get_mut(handle) {
+                let before = entries.len();
+                entries.retain(|&(key, _)| weak_collection_key_is_marked(space, key));
+                entries_dropped += before - entries.len();
+            }
+        }
+
+        // ---- JSWeakSet (m_weakSetSpace, Heap.cpp:815) ----
+        // Identical shape; a WeakSet's stored values ARE its weak keys
+        // (WeakMapBucketDataKey, WeakMapImpl.h:46-49).
+        let mut live_weak_set_value_handles: Vec<usize> = Vec::new();
+        {
+            let space = &self.space;
+            let live = &self.live_object_addrs;
+            let handles = &mut live_weak_set_value_handles;
+            self.weak_set_space_addrs.retain(|&addr| {
+                if !live.contains(&addr) {
+                    debug_assert!(false, "weak_set_space_addrs member not in the live set");
+                    return false;
+                }
+                if !space.is_addr_marked(addr) {
+                    return false; // DEAD weak set: membership dies with the cell
+                }
+                // SAFETY: identical to the WeakMap arm above.
+                let cell = unsafe { &*core::ptr::with_exposed_provenance::<CoreObjectCell>(addr) };
+                debug_assert_eq!(
+                    cell.kind,
+                    CoreObjectKind::WeakSet,
+                    "weak_set_space_addrs member is not a WeakSet cell"
+                );
+                if cell.set_values != AuxiliaryHandle::INVALID {
+                    handles.push(cell.set_values.0);
+                }
+                true
+            });
+        }
+        for handle in live_weak_set_value_handles {
+            let space = &self.space;
+            if let Some(values) = self.set_value_lists.get_mut(handle) {
+                let before = values.len();
+                values.retain(|&value| weak_collection_key_is_marked(space, value));
+                entries_dropped += before - values.len();
+            }
+        }
+        entries_dropped
+    }
+
+    /// GC-U7.0 re-home — the WeakRegistry accessor (was `gc::Heap::weak_registry()`): the
+    /// live collector owns the Weak<T>-handle slot metadata the end-of-cycle reap consumes
+    /// (`Heap::runEndPhase` -> reapWeakHandles, heap/Heap.cpp:1750).
+    pub(crate) fn weak_registry(&self) -> &WeakRegistry {
+        &self.weak
+    }
+
+    /// GC-U7.0 re-home — mutable registrar surface (was `gc::Heap::register_weak_set` /
+    /// `register_weak` / `process_weak` delegation; the registry's own methods carry the
+    /// duplicate/unknown-ID validation).
+    pub(crate) fn weak_registry_mut(&mut self) -> &mut WeakRegistry {
+        &mut self.weak
     }
 
     /// Convenience: `force_collect` over `RuntimeValue` roots, folding in the store's own
@@ -5283,12 +5568,18 @@ impl CoreObjectStore {
         // gc-r4 Map/Set unit: a WeakMap stores (key,value) entries like a Map, so it
         // eagerly gets a map-entry backing (see `allocate_map`).
         let entries = self.allocate_map_entries();
-        self.allocate_cell(CoreObjectCell {
+        let value = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::WeakMap,
             prototype: Some(prototype),
             map_entries: entries,
             ..CoreObjectCell::default()
-        })
+        });
+        // GC-U7.1 — register in the m_weakMapSpace membership (JSWeakMap.h subspaceFor<>):
+        // the Output marking constraint and finalizeUnconditionalFinalizers iterate this.
+        if let Some(addr) = value.as_cell().map(|c| c.pointer_payload_bits()) {
+            self.weak_map_space_addrs.push(addr);
+        }
+        value
     }
 
     pub(crate) fn allocate_weak_set(&mut self) -> RuntimeValue {
@@ -5296,12 +5587,19 @@ impl CoreObjectStore {
         // gc-r4 Map/Set unit: a WeakSet stores values like a Set, so it eagerly gets a
         // set-value backing (see `allocate_map`).
         let values = self.allocate_set_values();
-        self.allocate_cell(CoreObjectCell {
+        let value = self.allocate_cell(CoreObjectCell {
             kind: CoreObjectKind::WeakSet,
             prototype: Some(prototype),
             set_values: values,
             ..CoreObjectCell::default()
-        })
+        });
+        // GC-U7.1 — register in the m_weakSetSpace membership (JSWeakSet.h subspaceFor<>):
+        // finalizeUnconditionalFinalizers iterates this (WeakSet has no output constraint —
+        // WeakMapImpl.cpp:68-80, "Only JSWeakMap needs to harvest value references").
+        if let Some(addr) = value.as_cell().map(|c| c.pointer_payload_bits()) {
+            self.weak_set_space_addrs.push(addr);
+        }
+        value
     }
 
     pub(crate) fn ensure_object_prototype(&mut self) -> RuntimeValue {
@@ -12592,6 +12890,299 @@ mod r4b_sweep_tests {
             "the freed butterfly slot is on the free list"
         );
         assert!(store.find(keep).is_some(), "the rooted object survived");
+    }
+}
+
+// GC-U7 — WeakMap/WeakSet weak-key GC semantics end-to-end on the live store: keys are
+// weak (never marked through the collection — WeakMapImpl::visitChildrenImpl visits only
+// Base, runtime/WeakMapImpl.cpp:49-57), values are marked only when their key is
+// independently live (visitOutputConstraints, WeakMapImpl.cpp:82-98, re-executed to the
+// marking-constraint fixpoint, MarkingConstraintSet.cpp:97-164), and dead-key entries are
+// dropped by the reap->finalize seam between mark and sweep
+// (WeakMapImpl::finalizeUnconditionally, WeakMapImplInlines.h:109-128, at the
+// Heap::runEndPhase position, heap/Heap.cpp:1754).
+#[cfg(test)]
+mod weak_collection_gc_u7_tests {
+    use super::*;
+    use crate::gc::{
+        HeapId, WeakEdgeKind, WeakId, WeakProcessingPhase, WeakRegistrationRecord,
+        WeakSetDescriptor, WeakSetId, WeakSlotState,
+    };
+
+    fn obj(store: &mut CoreObjectStore) -> RuntimeValue {
+        store.allocate()
+    }
+
+    /// (a) An entry whose key dies is REMOVED by the reap, and its value is reclaimed
+    /// when otherwise unreferenced — the spec semantic the old unconditional key+value
+    /// trace (the strong-key divergence) violated as an unbounded leak.
+    #[test]
+    fn weak_map_dead_key_entry_dropped_and_value_reclaimed() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_weak_map();
+        let key = obj(&mut store);
+        let value = obj(&mut store);
+        store.map_entries_push(map, key, value);
+        assert_eq!(store.map_entries_len(map), 1);
+
+        // Only the map is rooted; the key is garbage.
+        store.force_collect_values(&[map]);
+
+        assert_eq!(
+            store.map_entries_len(map),
+            0,
+            "the dead-key entry was dropped by finalizeUnconditionally"
+        );
+        assert!(store.find(key).is_none(), "the dead key was reclaimed");
+        assert!(
+            store.find(value).is_none(),
+            "the value was NOT kept alive through the weak map (the old strong-key leak)"
+        );
+        assert!(store.find(map).is_some(), "the rooted weak map survives");
+    }
+
+    /// (b) An entry whose key lives keeps its value alive (the ephemeron output
+    /// constraint), across a 2nd collection too (the membership landmine).
+    #[test]
+    fn weak_map_live_key_keeps_value_alive() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_weak_map();
+        let key = obj(&mut store);
+        let value = obj(&mut store);
+        store.map_entries_push(map, key, value);
+
+        store.force_collect_values(&[map, key]);
+
+        assert_eq!(
+            store.map_entries_len(map),
+            1,
+            "the live-key entry is retained"
+        );
+        assert_eq!(store.map_entry_value(map, 0), Some(value));
+        assert!(
+            store.find(value).is_some(),
+            "the value is kept alive by its independently-live key"
+        );
+
+        store.force_collect_values(&[map, key]);
+        assert_eq!(store.map_entries_len(map), 1);
+        assert!(
+            store.find(value).is_some(),
+            "retained across a 2nd collection"
+        );
+    }
+
+    /// (c) THE CHAIN CASE (the visitOutputConstraints fixpoint): m = {k1→k2, k2→v} with
+    /// the entries stored in REVERSED order ([k2→v, k1→k2]) so a single in-order
+    /// constraint pass cannot resolve the chain — pass 1 skips (k2,v) (k2 not yet
+    /// marked), then marks k2 via (k1,k2); only the RE-EXECUTED pass (the
+    /// executeConvergence re-run) marks v. k1 live ⇒ k2 AND v live; k1 dead ⇒ all
+    /// reclaimed and both entries dropped.
+    #[test]
+    fn weak_map_key_chain_fixpoint_marks_dependent_values() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_weak_map();
+        let k1 = obj(&mut store);
+        let k2 = obj(&mut store);
+        let v = obj(&mut store);
+        // Reversed order: the (k2 -> v) entry precedes the (k1 -> k2) entry that
+        // makes k2 live.
+        store.map_entries_push(map, k2, v);
+        store.map_entries_push(map, k1, k2);
+
+        store.force_collect_values(&[map, k1]);
+
+        assert_eq!(
+            store.map_entries_len(map),
+            2,
+            "both entries retained: k1 live => k2 live => v live"
+        );
+        assert!(
+            store.find(k2).is_some(),
+            "k2 kept alive as the value of live k1"
+        );
+        assert!(
+            store.find(v).is_some(),
+            "v kept alive by the constraint fixpoint (k2 became live mid-marking)"
+        );
+
+        // k1 dead => the whole chain is garbage; the reap drops both entries.
+        store.force_collect_values(&[map]);
+        assert_eq!(
+            store.map_entries_len(map),
+            0,
+            "chain entries dropped once k1 died"
+        );
+        assert!(store.find(k1).is_none());
+        assert!(store.find(k2).is_none());
+        assert!(store.find(v).is_none());
+        assert!(store.find(map).is_some());
+    }
+
+    /// (c') The chain ACROSS two WeakMaps: m_late = {k2→v} (allocated/scanned FIRST),
+    /// m_early = {k1→k2}; k1 live ⇒ v live through both maps. Proves the constraint
+    /// re-executes over EVERY marked WeakMap per round (the m_weakMapSpace walk,
+    /// Heap.cpp:3151-3155), not per-map in isolation.
+    #[test]
+    fn weak_map_chain_across_two_maps_fixpoint() {
+        let mut store = CoreObjectStore::default();
+        // Allocated first => scanned first, before its key k2 can be live in round 1.
+        let m_late = store.allocate_weak_map();
+        let m_early = store.allocate_weak_map();
+        let k1 = obj(&mut store);
+        let k2 = obj(&mut store);
+        let v = obj(&mut store);
+        store.map_entries_push(m_late, k2, v);
+        store.map_entries_push(m_early, k1, k2);
+
+        store.force_collect_values(&[m_late, m_early, k1]);
+
+        assert!(store.find(k2).is_some(), "k2 live via m_early's live k1");
+        assert!(
+            store.find(v).is_some(),
+            "v live via m_late once k2 became live"
+        );
+        assert_eq!(store.map_entries_len(m_early), 1);
+        assert_eq!(store.map_entries_len(m_late), 1);
+
+        // k1 dead => the cross-map chain is garbage.
+        store.force_collect_values(&[m_late, m_early]);
+        assert_eq!(store.map_entries_len(m_early), 0);
+        assert_eq!(store.map_entries_len(m_late), 0);
+        assert!(store.find(v).is_none());
+    }
+
+    /// (d) WeakSet mirror: a stored value IS a weak key (WeakMapBucketDataKey,
+    /// WeakMapImpl.h:46-49) — never kept alive by the set, dropped by the reap when
+    /// dead, retained while independently live.
+    #[test]
+    fn weak_set_dead_member_dropped_live_member_kept() {
+        let mut store = CoreObjectStore::default();
+        let set = store.allocate_weak_set();
+        let live = obj(&mut store);
+        let dead = obj(&mut store);
+        store.set_values_push(set, live);
+        store.set_values_push(set, dead);
+        assert_eq!(store.set_values_len(set), 2);
+
+        store.force_collect_values(&[set, live]);
+
+        assert_eq!(store.set_values_len(set), 1, "the dead member was dropped");
+        assert_eq!(store.set_values_snapshot(set), vec![live]);
+        assert!(
+            store.find(dead).is_none(),
+            "the weak set did NOT keep its member alive"
+        );
+        assert!(
+            store.find(live).is_some(),
+            "the independently-live member is retained"
+        );
+    }
+
+    /// A DEAD weak collection is reclaimed whole and its space membership dies with the
+    /// cell (the IsoSubspace analog) — no stale (recyclable) address survives a cycle in
+    /// `weak_{map,set}_space_addrs`.
+    #[test]
+    fn dead_weak_collections_pruned_from_space_membership() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_weak_map();
+        let set = store.allocate_weak_set();
+        let key = obj(&mut store);
+        store.map_entries_push(map, key, key);
+        store.set_values_push(set, key);
+        assert_eq!(store.weak_map_space_addrs.len(), 1);
+        assert_eq!(store.weak_set_space_addrs.len(), 1);
+
+        // Nothing roots the collections; the key stays rooted independently.
+        store.force_collect_values(&[key]);
+
+        assert!(store.find(map).is_none(), "the dead weak map was reclaimed");
+        assert!(store.find(set).is_none(), "the dead weak set was reclaimed");
+        assert!(
+            store.weak_map_space_addrs.is_empty(),
+            "m_weakMapSpace membership died with the cell"
+        );
+        assert!(
+            store.weak_set_space_addrs.is_empty(),
+            "m_weakSetSpace membership died with the cell"
+        );
+        assert!(store.find(key).is_some(), "the rooted key survives");
+
+        // Stability: another cycle after the prune (dead addresses may be recycled by
+        // arbitrary cells) neither derefs a stale member nor resurrects one.
+        let key2 = obj(&mut store);
+        store.force_collect_values(&[key, key2]);
+        assert!(store.weak_map_space_addrs.is_empty());
+        assert!(store.weak_set_space_addrs.is_empty());
+    }
+
+    /// Control: the kind split did NOT weaken the STRONG collections — a Map/Set keeps
+    /// otherwise-unreferenced entries alive (JSMap/JSSet OrderedHashTable storage is
+    /// strongly visited by visitChildren).
+    #[test]
+    fn strong_map_and_set_still_retain_entries() {
+        let mut store = CoreObjectStore::default();
+        let map = store.allocate_map();
+        let set = store.allocate_set();
+        let key = obj(&mut store);
+        let value = obj(&mut store);
+        let member = obj(&mut store);
+        store.map_entries_push(map, key, value);
+        store.set_values_push(set, member);
+
+        store.force_collect_values(&[map, set]);
+
+        assert!(store.find(key).is_some(), "strong Map key retained");
+        assert!(store.find(value).is_some(), "strong Map value retained");
+        assert!(store.find(member).is_some(), "strong Set member retained");
+        assert_eq!(store.map_entries_len(map), 1);
+        assert_eq!(store.set_values_len(set), 1);
+    }
+
+    /// GC-U7.0 re-home — moved from gc/heap.rs (`heap_weak_processing_clears_dead_target`):
+    /// the WeakRegistry is owned by the live collector now; the validate->clear transition
+    /// pair still clears a dead slot's target through the store-owned registry.
+    #[test]
+    fn weak_registry_rehome_processing_clears_dead_target() {
+        let mut store = CoreObjectStore::default();
+        store
+            .weak_registry_mut()
+            .register_set(WeakSetDescriptor {
+                id: WeakSetId(1),
+                heap: HeapId::default(),
+                blocks: Vec::new(),
+                allocator_block: None,
+                next_allocator_block: None,
+                active_phase: None,
+            })
+            .expect("weak set");
+        store
+            .weak_registry_mut()
+            .register_weak(WeakRegistrationRecord {
+                id: WeakId(7),
+                set: WeakSetId(1),
+                owner: None,
+                target: None,
+                kind: WeakEdgeKind::Ordinary,
+                state: WeakSlotState::Live,
+            })
+            .expect("weak registration");
+
+        assert_eq!(
+            store
+                .weak_registry_mut()
+                .process_weak(WeakId(7), WeakProcessingPhase::Validate, false, None)
+                .map(|transition| transition.outcome.to),
+            Ok(WeakSlotState::ClearPending)
+        );
+        assert_eq!(
+            store
+                .weak_registry_mut()
+                .process_weak(WeakId(7), WeakProcessingPhase::Clear, false, None)
+                .map(|transition| transition.outcome.clears_target),
+            Ok(true)
+        );
+        assert_eq!(store.weak_registry().slots()[0].target, None);
     }
 }
 

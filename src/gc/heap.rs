@@ -210,7 +210,9 @@ pub const STATIC_HEAP_SCHEMA_DESCRIPTOR: HeapSchemaDescriptor = HeapSchemaDescri
     authority: HeapSchemaRegistryAuthority::StaticReadOnly,
     allocation_registry: static_allocation_schema_registry(),
     root_registry_owner: "gc::heap::RootSet",
-    weak_registry_owner: "gc::heap::WeakRegistry",
+    // U7.0 re-home: the WeakRegistry is owned by the live collector so the end-of-cycle
+    // reap (Heap::runEndPhase -> reapWeakHandles, heap/Heap.cpp:1750) can reach it.
+    weak_registry_owner: "interpreter::CoreObjectStore::weak (gc::heap::WeakRegistry)",
     finalizer_registry_owner: "gc::heap::FinalizationRegistry",
 };
 
@@ -437,7 +439,12 @@ pub struct Heap {
     next_snapshot: u64,
     roots: RootSet,
     targeted_roots: TargetedRootSet,
-    weak: WeakRegistry,
+    // U7.0 re-home (ratified): the `WeakRegistry` no longer hangs off this descriptor-layer
+    // Heap. C++ JSC's weak machinery (heap/WeakSet.h / WeakBlock.h) is owned by the SAME
+    // Heap whose cycle reaps it (Heap::runEndPhase -> reapWeakHandles, heap/Heap.cpp:1750);
+    // here the live collection cycle is `CoreObjectStore::force_collect`, so the registry
+    // moved there (`CoreObjectStore::weak`). Nothing outside this file's tests consumed the
+    // old field, so no delegation is kept.
     finalizers: FinalizationRegistry,
     object_space: MarkedSpaceDescriptor,
     requests: Vec<CollectionRequest>,
@@ -492,7 +499,6 @@ impl Heap {
             next_snapshot: 1,
             roots: RootSet::default(),
             targeted_roots: TargetedRootSet::default(),
-            weak: WeakRegistry::default(),
             finalizers: FinalizationRegistry::default(),
             object_space: MarkedSpaceDescriptor::new(id),
             requests: Vec::new(),
@@ -531,10 +537,6 @@ impl Heap {
 
     pub fn targeted_roots(&self) -> &TargetedRootSet {
         &self.targeted_roots
-    }
-
-    pub fn weak_registry(&self) -> &WeakRegistry {
-        &self.weak
     }
 
     pub fn finalization_registry(&self) -> &FinalizationRegistry {
@@ -1091,38 +1093,9 @@ impl Heap {
         Ok(WriteBarrierApplicationRecord { request, outcome })
     }
 
-    pub fn register_weak_set(
-        &mut self,
-        set: WeakSetDescriptor,
-    ) -> Result<(), HeapIntegrationError> {
-        self.require_heap(set.heap)?;
-        self.weak.register_set(set)
-    }
-
-    pub fn register_weak(
-        &mut self,
-        record: WeakRegistrationRecord,
-    ) -> Result<(), HeapIntegrationError> {
-        if let Some(target) = record.target {
-            self.require_known_cell(target)?;
-        }
-        self.weak.register_weak(record)
-    }
-
-    pub fn process_weak(
-        &mut self,
-        weak: WeakId,
-        phase: WeakProcessingPhase,
-        target_is_live: bool,
-        owner: Option<WeakHandleOwnerContract>,
-    ) -> Result<WeakProcessingTransitionRecord, HeapIntegrationError> {
-        evaluate_heap_semantics(
-            self.state_descriptor(),
-            HeapMutationAuthority::WeakProcessor,
-            HeapSemanticOperation::ProcessWeak,
-        )?;
-        self.weak.process_weak(weak, phase, target_is_live, owner)
-    }
+    // U7.0 re-home: `register_weak_set` / `register_weak` / `process_weak` moved to the
+    // live collector (`CoreObjectStore::weak_registry_mut()`), which owns the WeakRegistry
+    // the end-of-cycle reap consumes (Heap::runEndPhase -> reapWeakHandles, Heap.cpp:1750).
 
     pub fn register_finalizer_callback(
         &mut self,
@@ -2673,26 +2646,14 @@ mod tests {
 
     #[test]
     fn heap_no_gc_scope_blocks_weak_processing() {
+        // U7.0 re-home: the WeakRegistry now hangs off the live collector
+        // (`CoreObjectStore::weak`), so this pins only the heap-state half the old
+        // Heap::process_weak delegation enforced — a no-GC scope blocks the
+        // ProcessWeak OPERATION against this heap's state descriptor. The registry
+        // transition semantics are covered at the registry's new home
+        // (`weak_registry_rehome_processing_clears_dead_target`, object_store.rs)
+        // and in gc/weak.rs's own state-machine tests.
         let mut heap = Heap::new();
-        let target = allocate_test_cell(&mut heap);
-        heap.register_weak_set(WeakSetDescriptor {
-            id: WeakSetId(1),
-            heap: heap.id(),
-            blocks: Vec::new(),
-            allocator_block: None,
-            next_allocator_block: None,
-            active_phase: None,
-        })
-        .expect("weak set");
-        heap.register_weak(WeakRegistrationRecord {
-            id: WeakId(7),
-            set: WeakSetId(1),
-            owner: None,
-            target: Some(target),
-            kind: WeakEdgeKind::Ordinary,
-            state: WeakSlotState::Live,
-        })
-        .expect("weak registration");
         let scope = heap.enter_no_gc_scope();
         heap.enter_phase(
             GcPhase::Fixpoint,
@@ -2701,13 +2662,15 @@ mod tests {
         );
 
         assert_eq!(
-            heap.process_weak(WeakId(7), WeakProcessingPhase::Validate, false, None),
-            Err(HeapIntegrationError::HeapSemantic(
-                HeapSemanticError::NoGcScopeActive(HeapSemanticOperation::ProcessWeak)
+            evaluate_heap_semantics(
+                heap.state_descriptor(),
+                HeapMutationAuthority::WeakProcessor,
+                HeapSemanticOperation::ProcessWeak,
+            ),
+            Err(HeapSemanticError::NoGcScopeActive(
+                HeapSemanticOperation::ProcessWeak
             ))
         );
-        assert_eq!(heap.weak_registry().slots()[0].state, WeakSlotState::Live);
-        assert!(heap.weak_registry().transitions().is_empty());
 
         heap.leave_phase();
         assert_eq!(heap.leave_no_gc_scope(scope), Ok(()));
@@ -3049,50 +3012,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heap_weak_processing_clears_dead_target() {
-        let mut heap = Heap::new();
-        let subspace = test_subspace(&heap);
-        let target = heap
-            .allocate(heap.allocation_plan(&subspace), 64)
-            .map(|response| response.cell)
-            .expect("target allocation");
-        heap.register_weak_set(WeakSetDescriptor {
-            id: WeakSetId(1),
-            heap: heap.id(),
-            blocks: Vec::new(),
-            allocator_block: None,
-            next_allocator_block: None,
-            active_phase: None,
-        })
-        .expect("weak set");
-        heap.register_weak(WeakRegistrationRecord {
-            id: WeakId(7),
-            set: WeakSetId(1),
-            owner: None,
-            target: Some(target),
-            kind: WeakEdgeKind::Ordinary,
-            state: WeakSlotState::Live,
-        })
-        .expect("weak registration");
-        heap.enter_phase(
-            GcPhase::Fixpoint,
-            MutatorState::Collecting,
-            GcConductor::Collector,
-        );
-
-        assert_eq!(
-            heap.process_weak(WeakId(7), WeakProcessingPhase::Validate, false, None)
-                .map(|transition| transition.outcome.to),
-            Ok(WeakSlotState::ClearPending)
-        );
-        assert_eq!(
-            heap.process_weak(WeakId(7), WeakProcessingPhase::Clear, false, None)
-                .map(|transition| transition.outcome.clears_target),
-            Ok(true)
-        );
-        assert_eq!(heap.weak_registry().slots()[0].target, None);
-    }
+    // U7.0 re-home: `heap_weak_processing_clears_dead_target` moved to the registry's new
+    // owner as `weak_registry_rehome_processing_clears_dead_target`
+    // (interpreter/object_store.rs) — the live collector now owns the WeakRegistry.
 
     #[test]
     fn heap_finalization_queue_runs_ready_callback_boundary() {
