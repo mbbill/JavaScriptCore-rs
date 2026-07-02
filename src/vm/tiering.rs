@@ -356,8 +356,14 @@ impl VmTieringIntegration {
 
     // Batch 2: read the global plan-generation epoch (see the `plan_generation`
     // field comment). The Vm-side safepoint memo compares this against its stored
-    // per-owner snapshot to decide whether the six plan/candidate tables changed
-    // since the last full IC/tiering safepoint pass for that owner.
+    // per-owner snapshot to decide whether the four property-side plan/candidate
+    // tables changed since the last full IC/tiering safepoint pass for that
+    // owner. REDESIGN-AUDIT UNIT 2: this used to gate six tables (four
+    // property-side plus the two call-link tables consulted by
+    // `owner_has_any_safepoint_plan_work`); B3 removed the two call-link
+    // safepoint passes (call-link linking now happens in place at the slow path,
+    // faithful to `linkFor`/RepatchInlines.h:130), so only the four property-side
+    // tables remain live readers.
     pub(crate) fn plan_generation(&self) -> u64 {
         self.plan_generation
     }
@@ -367,13 +373,19 @@ impl VmTieringIntegration {
     }
 
     // Batch 2: the SINGLE bump site for the plan-generation epoch. Every mutation
-    // (insert OR lifecycle transition) of the six owner-keyed plan/candidate
-    // tables routes through this so omission is structurally impossible: a new
-    // mutator that forgets to call this is caught by the coverage test
-    // `plan_generation_advances_on_every_six_table_mutation`. Coarse over-bumping
-    // (e.g. when a transition's `.find()` misses or an outcome is Rejected) is
-    // sound -- it only forces an extra full safepoint pass, never skips a needed
-    // one.
+    // (insert OR lifecycle transition) of the four owner-keyed property-side
+    // plan/candidate tables routes through this so omission is structurally
+    // impossible: a new mutator that forgets to call this is caught by the
+    // coverage test `plan_generation_advances_on_every_four_table_mutation`.
+    // Coarse over-bumping (e.g. when a transition's `.find()` misses or an
+    // outcome is Rejected) is sound -- it only forces an extra full safepoint
+    // pass, never skips a needed one. REDESIGN-AUDIT UNIT 2: the call-link
+    // recorders (`record_call_link_attachment_plan`,
+    // `record_call_link_inline_cache_attachment`,
+    // `retire_call_link_inline_cache_metadata_for_clear`) no longer call this --
+    // `owner_has_any_safepoint_plan_work` (:658-674) has consulted only the four
+    // property-side tables since B3, so a call-link-only bump forced spurious
+    // memo misses with no reader to justify them.
     fn bump_plan_generation(&mut self) {
         self.plan_generation = self.plan_generation.saturating_add(1);
     }
@@ -4771,7 +4783,14 @@ impl VmTieringIntegration {
             lifecycle: VmCallLinkAttachmentPlanLifecycle::MetadataOnly,
             outcome,
         };
-        self.bump_plan_generation();
+        // DEAD BUMP REMOVED (redesign-audit Unit 2): `plan_generation` only gates
+        // the `Vm::run_ic_tiering_safepoint` memo, which since B3 consults ONLY the
+        // four property-side tables in `owner_has_any_safepoint_plan_work`
+        // (:658-674) -- the two call-link safepoint passes that used to read this
+        // table were removed. Bumping here forced spurious memo misses (extra,
+        // harmless-but-wasteful re-runs of the three idempotent property passes)
+        // for calls that touch no property IC. See `bump_plan_generation`'s
+        // updated doc comment.
         self.call_link_attachment_plan_records.push(record.clone());
         record
     }
@@ -4867,7 +4886,10 @@ impl VmTieringIntegration {
             outcome: outcome.clone(),
         };
 
-        self.bump_plan_generation();
+        // DEAD BUMP REMOVED (redesign-audit Unit 2): see the matching removal note
+        // in `record_call_link_attachment_plan` -- `plan_generation` no longer has
+        // a call-link-side reader since B3 removed the two call-link safepoint
+        // passes from `owner_has_any_safepoint_plan_work`.
         self.call_link_inline_cache_attachment_records
             .push(record.clone());
         record
@@ -4945,8 +4967,9 @@ impl VmTieringIntegration {
     ) {
         // Batch 2: this retires `call_link_inline_cache_attachment_records` and
         // `call_link_attachment_plan_records` entries (-> Cleared/RetiredByClear).
-        // Bump unconditionally at entry; over-bump if no record matches is sound.
-        self.bump_plan_generation();
+        // DEAD BUMP REMOVED (redesign-audit Unit 2): see the removal note in
+        // `record_call_link_attachment_plan` -- `plan_generation` has no
+        // call-link-side reader since B3.
         if let Some(attachment) = self
             .call_link_inline_cache_attachment_records
             .iter_mut()
@@ -35331,16 +35354,21 @@ mod tests {
     }
 
     // Batch 2 coverage test: `plan_generation` MUST advance after every kind of
-    // mutation (insert OR lifecycle transition) of the six owner-keyed
-    // plan/candidate tables. This is the omission-proofing guarantee for the
-    // steady-state safepoint memo in `Vm::run_ic_tiering_safepoint`: if a future
-    // edit adds a six-table mutator that forgets to bump the epoch (directly or
-    // by routing through one of the covered recorders), the memo could SKIP an
-    // IC/call-link materialization the call actually needs. Each block below
-    // captures the epoch, performs exactly one category of mutation through the
-    // public recorder, and asserts the epoch strictly increased.
+    // mutation (insert OR lifecycle transition) of the four owner-keyed
+    // property-side plan/candidate tables. This is the omission-proofing
+    // guarantee for the steady-state safepoint memo in
+    // `Vm::run_ic_tiering_safepoint`: if a future edit adds a four-table mutator
+    // that forgets to bump the epoch (directly or by routing through one of the
+    // covered recorders), the memo could SKIP an IC materialization the call
+    // actually needs. Each block below captures the epoch, performs exactly one
+    // category of mutation through the public recorder, and asserts the epoch
+    // strictly increased. REDESIGN-AUDIT UNIT 2: this used to cover six tables
+    // (four property-side plus two call-link tables); the call-link INSERT
+    // blocks were removed below along with the dead bumps they exercised (see
+    // `call_link_mutations_do_not_bump_plan_generation`), since B3 already
+    // removed `owner_has_any_safepoint_plan_work`'s only readers of those tables.
     #[test]
-    fn plan_generation_advances_on_every_six_table_mutation() {
+    fn plan_generation_advances_on_every_four_table_mutation() {
         // INSERT 1: property_load_access_case_plans (own-data load observation).
         {
             let owner = CodeBlockId(CellId(7001));
@@ -35455,40 +35483,8 @@ mod tests {
             assert!(before > 0, "attachment insert must bump plan_generation");
         }
 
-        // INSERT 5: call_link_attachment_plan_records.
-        {
-            let (tiering, ..) = record_call_link_attachment_plan_fixture();
-            assert_eq!(tiering.call_link_attachment_plan_records().len(), 1);
-            assert!(
-                tiering.plan_generation() > 0,
-                "call-link attachment plan insert must bump plan_generation"
-            );
-        }
-
-        // INSERT 6 + TRANSITION (clear): call_link_inline_cache_attachment_records
-        // insert plus retire_call_link_inline_cache_metadata_for_clear.
-        {
-            let (mut tiering, _, _, attachment, _, _) =
-                record_call_link_inline_cache_attachment_fixture();
-            assert!(
-                tiering.plan_generation() > 0,
-                "call-link inline cache attachment insert must bump plan_generation"
-            );
-            let before = tiering.plan_generation();
-            let request = call_link_inline_cache_clear_request(&attachment);
-            let outcome = call_link_inline_cache_clear_outcome(&attachment);
-            tiering.record_call_link_inline_cache_clear(
-                request,
-                VmCallLinkInlineCacheClearOutcome::Accepted { outcome },
-            );
-            assert!(
-                tiering.plan_generation() > before,
-                "call-link inline cache clear must bump plan_generation"
-            );
-        }
-
         // TRANSITION: property_load_guard_plans -> Retired via watchpoint
-        // invalidation. The materialization/recheck setup touches non-six tables
+        // invalidation. The materialization/recheck setup touches non-four tables
         // (no bump), so the delta isolates the invalidation recorder.
         {
             let (mut tiering, guard_plan, _) = record_prototype_data_guard_fixture();
@@ -35577,5 +35573,44 @@ mod tests {
                 "generated guarded property-load probe miss must bump plan_generation"
             );
         }
+    }
+
+    // REDESIGN-AUDIT UNIT 2 regression: call-link plan/attachment/clear mutations
+    // must NOT bump `plan_generation` any more -- `owner_has_any_safepoint_pass`
+    // (:658-674) dropped its call-link readers under B3, so a call-link-only bump
+    // has no consumer and only forces spurious property-side safepoint re-runs.
+    // This is the counterpart to
+    // `plan_generation_advances_on_every_four_table_mutation`: that test proves
+    // the four property-side tables DO bump; this proves the two call-link
+    // recorders (attachment-plan insert, inline-cache attach+clear) do NOT.
+    #[test]
+    fn call_link_mutations_do_not_bump_plan_generation() {
+        let (tiering, ..) = record_call_link_attachment_plan_fixture();
+        assert_eq!(tiering.call_link_attachment_plan_records().len(), 1);
+        assert_eq!(
+            tiering.plan_generation(),
+            0,
+            "call-link attachment plan insert must not bump plan_generation"
+        );
+
+        let (mut tiering, _, _, attachment, _, _) =
+            record_call_link_inline_cache_attachment_fixture();
+        assert_eq!(
+            tiering.plan_generation(),
+            0,
+            "call-link inline cache attachment insert must not bump plan_generation"
+        );
+        let before = tiering.plan_generation();
+        let request = call_link_inline_cache_clear_request(&attachment);
+        let outcome = call_link_inline_cache_clear_outcome(&attachment);
+        tiering.record_call_link_inline_cache_clear(
+            request,
+            VmCallLinkInlineCacheClearOutcome::Accepted { outcome },
+        );
+        assert_eq!(
+            tiering.plan_generation(),
+            before,
+            "call-link inline cache clear must not bump plan_generation"
+        );
     }
 }
