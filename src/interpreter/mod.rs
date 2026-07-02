@@ -27800,13 +27800,6 @@ mod tests {
                 may_call_js: true,
                 may_throw: true,
             },
-            attachment_ordinal: 1,
-            attachment_plan_ordinal: 2,
-            install_recheck_ordinal: 3,
-            boundary_validation_ordinal: Some(4),
-            descriptor_ordinal: Some(5),
-            observation_ordinal: Some(6),
-            readiness_ordinal: Some(7),
             remaining_blockers: CallLinkReadinessBlockers::from_blocker(
                 CallLinkReadinessBlocker::DirectCallDisallowed,
             ),

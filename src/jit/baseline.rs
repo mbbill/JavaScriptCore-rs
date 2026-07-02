@@ -489,18 +489,17 @@ impl<'plan, 'host> BaselineGeneratedPropertyStoreExecutionSidecar<'plan, 'host> 
     }
 }
 
+// REDESIGN (telemetry Unit 2b): the seven pipeline-stage ordinal fields
+// (attachment/attachment_plan/install_recheck/boundary_validation/descriptor/
+// observation/readiness) were pure diagnostic pass-through from
+// `GeneratedCallLinkCandidate`, which no longer carries them (see the
+// identity-relaxation comment on that struct, src/jit/ic.rs). Dropped here
+// rather than left dangling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineGeneratedCallLinkProbeMissRecord {
     pub(crate) owner: CodeBlockId,
     pub(crate) bytecode_index: BytecodeIndex,
     pub(crate) slot: Option<InlineCacheSlotId>,
-    pub(crate) attachment_ordinal: Option<u64>,
-    pub(crate) attachment_plan_ordinal: Option<u64>,
-    pub(crate) install_recheck_ordinal: Option<u64>,
-    pub(crate) boundary_validation_ordinal: Option<u64>,
-    pub(crate) descriptor_ordinal: Option<u64>,
-    pub(crate) observation_ordinal: Option<u64>,
-    pub(crate) readiness_ordinal: Option<u64>,
     pub(crate) target_executable: Option<ExecutableId>,
     pub(crate) target_callee: Option<ObjectId>,
     pub(crate) target_code_block: Option<CodeBlockId>,
@@ -514,13 +513,6 @@ pub(crate) struct BaselineGeneratedCallLinkProbeBlockedRecord {
     pub(crate) owner: CodeBlockId,
     pub(crate) bytecode_index: BytecodeIndex,
     pub(crate) slot: InlineCacheSlotId,
-    pub(crate) attachment_ordinal: u64,
-    pub(crate) attachment_plan_ordinal: u64,
-    pub(crate) install_recheck_ordinal: u64,
-    pub(crate) boundary_validation_ordinal: Option<u64>,
-    pub(crate) descriptor_ordinal: Option<u64>,
-    pub(crate) observation_ordinal: Option<u64>,
-    pub(crate) readiness_ordinal: Option<u64>,
     pub(crate) target_executable: ExecutableId,
     pub(crate) target_callee: ObjectId,
     pub(crate) target_code_block: CodeBlockId,
@@ -5427,7 +5419,6 @@ mod tests {
         executable_cell: u32,
         callee_cell: u32,
         target_code_block_cell: u32,
-        attachment_ordinal: u64,
     ) -> GeneratedCallLinkCandidate {
         generated_call_link_candidate_for_target(
             opcode,
@@ -5436,7 +5427,6 @@ mod tests {
             ExecutableId(CellId(executable_cell.into())),
             ObjectId(CellId(callee_cell.into())),
             CodeBlockId(CellId(target_code_block_cell.into())),
-            attachment_ordinal,
         )
     }
 
@@ -5447,7 +5437,6 @@ mod tests {
         executable: ExecutableId,
         callee: ObjectId,
         target_code_block: CodeBlockId,
-        attachment_ordinal: u64,
     ) -> GeneratedCallLinkCandidate {
         let owner = owner();
         let boundary = CallBoundaryId(10_000 + u64::from(slot.0));
@@ -5490,13 +5479,6 @@ mod tests {
                 may_call_js: true,
                 may_throw: true,
             },
-            attachment_ordinal,
-            attachment_plan_ordinal: attachment_ordinal + 100,
-            install_recheck_ordinal: attachment_ordinal + 200,
-            boundary_validation_ordinal: Some(attachment_ordinal + 300),
-            descriptor_ordinal: Some(attachment_ordinal + 400),
-            observation_ordinal: Some(attachment_ordinal + 500),
-            readiness_ordinal: Some(attachment_ordinal + 600),
             remaining_blockers: CallLinkReadinessBlockers::from_blocker(
                 CallLinkReadinessBlocker::DirectCallDisallowed,
             ),
@@ -5809,7 +5791,6 @@ mod tests {
                     bytecode_index: request.bytecode_index,
                     argument_count_including_this: request.argument_count_including_this,
                     candidate_slot: request.candidate.slot,
-                    candidate_attachment_ordinal: request.candidate.attachment_ordinal,
                     callee_value: request.callee_value,
                     callee_value_kind: request.callee_value_kind,
                     callee_object: request.callee_object,
@@ -5943,6 +5924,10 @@ mod tests {
         }
     }
 
+    // REDESIGN (telemetry Unit 2b): dropped `candidate_attachment_ordinal`
+    // alongside `GeneratedCallLinkCandidate`'s identity relaxation (see that
+    // struct's comment, src/jit/ic.rs) -- `candidate_slot` already uniquely
+    // identifies the probed candidate in these fixtures.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct GeneratedCallLinkProbeSnapshot {
         owner: CodeBlockId,
@@ -5950,7 +5935,6 @@ mod tests {
         bytecode_index: u32,
         argument_count_including_this: u32,
         candidate_slot: InlineCacheSlotId,
-        candidate_attachment_ordinal: u64,
         callee_value: RuntimeValue,
         callee_value_kind: ValueKind,
         callee_object: Option<ObjectId>,
@@ -5986,7 +5970,6 @@ mod tests {
                 bytecode_index: request.bytecode_index,
                 argument_count_including_this: request.argument_count_including_this,
                 candidate_slot: request.candidate.slot,
-                candidate_attachment_ordinal: request.candidate.attachment_ordinal,
                 callee_value: request.callee_value,
                 callee_value_kind: request.callee_value_kind,
                 callee_object: request.callee_object,
@@ -6885,7 +6868,6 @@ mod tests {
             81,
             91,
             101,
-            11,
         );
         let table = generated_call_link_candidate_table(owner(), vec![candidate.clone()]);
         let callee_value = generated_call_link_cell_value(0x5001);
@@ -6942,13 +6924,6 @@ mod tests {
                 owner: candidate.owner,
                 bytecode_index,
                 slot: candidate.slot,
-                attachment_ordinal: candidate.attachment_ordinal,
-                attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-                install_recheck_ordinal: candidate.install_recheck_ordinal,
-                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                descriptor_ordinal: candidate.descriptor_ordinal,
-                observation_ordinal: candidate.observation_ordinal,
-                readiness_ordinal: candidate.readiness_ordinal,
                 target_executable: candidate.target.executable,
                 target_callee: candidate.target.callee,
                 target_code_block: candidate.target.target_code_block,
@@ -6965,7 +6940,6 @@ mod tests {
                 bytecode_index: bytecode_index.offset(),
                 argument_count_including_this: 1,
                 candidate_slot: candidate.slot,
-                candidate_attachment_ordinal: candidate.attachment_ordinal,
                 callee_value,
                 callee_value_kind: ValueKind::Cell,
                 callee_object: None,
@@ -7004,7 +6978,6 @@ mod tests {
             82,
             92,
             102,
-            21,
         );
         let second_candidate = generated_call_link_candidate(
             CoreOpcode::Call,
@@ -7013,7 +6986,6 @@ mod tests {
             83,
             93,
             103,
-            22,
         );
         let table = generated_call_link_candidate_table(
             owner(),
@@ -7072,13 +7044,6 @@ mod tests {
                     owner: owner(),
                     bytecode_index,
                     slot: Some(first_candidate.slot),
-                    attachment_ordinal: Some(first_candidate.attachment_ordinal),
-                    attachment_plan_ordinal: Some(first_candidate.attachment_plan_ordinal),
-                    install_recheck_ordinal: Some(first_candidate.install_recheck_ordinal),
-                    boundary_validation_ordinal: first_candidate.boundary_validation_ordinal,
-                    descriptor_ordinal: first_candidate.descriptor_ordinal,
-                    observation_ordinal: first_candidate.observation_ordinal,
-                    readiness_ordinal: first_candidate.readiness_ordinal,
                     target_executable: Some(first_candidate.target.executable),
                     target_callee: Some(first_candidate.target.callee),
                     target_code_block: Some(first_candidate.target.target_code_block),
@@ -7090,13 +7055,6 @@ mod tests {
                     owner: owner(),
                     bytecode_index,
                     slot: Some(second_candidate.slot),
-                    attachment_ordinal: Some(second_candidate.attachment_ordinal),
-                    attachment_plan_ordinal: Some(second_candidate.attachment_plan_ordinal),
-                    install_recheck_ordinal: Some(second_candidate.install_recheck_ordinal),
-                    boundary_validation_ordinal: second_candidate.boundary_validation_ordinal,
-                    descriptor_ordinal: second_candidate.descriptor_ordinal,
-                    observation_ordinal: second_candidate.observation_ordinal,
-                    readiness_ordinal: second_candidate.readiness_ordinal,
                     target_executable: Some(second_candidate.target.executable),
                     target_callee: Some(second_candidate.target.callee),
                     target_code_block: Some(second_candidate.target.target_code_block),
@@ -7114,7 +7072,6 @@ mod tests {
             84,
             94,
             104,
-            23,
         );
         let table = generated_call_link_candidate_table(owner(), vec![no_candidate]);
         let mut host =
@@ -7168,13 +7125,6 @@ mod tests {
                 owner: owner(),
                 bytecode_index,
                 slot: None,
-                attachment_ordinal: None,
-                attachment_plan_ordinal: None,
-                install_recheck_ordinal: None,
-                boundary_validation_ordinal: None,
-                descriptor_ordinal: None,
-                observation_ordinal: None,
-                readiness_ordinal: None,
                 target_executable: None,
                 target_callee: None,
                 target_code_block: None,
@@ -7212,7 +7162,6 @@ mod tests {
             85,
             95,
             105,
-            24,
         );
         let matching_payload = 0x6002;
         let matching_value = generated_call_link_cell_value(matching_payload);
@@ -7228,7 +7177,6 @@ mod tests {
             ExecutableId(CellId(86)),
             ObjectId(matching_cell),
             CodeBlockId(CellId(106)),
-            25,
         );
         let table = generated_call_link_candidate_table(
             owner(),
@@ -7284,7 +7232,6 @@ mod tests {
                 bytecode_index: bytecode_index.offset(),
                 argument_count_including_this: 1,
                 candidate_slot: matching_candidate.slot,
-                candidate_attachment_ordinal: matching_candidate.attachment_ordinal,
                 callee_value: matching_value,
                 callee_value_kind: ValueKind::Cell,
                 callee_object: Some(ObjectId(matching_cell)),
@@ -7333,18 +7280,10 @@ mod tests {
             ExecutableId(CellId(87)),
             ObjectId(matching_cell),
             CodeBlockId(CellId(107)),
-            26,
         );
         candidate.remaining_blockers =
             CallLinkReadinessBlockers::from_blocker(CallLinkReadinessBlocker::MayCallJsBoundary);
         candidate.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
-        candidate.observation_ordinal = Some(100);
-        candidate.descriptor_ordinal = Some(200);
-        candidate.readiness_ordinal = Some(300);
-        candidate.boundary_validation_ordinal = Some(400);
-        candidate.attachment_plan_ordinal = 500;
-        candidate.install_recheck_ordinal = 600;
-        candidate.attachment_ordinal = 700;
         let authorization = GeneratedCallLinkDirectCall::from_candidate(&candidate);
         let hot_slots = vec![BaselineGeneratedJsDirectCallHotSlot {
             candidate: candidate.clone(),
@@ -7459,7 +7398,6 @@ mod tests {
             85,
             95,
             105,
-            31,
         );
         let call_table = generated_call_link_candidate_table(owner(), vec![candidate.clone()]);
         let base = cell_runtime_value();
@@ -7571,13 +7509,6 @@ mod tests {
                 owner: candidate.owner,
                 bytecode_index: call_index,
                 slot: candidate.slot,
-                attachment_ordinal: candidate.attachment_ordinal,
-                attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-                install_recheck_ordinal: candidate.install_recheck_ordinal,
-                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                descriptor_ordinal: candidate.descriptor_ordinal,
-                observation_ordinal: candidate.observation_ordinal,
-                readiness_ordinal: candidate.readiness_ordinal,
                 target_executable: candidate.target.executable,
                 target_callee: candidate.target.callee,
                 target_code_block: candidate.target.target_code_block,
@@ -7594,7 +7525,6 @@ mod tests {
                 bytecode_index: call_index.offset(),
                 argument_count_including_this: 1,
                 candidate_slot: candidate.slot,
-                candidate_attachment_ordinal: candidate.attachment_ordinal,
                 callee_value,
                 callee_value_kind: ValueKind::Cell,
                 callee_object: None,

@@ -1792,13 +1792,6 @@ mod tests {
                 may_call_js: true,
                 may_throw: true,
             },
-            attachment_ordinal: 9004,
-            attachment_plan_ordinal: 9005,
-            install_recheck_ordinal: 9006,
-            boundary_validation_ordinal: Some(9007),
-            descriptor_ordinal: Some(9008),
-            observation_ordinal: Some(9009),
-            readiness_ordinal: Some(9010),
             remaining_blockers: CallLinkReadinessBlockers::from_blocker(
                 CallLinkReadinessBlocker::MayCallJsBoundary,
             ),

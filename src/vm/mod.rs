@@ -10018,13 +10018,6 @@ impl Vm {
                                 bytecode_index: site.bytecode_index,
                                 bytecode_snapshot,
                                 slot: Some(candidate.slot),
-                                attachment_ordinal: Some(candidate.attachment_ordinal),
-                                attachment_plan_ordinal: Some(candidate.attachment_plan_ordinal),
-                                install_recheck_ordinal: Some(candidate.install_recheck_ordinal),
-                                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                                descriptor_ordinal: candidate.descriptor_ordinal,
-                                observation_ordinal: candidate.observation_ordinal,
-                                readiness_ordinal: candidate.readiness_ordinal,
                                 target_executable: Some(candidate.target.executable),
                                 target_callee: Some(candidate.target.callee),
                                 target_code_block: Some(candidate.target.target_code_block),
@@ -10053,13 +10046,6 @@ impl Vm {
                             bytecode_index: site.bytecode_index,
                             bytecode_snapshot,
                             slot: candidate.slot,
-                            attachment_ordinal: candidate.attachment_ordinal,
-                            attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-                            install_recheck_ordinal: candidate.install_recheck_ordinal,
-                            boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                            descriptor_ordinal: candidate.descriptor_ordinal,
-                            observation_ordinal: candidate.observation_ordinal,
-                            readiness_ordinal: candidate.readiness_ordinal,
                             target_executable: candidate.target.executable,
                             target_callee: candidate.target.callee,
                             target_code_block: candidate.target.target_code_block,
@@ -10076,13 +10062,6 @@ impl Vm {
                             bytecode_index: site.bytecode_index,
                             bytecode_snapshot,
                             slot: Some(candidate.slot),
-                            attachment_ordinal: Some(candidate.attachment_ordinal),
-                            attachment_plan_ordinal: Some(candidate.attachment_plan_ordinal),
-                            install_recheck_ordinal: Some(candidate.install_recheck_ordinal),
-                            boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                            descriptor_ordinal: candidate.descriptor_ordinal,
-                            observation_ordinal: candidate.observation_ordinal,
-                            readiness_ordinal: candidate.readiness_ordinal,
                             target_executable: Some(candidate.target.executable),
                             target_callee: Some(candidate.target.callee),
                             target_code_block: Some(candidate.target.target_code_block),
@@ -10748,13 +10727,6 @@ impl Vm {
                     bytecode_index: record.bytecode_index,
                     bytecode_snapshot,
                     slot: record.slot,
-                    attachment_ordinal: record.attachment_ordinal,
-                    attachment_plan_ordinal: record.attachment_plan_ordinal,
-                    install_recheck_ordinal: record.install_recheck_ordinal,
-                    boundary_validation_ordinal: record.boundary_validation_ordinal,
-                    descriptor_ordinal: record.descriptor_ordinal,
-                    observation_ordinal: record.observation_ordinal,
-                    readiness_ordinal: record.readiness_ordinal,
                     target_executable: record.target_executable,
                     target_callee: record.target_callee,
                     target_code_block: record.target_code_block,
@@ -10879,13 +10851,6 @@ impl Vm {
                     bytecode_index: record.bytecode_index,
                     bytecode_snapshot,
                     slot: record.slot,
-                    attachment_ordinal: record.attachment_ordinal,
-                    attachment_plan_ordinal: record.attachment_plan_ordinal,
-                    install_recheck_ordinal: record.install_recheck_ordinal,
-                    boundary_validation_ordinal: record.boundary_validation_ordinal,
-                    descriptor_ordinal: record.descriptor_ordinal,
-                    observation_ordinal: record.observation_ordinal,
-                    readiness_ordinal: record.readiness_ordinal,
                     target_executable: record.target_executable,
                     target_callee: record.target_callee,
                     target_code_block: record.target_code_block,
@@ -51693,11 +51658,17 @@ mod tests {
             setup_payload: None,
         };
 
+        // REDESIGN (telemetry Unit 2b): this used to forge `attachment_ordinal`,
+        // a pipeline-stage ordinal `GeneratedCallLinkDirectCall` no longer
+        // carries (see `GeneratedCallLinkCandidate`'s identity-relaxation
+        // comment, src/jit/ic.rs). The real protected behavior is unchanged:
+        // dispatch re-derives `GeneratedCallLinkDirectCall::from_candidate(&candidate)`
+        // and rejects any `authorization` that does not match it exactly
+        // (:13611/:13931 below) -- forge `slot` instead to exercise that same
+        // equality re-derivation guard on a field that still exists.
         let mut forged_authorization = direct_call.clone();
-        forged_authorization.authorization.attachment_ordinal = forged_authorization
-            .authorization
-            .attachment_ordinal
-            .saturating_add(1);
+        forged_authorization.authorization.slot =
+            InlineCacheSlotId(forged_authorization.authorization.slot.0.wrapping_add(1));
 
         let mut forged_candidate_bci = direct_call.clone();
         forged_candidate_bci.candidate.bytecode_index = 99;

@@ -6409,13 +6409,6 @@ impl VmTieringIntegration {
             bytecode_index: request.bytecode_index,
             bytecode_snapshot: request.bytecode_snapshot,
             slot: request.slot,
-            attachment_ordinal: request.attachment_ordinal,
-            attachment_plan_ordinal: request.attachment_plan_ordinal,
-            install_recheck_ordinal: request.install_recheck_ordinal,
-            boundary_validation_ordinal: request.boundary_validation_ordinal,
-            descriptor_ordinal: request.descriptor_ordinal,
-            observation_ordinal: request.observation_ordinal,
-            readiness_ordinal: request.readiness_ordinal,
             target_executable: request.target_executable,
             target_callee: request.target_callee,
             target_code_block: request.target_code_block,
@@ -6450,13 +6443,6 @@ impl VmTieringIntegration {
             bytecode_index: request.bytecode_index,
             bytecode_snapshot: request.bytecode_snapshot,
             slot: request.slot,
-            attachment_ordinal: request.attachment_ordinal,
-            attachment_plan_ordinal: request.attachment_plan_ordinal,
-            install_recheck_ordinal: request.install_recheck_ordinal,
-            boundary_validation_ordinal: request.boundary_validation_ordinal,
-            descriptor_ordinal: request.descriptor_ordinal,
-            observation_ordinal: request.observation_ordinal,
-            readiness_ordinal: request.readiness_ordinal,
             target_executable: request.target_executable,
             target_callee: request.target_callee,
             target_code_block: request.target_code_block,
@@ -10108,6 +10094,10 @@ pub enum VmCallLinkInlineCacheClearMetadataMismatchField {
     CodeBlockTarget,
 }
 
+// REDESIGN (telemetry Unit 2b): the seven pipeline-stage ordinal fields were
+// pure diagnostic pass-through from `GeneratedCallLinkCandidate`/
+// `GeneratedCallLinkDirectCall`, which no longer carry them (see the
+// identity-relaxation comment on `GeneratedCallLinkCandidate`, src/jit/ic.rs).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VmGeneratedCallLinkProbeMissRequest {
@@ -10115,13 +10105,6 @@ pub(crate) struct VmGeneratedCallLinkProbeMissRequest {
     pub bytecode_index: BytecodeIndex,
     pub bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub slot: Option<InlineCacheSlotId>,
-    pub attachment_ordinal: Option<u64>,
-    pub attachment_plan_ordinal: Option<u64>,
-    pub install_recheck_ordinal: Option<u64>,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub target_executable: Option<ExecutableId>,
     pub target_callee: Option<ObjectId>,
     pub target_code_block: Option<CodeBlockId>,
@@ -10137,13 +10120,6 @@ pub struct VmGeneratedCallLinkProbeMissRecord {
     pub bytecode_index: BytecodeIndex,
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub slot: Option<InlineCacheSlotId>,
-    pub attachment_ordinal: Option<u64>,
-    pub attachment_plan_ordinal: Option<u64>,
-    pub install_recheck_ordinal: Option<u64>,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub target_executable: Option<ExecutableId>,
     pub target_callee: Option<ObjectId>,
     pub target_code_block: Option<CodeBlockId>,
@@ -10159,13 +10135,6 @@ pub(crate) struct VmGeneratedCallLinkProbeBlockedRequest {
     pub bytecode_index: BytecodeIndex,
     pub bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub slot: InlineCacheSlotId,
-    pub attachment_ordinal: u64,
-    pub attachment_plan_ordinal: u64,
-    pub install_recheck_ordinal: u64,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub target_executable: ExecutableId,
     pub target_callee: ObjectId,
     pub target_code_block: CodeBlockId,
@@ -10181,13 +10150,6 @@ pub struct VmGeneratedCallLinkProbeBlockedRecord {
     pub bytecode_index: BytecodeIndex,
     pub(crate) bytecode_snapshot: BaselineBytecodeSnapshotFingerprint,
     pub slot: InlineCacheSlotId,
-    pub attachment_ordinal: u64,
-    pub attachment_plan_ordinal: u64,
-    pub install_recheck_ordinal: u64,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub target_executable: ExecutableId,
     pub target_callee: ObjectId,
     pub target_code_block: CodeBlockId,
@@ -10536,13 +10498,6 @@ fn generated_call_link_candidate_from_metadata_only_attachment(
         descriptor,
         target: plan.target,
         boundary: plan.boundary.clone(),
-        attachment_ordinal: attachment.ordinal,
-        attachment_plan_ordinal: attachment.attachment_plan_ordinal,
-        install_recheck_ordinal: attachment.install_recheck_ordinal,
-        boundary_validation_ordinal: attachment.boundary_validation_ordinal,
-        descriptor_ordinal: attachment.descriptor_ordinal,
-        observation_ordinal: attachment.observation_ordinal,
-        readiness_ordinal: attachment.readiness_ordinal,
         remaining_blockers,
         direct_call_status,
     })
@@ -10594,13 +10549,6 @@ fn generated_call_link_candidate_from_attachment(
         descriptor,
         target: plan.target,
         boundary: plan.boundary.clone(),
-        attachment_ordinal: attachment.ordinal,
-        attachment_plan_ordinal: attachment.attachment_plan_ordinal,
-        install_recheck_ordinal: attachment.install_recheck_ordinal,
-        boundary_validation_ordinal: attachment.boundary_validation_ordinal,
-        descriptor_ordinal: attachment.descriptor_ordinal,
-        observation_ordinal: attachment.observation_ordinal,
-        readiness_ordinal: attachment.readiness_ordinal,
         remaining_blockers,
         direct_call_status,
     })
@@ -24336,13 +24284,6 @@ mod tests {
             bytecode_index: BytecodeIndex::from_offset(candidate.bytecode_index),
             bytecode_snapshot,
             slot: Some(candidate.slot),
-            attachment_ordinal: Some(candidate.attachment_ordinal),
-            attachment_plan_ordinal: Some(candidate.attachment_plan_ordinal),
-            install_recheck_ordinal: Some(candidate.install_recheck_ordinal),
-            boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-            descriptor_ordinal: candidate.descriptor_ordinal,
-            observation_ordinal: candidate.observation_ordinal,
-            readiness_ordinal: candidate.readiness_ordinal,
             target_executable: Some(candidate.target.executable),
             target_callee: Some(candidate.target.callee),
             target_code_block: Some(candidate.target.target_code_block),
@@ -24362,13 +24303,6 @@ mod tests {
             bytecode_index: BytecodeIndex::from_offset(candidate.bytecode_index),
             bytecode_snapshot,
             slot: candidate.slot,
-            attachment_ordinal: candidate.attachment_ordinal,
-            attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-            install_recheck_ordinal: candidate.install_recheck_ordinal,
-            boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-            descriptor_ordinal: candidate.descriptor_ordinal,
-            observation_ordinal: candidate.observation_ordinal,
-            readiness_ordinal: candidate.readiness_ordinal,
             target_executable: candidate.target.executable,
             target_callee: candidate.target.callee,
             target_code_block: candidate.target.target_code_block,
@@ -25575,7 +25509,7 @@ mod tests {
     #[test]
     fn generated_call_link_candidate_table_projects_active_attached_candidate_with_direct_call_authorized(
     ) {
-        let (tiering, attachment_plan, recheck, attachment, target, boundary) =
+        let (tiering, attachment_plan, _recheck, attachment, target, boundary) =
             record_call_link_inline_cache_attachment_fixture();
         let attached = accepted_attached_call_link_candidate(&attachment);
 
@@ -25610,9 +25544,6 @@ mod tests {
         assert_eq!(candidate.target, plan.target);
         assert_eq!(candidate.target.specialization, CodeSpecialization::Call);
         assert_eq!(candidate.boundary, boundary);
-        assert_eq!(candidate.attachment_ordinal, attachment.ordinal);
-        assert_eq!(candidate.attachment_plan_ordinal, attachment_plan.ordinal);
-        assert_eq!(candidate.install_recheck_ordinal, recheck.ordinal);
         assert_eq!(
             candidate.direct_call_status,
             GeneratedCallLinkDirectCallStatus::Authorized
@@ -25658,13 +25589,6 @@ mod tests {
                 bytecode_index: attachment.bytecode_index,
                 bytecode_snapshot: attachment.bytecode_snapshot,
                 slot: candidate.slot,
-                attachment_ordinal: candidate.attachment_ordinal,
-                attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-                install_recheck_ordinal: candidate.install_recheck_ordinal,
-                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                descriptor_ordinal: candidate.descriptor_ordinal,
-                observation_ordinal: candidate.observation_ordinal,
-                readiness_ordinal: candidate.readiness_ordinal,
                 target_executable: candidate.target.executable,
                 target_callee: candidate.target.callee,
                 target_code_block: candidate.target.target_code_block,
@@ -25730,13 +25654,6 @@ mod tests {
                 bytecode_index: attachment.bytecode_index,
                 bytecode_snapshot: attachment.bytecode_snapshot,
                 slot: Some(candidate.slot),
-                attachment_ordinal: Some(candidate.attachment_ordinal),
-                attachment_plan_ordinal: Some(candidate.attachment_plan_ordinal),
-                install_recheck_ordinal: Some(candidate.install_recheck_ordinal),
-                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                descriptor_ordinal: candidate.descriptor_ordinal,
-                observation_ordinal: candidate.observation_ordinal,
-                readiness_ordinal: candidate.readiness_ordinal,
                 target_executable: Some(candidate.target.executable),
                 target_callee: Some(candidate.target.callee),
                 target_code_block: Some(candidate.target.target_code_block),
@@ -25837,8 +25754,14 @@ mod tests {
             )
             .expect("duplicate semantic call-link candidates dedupe");
 
+        // REDESIGN (telemetry Unit 2b): `GeneratedCallLinkCandidate` no longer
+        // carries `attachment_ordinal` (relaxed identity is
+        // (owner, bytecode_index) -- see that struct's comment, src/jit/ic.rs).
+        // `attachment` and `duplicate` describe the SAME call-link site, so
+        // once dedup collapses them to one candidate there is nothing left
+        // to distinguish "the original" from "the duplicate" by field value
+        // -- `table.len() == 1` is the real, still-meaningful assertion.
         assert_eq!(table.len(), 1);
-        assert_eq!(table.candidates()[0].attachment_ordinal, attachment.ordinal);
     }
 
     #[test]

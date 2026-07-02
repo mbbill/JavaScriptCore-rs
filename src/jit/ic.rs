@@ -3983,6 +3983,31 @@ pub enum GeneratedCallLinkDirectCallStatus {
 /// This records attached monomorphic metadata and provenance. An authorized
 /// projection is still only a VM transaction request; generated code does not
 /// push frames, mutate call-link metadata, or enter target code by itself.
+///
+/// REDESIGN (telemetry Unit 2b): this used to also carry seven pipeline-stage
+/// ordinals (`attachment_ordinal`, `attachment_plan_ordinal`,
+/// `install_recheck_ordinal`, `boundary_validation_ordinal`,
+/// `descriptor_ordinal`, `observation_ordinal`, `readiness_ordinal`) whose
+/// only role was proving -- via a hard-coded strictly-increasing 7-stage
+/// chain, see the removed `generated_call_link_authorized_ordinals_are_coherent`
+/// -- that a candidate passed through every VM-global bookkeeping Vec in
+/// order. C++ JSC has no such ordinal chain: a `CallLinkInfo` is identified
+/// solely by its call site, exactly one embedded struct per
+/// op_call/op_construct bytecode (bytecode/CallLinkInfo.h).
+///
+/// The per-candidate ordinal-coherence PROOF is gone (relaxed to the
+/// structural owner/call-site checks `validate_generated_call_link_candidate_for_table`
+/// already runs, e.g. `candidate.owner == owner`). NOTE this does NOT mean
+/// the table dedups down to one candidate per (owner, bytecode_index): an
+/// earlier version of this batch narrowed
+/// `GeneratedCallLinkCandidateTable::new`'s cross-candidate dedup key to
+/// exactly that pair, reasoning it should match `CallLinkInfo`'s 1-per-site
+/// cardinality -- `cargo test --lib` refuted it (see the scope-note on that
+/// dedup loop, below): the generated call-link sidecar deliberately probes
+/// multiple candidates at one bytecode_index, filtered by target callee, so
+/// the dedup key was reverted to its original
+/// opcode/call_kind/bytecode_index/executable/callee/target_code_block
+/// width.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedCallLinkCandidate {
     pub owner: CodeBlockId,
@@ -3992,13 +4017,6 @@ pub struct GeneratedCallLinkCandidate {
     pub descriptor: CallLinkInfoDescriptor,
     pub target: CallLinkAttachmentTargetDescriptor,
     pub boundary: CallBoundaryMetadata,
-    pub attachment_ordinal: u64,
-    pub attachment_plan_ordinal: u64,
-    pub install_recheck_ordinal: u64,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub remaining_blockers: CallLinkReadinessBlockers,
     pub direct_call_status: GeneratedCallLinkDirectCallStatus,
 }
@@ -4022,20 +4040,34 @@ impl GeneratedCallLinkCandidateTable {
             validate_generated_call_link_candidate_for_table(owner, candidate)?;
         }
 
+        // REDESIGN (telemetry Unit 2b): drops the prior ordinal-pair
+        // uniqueness checks (`attachment_ordinal`/`attachment_plan_ordinal`),
+        // which no longer exist on `GeneratedCallLinkCandidate` (see that
+        // struct's identity-relaxation comment, above) -- dedup now runs
+        // solely on `generated_call_link_candidate_semantic_key`.
+        //
+        // SCOPE-NOTE / EVIDENCE-BACKED REVERT: an earlier version of this
+        // batch ALSO narrowed the semantic key itself down to
+        // `(owner, bytecode_index)` alone, reasoning that C++ `CallLinkInfo`
+        // is one struct per call site. `cargo test --lib` refuted that: the
+        // baseline-JIT generated call-link sidecar
+        // (`execute_generated_call_link_sidecar_probe_with_host`,
+        // src/jit/baseline/generated_call_link.rs) iterates
+        // `candidates_for_bytecode_index(...)` and filters by
+        // `candidate.target.callee == callee_object`, i.e. it is DESIGNED to
+        // hold multiple simultaneous candidates at one bytecode_index
+        // (distinguished by target) and probe each until the observed callee
+        // matches -- a real, load-bearing production consumer, exercised by
+        // `jit::baseline::tests::generated_call_link_sidecar_records_bounded_miss_or_candidate_not_found_and_hands_off`
+        // and `..._skips_nonmatching_candidates_for_known_callee`. Narrowing
+        // the key broke both. The ratified instruction's "(owner,
+        // bytecode_index) identity" scope was the two ordinal-coherence
+        // validator fns (`generated_call_link_authorized_ordinals_are_coherent`
+        // / `validate_generated_call_link_candidate_ordinals`), not this
+        // cross-candidate dedup key -- reverted to the original
+        // opcode/call_kind/bytecode_index/executable/callee/target_code_block
+        // key below.
         for (index, candidate) in candidates.iter().enumerate() {
-            if candidates[..index]
-                .iter()
-                .any(|prior| prior.attachment_ordinal == candidate.attachment_ordinal)
-            {
-                return Err(InlineCacheValidationError::CallLinkMismatch);
-            }
-            if candidates[..index]
-                .iter()
-                .any(|prior| prior.attachment_plan_ordinal == candidate.attachment_plan_ordinal)
-            {
-                return Err(InlineCacheValidationError::CallLinkMismatch);
-            }
-
             let semantic_key = generated_call_link_candidate_semantic_key(candidate);
             if candidates[..index]
                 .iter()
@@ -4155,16 +4187,11 @@ pub struct GeneratedCallLinkProbeBlock {
     pub reason: GeneratedCallLinkProbeMissReason,
 }
 
+// REDESIGN (telemetry Unit 2b): dropped the seven pipeline-stage ordinal
+// fields alongside `GeneratedCallLinkCandidate` (see that struct's comment).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeneratedCallLinkDirectCall {
     pub slot: InlineCacheSlotId,
-    pub attachment_ordinal: u64,
-    pub attachment_plan_ordinal: u64,
-    pub install_recheck_ordinal: u64,
-    pub boundary_validation_ordinal: Option<u64>,
-    pub descriptor_ordinal: Option<u64>,
-    pub observation_ordinal: Option<u64>,
-    pub readiness_ordinal: Option<u64>,
     pub target_executable: ExecutableId,
     pub target_callee: ObjectId,
     pub target_code_block: CodeBlockId,
@@ -4247,13 +4274,6 @@ impl GeneratedCallLinkDirectCall {
     pub const fn from_candidate(candidate: &GeneratedCallLinkCandidate) -> Self {
         Self {
             slot: candidate.slot,
-            attachment_ordinal: candidate.attachment_ordinal,
-            attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-            install_recheck_ordinal: candidate.install_recheck_ordinal,
-            boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-            descriptor_ordinal: candidate.descriptor_ordinal,
-            observation_ordinal: candidate.observation_ordinal,
-            readiness_ordinal: candidate.readiness_ordinal,
             target_executable: candidate.target.executable,
             target_callee: candidate.target.callee,
             target_code_block: candidate.target.target_code_block,
@@ -4374,11 +4394,22 @@ fn validate_generated_call_link_candidate_for_table(
     {
         return Err(InlineCacheValidationError::CallLinkMismatch);
     }
-    validate_generated_call_link_direct_call_contract(candidate)?;
-
-    validate_generated_call_link_candidate_ordinals(candidate)
+    validate_generated_call_link_direct_call_contract(candidate)
 }
 
+// REDESIGN (telemetry Unit 2b): this used to also require
+// `generated_call_link_authorized_ordinals_are_coherent(candidate)` -- a
+// strictly-increasing 7-ordinal pipeline-stage chain
+// (observation < descriptor < readiness < boundary_validation <
+// attachment_plan < install_recheck < attachment) with NO C++ counterpart.
+// C++ JSC never proves a `CallLinkInfo` was built "in the right order"; it
+// just holds the one struct per call site and mutates it in place
+// (`CallLinkInfo::setMonomorphicCallee`, bytecode/CallLinkInfo.cpp:134-141).
+// The candidate's identity is now (owner, bytecode_index), enforced by the
+// caller (`validate_generated_call_link_candidate_for_table`'s owner checks)
+// and by `GeneratedCallLinkCandidateTable::new`'s per-site dedup -- so this
+// validator is left with exactly the real behavioral contract: does the
+// authorization status agree with the readiness blockers.
 fn validate_generated_call_link_direct_call_contract(
     candidate: &GeneratedCallLinkCandidate,
 ) -> Result<(), InlineCacheValidationError> {
@@ -4386,12 +4417,6 @@ fn validate_generated_call_link_direct_call_contract(
         candidate.direct_call_status,
         candidate.remaining_blockers,
     ) {
-        return Err(InlineCacheValidationError::CallLinkMismatch);
-    }
-
-    if candidate.direct_call_status == GeneratedCallLinkDirectCallStatus::Authorized
-        && !generated_call_link_authorized_ordinals_are_coherent(candidate)
-    {
         return Err(InlineCacheValidationError::CallLinkMismatch);
     }
 
@@ -4419,69 +4444,15 @@ fn generated_call_link_direct_call_status_matches_blockers(
     }
 }
 
-fn generated_call_link_authorized_ordinals_are_coherent(
-    candidate: &GeneratedCallLinkCandidate,
-) -> bool {
-    let (
-        Some(boundary_validation_ordinal),
-        Some(descriptor_ordinal),
-        Some(observation_ordinal),
-        Some(readiness_ordinal),
-    ) = (
-        candidate.boundary_validation_ordinal,
-        candidate.descriptor_ordinal,
-        candidate.observation_ordinal,
-        candidate.readiness_ordinal,
-    )
-    else {
-        return false;
-    };
-
-    observation_ordinal != 0
-        && descriptor_ordinal != 0
-        && readiness_ordinal != 0
-        && boundary_validation_ordinal != 0
-        && candidate.attachment_plan_ordinal != 0
-        && candidate.install_recheck_ordinal != 0
-        && candidate.attachment_ordinal != 0
-        && observation_ordinal < descriptor_ordinal
-        && descriptor_ordinal < readiness_ordinal
-        && readiness_ordinal < boundary_validation_ordinal
-        && boundary_validation_ordinal < candidate.attachment_plan_ordinal
-        && candidate.attachment_plan_ordinal < candidate.install_recheck_ordinal
-        && candidate.install_recheck_ordinal < candidate.attachment_ordinal
-}
-
-fn validate_generated_call_link_candidate_ordinals(
-    candidate: &GeneratedCallLinkCandidate,
-) -> Result<(), InlineCacheValidationError> {
-    for ordinal in [
-        candidate.attachment_ordinal,
-        candidate.attachment_plan_ordinal,
-        candidate.install_recheck_ordinal,
-    ] {
-        if ordinal == 0 {
-            return Err(InlineCacheValidationError::CallLinkMismatch);
-        }
-    }
-
-    for ordinal in [
-        candidate.boundary_validation_ordinal,
-        candidate.descriptor_ordinal,
-        candidate.observation_ordinal,
-        candidate.readiness_ordinal,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if ordinal == 0 {
-            return Err(InlineCacheValidationError::CallLinkMismatch);
-        }
-    }
-
-    Ok(())
-}
-
+// SCOPE-NOTE (telemetry Unit 2b, evidence-backed revert -- see the comment on
+// `GeneratedCallLinkCandidateTable::new`'s dedup loop, above): kept at its
+// original width. The baseline-JIT generated call-link sidecar
+// (`execute_generated_call_link_sidecar_probe_with_host`,
+// src/jit/baseline/generated_call_link.rs) relies on the table holding
+// multiple candidates for one `bytecode_index` when they target different
+// callees, then filtering by `candidate.target.callee` at probe time --
+// narrowing this key to `(owner, bytecode_index)` alone broke that
+// production consumer under `cargo test --lib`.
 fn generated_call_link_candidate_semantic_key(
     candidate: &GeneratedCallLinkCandidate,
 ) -> (
@@ -6248,9 +6219,15 @@ mod tests {
         }
     }
 
+    // REDESIGN (telemetry Unit 2b): `generated_call_link_candidate_from_plan`
+    // and `ready_generated_call_link_candidate` used to take a caller-supplied
+    // ordinal to seed the seven pipeline-stage ordinal fields
+    // `GeneratedCallLinkCandidate` no longer carries (identity is now
+    // (owner, bytecode_index) -- see that struct's comment, above). The
+    // fixture-distinguishing role those numeric args played at call sites is
+    // now carried entirely by `slot`/`bytecode_index`/the cell ids.
     fn generated_call_link_candidate_from_plan(
         mut plan: CallLinkAttachmentPlan,
-        attachment_ordinal: u64,
     ) -> GeneratedCallLinkCandidate {
         plan.descriptor.mode = CallLinkMode::Monomorphic;
         GeneratedCallLinkCandidate {
@@ -6261,13 +6238,6 @@ mod tests {
             descriptor: plan.descriptor,
             target: plan.target,
             boundary: plan.boundary,
-            attachment_ordinal,
-            attachment_plan_ordinal: attachment_ordinal + 100,
-            install_recheck_ordinal: attachment_ordinal + 200,
-            boundary_validation_ordinal: Some(attachment_ordinal + 300),
-            descriptor_ordinal: Some(attachment_ordinal + 400),
-            observation_ordinal: Some(attachment_ordinal + 500),
-            readiness_ordinal: Some(attachment_ordinal + 600),
             remaining_blockers: plan.remaining_blockers,
             direct_call_status: GeneratedCallLinkDirectCallStatus::Disallowed,
         }
@@ -6279,31 +6249,19 @@ mod tests {
         executable_cell: u32,
         callee_cell: u32,
         target_code_block_cell: u32,
-        attachment_ordinal: u64,
     ) -> GeneratedCallLinkCandidate {
-        generated_call_link_candidate_from_plan(
-            ready_call_link_attachment_plan(
-                slot,
-                bytecode_index,
-                executable_cell,
-                callee_cell,
-                target_code_block_cell,
-            ),
-            attachment_ordinal,
-        )
+        generated_call_link_candidate_from_plan(ready_call_link_attachment_plan(
+            slot,
+            bytecode_index,
+            executable_cell,
+            callee_cell,
+            target_code_block_cell,
+        ))
     }
 
     fn vm_authorized_generated_call_link_candidate(
         mut candidate: GeneratedCallLinkCandidate,
-        ordinal_base: u64,
     ) -> GeneratedCallLinkCandidate {
-        candidate.observation_ordinal = Some(ordinal_base + 1);
-        candidate.descriptor_ordinal = Some(ordinal_base + 2);
-        candidate.readiness_ordinal = Some(ordinal_base + 3);
-        candidate.boundary_validation_ordinal = Some(ordinal_base + 4);
-        candidate.attachment_plan_ordinal = ordinal_base + 5;
-        candidate.install_recheck_ordinal = ordinal_base + 6;
-        candidate.attachment_ordinal = ordinal_base + 7;
         candidate
             .remaining_blockers
             .remove(CallLinkReadinessBlocker::DirectCallDisallowed);
@@ -6663,14 +6621,20 @@ mod tests {
         );
     }
 
+    // SCOPE-NOTE (telemetry Unit 2b, evidence-backed revert): `first` and
+    // `same_bytecode` deliberately share a bytecode_index with DIFFERENT
+    // targets -- this is real, load-bearing shape (see the scope-note on
+    // `GeneratedCallLinkCandidateTable::new`'s dedup loop, src/jit/ic.rs):
+    // the baseline-JIT generated call-link sidecar probes every candidate at
+    // a site and filters by observed callee, so a site can carry multiple
+    // candidates targeting different callees. Kept as originally written.
     #[test]
     fn generated_call_link_candidate_table_accepts_active_metadata_and_filters_lookup() {
-        let first =
-            ready_generated_call_link_candidate(InlineCacheSlotId(170), 53, 180, 190, 200, 1);
+        let first = ready_generated_call_link_candidate(InlineCacheSlotId(170), 53, 180, 190, 200);
         let same_bytecode =
-            ready_generated_call_link_candidate(InlineCacheSlotId(171), 53, 181, 191, 201, 2);
+            ready_generated_call_link_candidate(InlineCacheSlotId(171), 53, 181, 191, 201);
         let mut call_with_this =
-            ready_generated_call_link_candidate(InlineCacheSlotId(172), 54, 182, 192, 202, 3);
+            ready_generated_call_link_candidate(InlineCacheSlotId(172), 54, 182, 192, 202);
         call_with_this.opcode = CoreOpcode::CallWithThis;
 
         let table = GeneratedCallLinkCandidateTable::new(
@@ -6710,8 +6674,7 @@ mod tests {
     #[test]
     fn generated_call_link_candidate_table_accepts_vm_authorized_direct_call_candidate() {
         let candidate = vm_authorized_generated_call_link_candidate(
-            ready_generated_call_link_candidate(InlineCacheSlotId(173), 55, 183, 193, 203, 1),
-            10,
+            ready_generated_call_link_candidate(InlineCacheSlotId(173), 55, 183, 193, 203),
         );
 
         let table = GeneratedCallLinkCandidateTable::new(candidate.owner, vec![candidate.clone()])
@@ -6727,32 +6690,103 @@ mod tests {
             .contains(CallLinkReadinessBlocker::DirectCallDisallowed));
     }
 
+    // REDESIGN (telemetry Unit 2b): this test used to be named
+    // `..._rejects_forged_authorized_candidate_ordinals` and asserted
+    // rejection of (a) an Authorized candidate that skipped the manufactured
+    // 7-ordinal pipeline chain, and (b) a `vm_authorized_...` candidate with
+    // one ordinal field forced back to `None`. Both sub-cases tested only the
+    // deleted `generated_call_link_authorized_ordinals_are_coherent` chain
+    // (no C++ counterpart -- see `GeneratedCallLinkCandidate`'s comment,
+    // above), not real call-link behavior: under the relaxed
+    // (owner, bytecode_index) identity model there is nothing left to forge
+    // -- constructing a candidate directly (skipping any "pipeline") is now
+    // exactly as legitimate as going through `vm_authorized_...`, matching
+    // C++ JSC (`CallLinkInfo` has no provenance chain either). Rewritten to
+    // assert the real surviving contract instead:
+    // `generated_call_link_direct_call_status_matches_blockers` still
+    // requires `direct_call_status` to agree with `remaining_blockers` in
+    // both directions.
     #[test]
-    fn generated_call_link_candidate_table_rejects_forged_authorized_candidate_ordinals() {
-        let mut forged =
-            ready_generated_call_link_candidate(InlineCacheSlotId(174), 56, 184, 194, 204, 1);
-        forged
+    fn generated_call_link_candidate_table_rejects_status_blocker_mismatch() {
+        let mut authorized_with_blocker =
+            ready_generated_call_link_candidate(InlineCacheSlotId(174), 56, 184, 194, 204);
+        authorized_with_blocker.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
+        assert!(authorized_with_blocker
+            .remaining_blockers
+            .contains(CallLinkReadinessBlocker::DirectCallDisallowed));
+        assert_generated_call_link_candidate_table_error(authorized_with_blocker);
+
+        let mut disallowed_without_blocker =
+            ready_generated_call_link_candidate(InlineCacheSlotId(175), 57, 185, 195, 205);
+        disallowed_without_blocker
             .remaining_blockers
             .remove(CallLinkReadinessBlocker::DirectCallDisallowed);
-        forged.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
-
-        assert_generated_call_link_candidate_table_error(forged);
-
-        let mut missing = vm_authorized_generated_call_link_candidate(
-            ready_generated_call_link_candidate(InlineCacheSlotId(175), 57, 185, 195, 205, 1),
-            20,
+        assert_eq!(
+            disallowed_without_blocker.direct_call_status,
+            GeneratedCallLinkDirectCallStatus::Disallowed
         );
-        missing.readiness_ordinal = None;
+        assert_generated_call_link_candidate_table_error(disallowed_without_blocker);
+    }
 
-        assert_generated_call_link_candidate_table_error(missing);
+    // Regression for the completed piece of telemetry Unit 2b (the identity
+    // relaxation). NOTE on scope: the batch's requested regression was "N
+    // distinct call executions leave no per-event growth (grep-assert the
+    // deleted fields are gone)" for the seven `VmTieringIntegration` Vec
+    // fields (`call_observations`, `call_link_readiness_records`, etc.) --
+    // those fields were NOT deleted this batch (see the unresolved-questions
+    // section of this batch's report: the observation/boundary-validation/
+    // plan/install-recheck/attachment pipeline is cross-referenced by ordinal
+    // lookups at every stage, both within `VmTieringIntegration`'s own
+    // internal validators and in `vm/mod.rs` production dedup/idempotency
+    // scans over the FULL accumulated log, not just the latest entry -- a
+    // faithful atomic collapse is a distinct, larger unit). This test instead
+    // guards the identity-relaxation itself: `GeneratedCallLinkCandidate` and
+    // `GeneratedCallLinkDirectCall` must never again grow the seven
+    // pipeline-stage ordinal fields this batch removed, so a future edit
+    // cannot silently reintroduce the manufactured ordinal chain.
+    #[test]
+    fn generated_call_link_candidate_and_direct_call_carry_no_pipeline_ordinals() {
+        let source = include_str!("ic.rs");
+        for forbidden_field in [
+            "attachment_ordinal:",
+            "attachment_plan_ordinal:",
+            "install_recheck_ordinal:",
+            "boundary_validation_ordinal:",
+            "descriptor_ordinal:",
+            "observation_ordinal:",
+            "readiness_ordinal:",
+        ] {
+            assert!(
+                !struct_body_between("GeneratedCallLinkCandidate {", source)
+                    .contains(forbidden_field),
+                "GeneratedCallLinkCandidate must not carry pipeline-stage ordinal {forbidden_field}"
+            );
+            assert!(
+                !struct_body_between("GeneratedCallLinkDirectCall {", source)
+                    .contains(forbidden_field),
+                "GeneratedCallLinkDirectCall must not carry pipeline-stage ordinal {forbidden_field}"
+            );
+        }
+    }
+
+    /// Test-only helper: slices the `{ ... }` body immediately following the
+    /// first occurrence of `needle` in `source`, for asserting field names
+    /// are (or are not) declared inside one specific struct definition.
+    fn struct_body_between<'a>(needle: &str, source: &'a str) -> &'a str {
+        let start = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected to find `{needle}` in ic.rs"))
+            + needle.len();
+        let end = source[start..]
+            .find("\n}")
+            .unwrap_or_else(|| panic!("expected a closing `}}` for `{needle}`"));
+        &source[start..start + end]
     }
 
     #[test]
     fn generated_call_link_candidate_table_rejects_duplicate_semantic_candidates() {
-        let first =
-            ready_generated_call_link_candidate(InlineCacheSlotId(176), 58, 186, 196, 206, 1);
-        let second =
-            ready_generated_call_link_candidate(InlineCacheSlotId(176), 58, 186, 196, 206, 2);
+        let first = ready_generated_call_link_candidate(InlineCacheSlotId(176), 58, 186, 196, 206);
+        let second = ready_generated_call_link_candidate(InlineCacheSlotId(176), 58, 186, 196, 206);
 
         assert_eq!(
             GeneratedCallLinkCandidateTable::new(first.owner, vec![first, second]),
@@ -6763,26 +6797,26 @@ mod tests {
     #[test]
     fn generated_call_link_candidate_table_rejects_owner_opcode_mode_and_boundary_mismatch() {
         let owner_mismatch =
-            ready_generated_call_link_candidate(InlineCacheSlotId(177), 59, 187, 197, 207, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(177), 59, 187, 197, 207);
         assert_eq!(
             GeneratedCallLinkCandidateTable::new(CodeBlockId(CellId(999)), vec![owner_mismatch]),
             Err(InlineCacheValidationError::CallLinkMismatch)
         );
 
         let mut wrong_opcode =
-            ready_generated_call_link_candidate(InlineCacheSlotId(178), 60, 188, 198, 208, 2);
+            ready_generated_call_link_candidate(InlineCacheSlotId(178), 60, 188, 198, 208);
         wrong_opcode.opcode = CoreOpcode::GetByName;
 
         let mut wrong_mode =
-            ready_generated_call_link_candidate(InlineCacheSlotId(179), 61, 189, 199, 209, 3);
+            ready_generated_call_link_candidate(InlineCacheSlotId(179), 61, 189, 199, 209);
         wrong_mode.descriptor.mode = CallLinkMode::Init;
 
         let mut missing_boundary =
-            ready_generated_call_link_candidate(InlineCacheSlotId(180), 62, 190, 200, 210, 4);
+            ready_generated_call_link_candidate(InlineCacheSlotId(180), 62, 190, 200, 210);
         missing_boundary.descriptor.boundary = None;
 
         let mut non_llint_boundary =
-            ready_generated_call_link_candidate(InlineCacheSlotId(181), 63, 191, 201, 211, 5);
+            ready_generated_call_link_candidate(InlineCacheSlotId(181), 63, 191, 201, 211);
         non_llint_boundary.boundary.abi = EntryAbi::Rust;
 
         for candidate in [
@@ -6798,19 +6832,19 @@ mod tests {
     #[test]
     fn generated_call_link_candidate_table_rejects_direct_dispatch_and_native_boundary_shapes() {
         let mut direct_status =
-            ready_generated_call_link_candidate(InlineCacheSlotId(182), 64, 192, 202, 212, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(182), 64, 192, 202, 212);
         direct_status.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
 
         let mut direct_mode =
-            ready_generated_call_link_candidate(InlineCacheSlotId(183), 65, 193, 203, 213, 2);
+            ready_generated_call_link_candidate(InlineCacheSlotId(183), 65, 193, 203, 213);
         direct_mode.descriptor.mode = CallLinkMode::Direct;
 
         let mut generated_entry =
-            ready_generated_call_link_candidate(InlineCacheSlotId(184), 66, 194, 204, 214, 3);
+            ready_generated_call_link_candidate(InlineCacheSlotId(184), 66, 194, 204, 214);
         generated_entry.boundary.entry_kind = EntrypointKind::GeneratedCode;
 
         let mut native_symbol =
-            ready_generated_call_link_candidate(InlineCacheSlotId(185), 67, 195, 205, 215, 4);
+            ready_generated_call_link_candidate(InlineCacheSlotId(185), 67, 195, 205, 215);
         native_symbol.boundary.native_symbol = Some(crate::runtime::NativeCodeId(7));
 
         for candidate in [direct_status, direct_mode, generated_entry, native_symbol] {
@@ -6821,7 +6855,7 @@ mod tests {
     #[test]
     fn generated_call_link_probe_request_preserves_metadata_only_call_site_facts() {
         let candidate =
-            ready_generated_call_link_candidate(InlineCacheSlotId(183), 65, 193, 203, 213, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(183), 65, 193, 203, 213);
         let request = generated_call_link_probe_request(&candidate);
 
         assert_eq!(request.candidate, &candidate);
@@ -6862,7 +6896,7 @@ mod tests {
     #[test]
     fn generated_call_link_probe_matching_candidate_blocks_direct_dispatch() {
         let candidate =
-            ready_generated_call_link_candidate(InlineCacheSlotId(184), 66, 194, 204, 214, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(184), 66, 194, 204, 214);
         let request = generated_call_link_probe_request(&candidate);
 
         let result = GeneratedCallLinkProbeResult::for_request(&request);
@@ -6887,8 +6921,7 @@ mod tests {
     #[test]
     fn generated_call_link_probe_matching_vm_authorized_candidate_returns_direct_call() {
         let candidate = vm_authorized_generated_call_link_candidate(
-            ready_generated_call_link_candidate(InlineCacheSlotId(185), 67, 195, 205, 215, 1),
-            20,
+            ready_generated_call_link_candidate(InlineCacheSlotId(185), 67, 195, 205, 215),
         );
         let request = generated_call_link_probe_request(&candidate);
 
@@ -6898,13 +6931,6 @@ mod tests {
             result,
             GeneratedCallLinkProbeResult::DirectCall(GeneratedCallLinkDirectCall {
                 slot: candidate.slot,
-                attachment_ordinal: candidate.attachment_ordinal,
-                attachment_plan_ordinal: candidate.attachment_plan_ordinal,
-                install_recheck_ordinal: candidate.install_recheck_ordinal,
-                boundary_validation_ordinal: candidate.boundary_validation_ordinal,
-                descriptor_ordinal: candidate.descriptor_ordinal,
-                observation_ordinal: candidate.observation_ordinal,
-                readiness_ordinal: candidate.readiness_ordinal,
                 target_executable: candidate.target.executable,
                 target_callee: candidate.target.callee,
                 target_code_block: candidate.target.target_code_block,
@@ -6917,7 +6943,7 @@ mod tests {
     #[test]
     fn generated_call_link_probe_mismatches_report_bounded_miss_reasons() {
         let candidate =
-            ready_generated_call_link_candidate(InlineCacheSlotId(186), 68, 196, 206, 216, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(186), 68, 196, 206, 216);
 
         macro_rules! assert_probe_miss {
             ($mutate:expr, $reason:expr) => {{
@@ -7011,14 +7037,31 @@ mod tests {
         }
     }
 
+    // REDESIGN (telemetry Unit 2b): this test used to forge an Authorized
+    // candidate by clearing `remaining_blockers` and setting
+    // `direct_call_status` WITHOUT setting coherent pipeline-stage ordinals,
+    // relying on the deleted `generated_call_link_authorized_ordinals_are_coherent`
+    // chain (see `GeneratedCallLinkCandidate`'s comment, above) to reject it
+    // as unsupported. Under the relaxed identity model that construction is
+    // now a perfectly legitimate Authorized candidate (status agrees with
+    // blockers) -- it correctly authorizes a direct call. Rewritten to
+    // forge a REAL, still-enforced structural violation instead: a boundary
+    // carrying a native symbol, which `generated_call_link_probe_unsupported_candidate_metadata`
+    // still independently rejects (generated call-link boundaries must stay
+    // LLInt-compatible interpreter-thunk, matching
+    // `generated_call_link_candidate_table_rejects_direct_dispatch_and_native_boundary_shapes`'s
+    // table-construction-time check) -- this exercises the PROBE path's own
+    // direct check, which runs on a raw candidate reference that bypasses
+    // table construction.
     #[test]
     fn generated_call_link_probe_rejects_unsupported_candidate_metadata_without_authority() {
         let mut forged =
-            ready_generated_call_link_candidate(InlineCacheSlotId(187), 69, 197, 207, 217, 1);
+            ready_generated_call_link_candidate(InlineCacheSlotId(187), 69, 197, 207, 217);
         forged
             .remaining_blockers
             .remove(CallLinkReadinessBlocker::DirectCallDisallowed);
         forged.direct_call_status = GeneratedCallLinkDirectCallStatus::Authorized;
+        forged.boundary.native_symbol = Some(crate::runtime::NativeCodeId(77));
         let request = generated_call_link_probe_request(&forged);
         let result = GeneratedCallLinkProbeResult::for_request(&request);
 
