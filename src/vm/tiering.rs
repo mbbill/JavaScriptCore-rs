@@ -294,8 +294,18 @@ pub struct VmTieringIntegration {
     data_ic_self_load_slow_path_exit_count: usize,
     diagnostics: Vec<ExecutionDiagnosticRecord>,
     baseline_entry_artifacts: Vec<BaselineEntryArtifact>,
-    baseline_executable_materializations: Vec<BaselineExecutableMaterializationRecord>,
-    baseline_native_entry_readiness_records: Vec<BaselineNativeEntryReadinessRecord>,
+    // Redesign-audit telemetry Unit R4 (ic-resident-provenance.md "§C.
+    // Materialization/readiness split", resolving the `6170b4c` SCOPE NOTEs
+    // this batch replaces): the VM-global `baseline_executable_materializations`/
+    // `baseline_native_entry_readiness_records` unbounded logs are DELETED.
+    // C++ JSC never logs either kind of attempt -- see
+    // `RuntimeTierState::materialization_ring`/`last_disabled_readiness`/
+    // `last_enabled_readiness` for the owner-keyed resident replacement and
+    // the C++ citations. These two counters are the monotonic "how many,
+    // ever" replacements for callers that only wanted `.len()`, mirroring
+    // `entry_decision_count` (Unit 1).
+    baseline_executable_materialization_count: u64,
+    baseline_native_entry_readiness_count: u64,
     baseline_machine_code_emission_provenance_records:
         Vec<BaselineMachineCodeEmissionProvenanceRecord>,
     baseline_generated_code_artifacts: Vec<BaselineGeneratedCodeArtifact>,
@@ -1915,22 +1925,113 @@ impl VmTieringIntegration {
         &self.baseline_entry_artifacts
     }
 
-    pub fn baseline_executable_materializations(
+    /// C++ never logs materialization attempts (see
+    /// `RuntimeTierState::materialization_ring`'s doc); this is the
+    /// most-recently-retained attempt for `owner`, picked by ordinal since
+    /// the ring is a circular buffer, not necessarily insertion-ordered once
+    /// it has wrapped.
+    pub fn last_baseline_executable_materialization_for(
         &self,
-    ) -> &[BaselineExecutableMaterializationRecord] {
-        &self.baseline_executable_materializations
+        owner: CodeBlockId,
+    ) -> Option<&BaselineExecutableMaterializationRecord> {
+        self.state_for(owner)?
+            .materialization_ring
+            .iter()
+            .filter_map(Option::as_ref)
+            .max_by_key(|record| record.ordinal)
     }
 
-    pub fn baseline_native_entry_readiness_records(&self) -> &[BaselineNativeEntryReadinessRecord] {
-        &self.baseline_native_entry_readiness_records
+    /// Redesign-audit telemetry Unit R4: replaces `.len()` reads on the
+    /// deleted `baseline_executable_materializations` VM-global log;
+    /// monotonic count of every materialization attempt ever recorded
+    /// (accepted or rejected), mirroring `entry_decision_count` (Unit 1).
+    pub fn baseline_executable_materialization_count(&self) -> u64 {
+        self.baseline_executable_materialization_count
+    }
+
+    /// Owner-scoped replacement for `.last()` on the deleted
+    /// `baseline_native_entry_readiness_records` VM-global log: whichever of
+    /// `last_disabled_readiness`/`last_enabled_readiness` was recorded most
+    /// recently (higher ordinal) for `owner`.
+    pub fn last_baseline_native_entry_readiness_for(
+        &self,
+        owner: CodeBlockId,
+    ) -> Option<&BaselineNativeEntryReadinessRecord> {
+        let state = self.state_for(owner)?;
+        match (
+            &state.last_disabled_readiness,
+            &state.last_enabled_readiness,
+        ) {
+            (Some(disabled), Some(enabled)) => Some(if enabled.ordinal >= disabled.ordinal {
+                enabled
+            } else {
+                disabled
+            }),
+            (Some(disabled), None) => Some(disabled),
+            (None, Some(enabled)) => Some(enabled),
+            (None, None) => None,
+        }
+    }
+
+    /// Redesign-audit telemetry Unit R4: replaces `.len()` reads on the
+    /// deleted `baseline_native_entry_readiness_records` VM-global log;
+    /// bumped once per readiness record produced (2 per P6 install call),
+    /// mirroring `entry_decision_count` (Unit 1).
+    pub fn baseline_native_entry_readiness_count(&self) -> u64 {
+        self.baseline_native_entry_readiness_count
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) fn baseline_native_entry_readiness_records_mut_for_test(
+    pub(crate) fn last_enabled_native_entry_readiness_mut_for_test(
         &mut self,
-    ) -> &mut [BaselineNativeEntryReadinessRecord] {
-        &mut self.baseline_native_entry_readiness_records
+        owner: CodeBlockId,
+    ) -> Option<&mut BaselineNativeEntryReadinessRecord> {
+        self.states
+            .iter_mut()
+            .find(|state| state.owner == owner)?
+            .last_enabled_readiness
+            .as_mut()
+    }
+
+    /// Owner-scoped identity check: is `materialization` still resident in
+    /// `owner`'s bounded ring? Faithful replacement for the deleted
+    /// `baseline_executable_materializations.iter().any(|r| r ==
+    /// materialization)` global scan -- see
+    /// `RuntimeTierState::materialization_ring`'s doc for why this is a
+    /// bounded per-owner window rather than an unbounded VM-global log.
+    fn materialization_is_resident(
+        &self,
+        owner: CodeBlockId,
+        materialization: &BaselineExecutableMaterializationRecord,
+    ) -> bool {
+        self.state_for(owner)
+            .map(|state| {
+                state
+                    .materialization_ring
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .any(|record| record == materialization)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Owner-scoped identity check: is `readiness` still resident in
+    /// `owner`'s `last_disabled_readiness`/`last_enabled_readiness` slots?
+    /// Faithful replacement for the deleted
+    /// `baseline_native_entry_readiness_records.iter().any(|r| r ==
+    /// readiness)` global scan.
+    fn native_entry_readiness_is_resident(
+        &self,
+        owner: CodeBlockId,
+        readiness: &BaselineNativeEntryReadinessRecord,
+    ) -> bool {
+        self.state_for(owner)
+            .map(|state| {
+                state.last_disabled_readiness.as_ref() == Some(readiness)
+                    || state.last_enabled_readiness.as_ref() == Some(readiness)
+            })
+            .unwrap_or(false)
     }
 
     pub fn baseline_machine_code_emission_provenance_records(
@@ -2204,21 +2305,32 @@ impl VmTieringIntegration {
             baseline_abi_proof,
             outcome,
         };
-        // Redesign-audit telemetry Unit 1 SCOPE NOTE: `baseline_executable_materializations`
-        // was evaluated for the same owner-keyed bound as the other 4 fields
-        // and REJECTED by evidence -- `validate_baseline_executable_materialization_for_install`
-        // and friends validate a SPECIFIC materialization record (passed back
-        // to the VM by value) is still VM-owned via `.any(|r| r == materialization)`.
-        // `baseline_materialization_rejects_descriptor_mismatches` (this file)
-        // deliberately creates several REJECTED materialization attempts for
-        // the SAME owner and later re-validates an earlier (non-latest) one;
-        // an owner-keyed bound evicts it, breaking that VM-ownership check
-        // with a false "not VM owned" instead of the real rejection reason.
-        // This is a Rust-only concern (a stand-in for identity/pointer
-        // validation C++ gets for free); still unbounded, deferred pending a
-        // redesign that preserves per-attempt receipt validity.
-        self.baseline_executable_materializations
-            .push(record.clone());
+        // Redesign-audit telemetry Unit R4 (ic-resident-provenance.md "§C.
+        // Materialization/readiness split", resolving the `6170b4c` SCOPE
+        // NOTE this replaces): was
+        // `self.baseline_executable_materializations.push(record.clone())`
+        // (VM-global unbounded log). C++ JSC never logs materialization
+        // attempts either -- a real `CodeBlock*`/materialized-artifact
+        // pointer needs no such log; pointer identity IS the check
+        // (`CodeBlock.h:999`, one-way `m_jitCode`/jettison bool). Rust
+        // attempts are values, not pointers, so
+        // `validate_baseline_executable_materialization_for_install` needs a
+        // bounded per-owner window in which an EARLIER, non-latest attempt
+        // stays checkable by identity/equality (see
+        // `baseline_materialization_rejects_descriptor_mismatches`, the test
+        // that forced the `6170b4c` revert). `materialization_ring`
+        // (capacity `MATERIALIZATION_RING_CAPACITY`, ratified by the
+        // orchestrator) is that bounded window, owner-keyed on
+        // `RuntimeTierState` (R0, `fbcd267`).
+        // `baseline_executable_materialization_count` keeps the monotonic
+        // "how many, ever" counter for callers that only wanted `.len()`.
+        let state = self.state_for_mut(request.owner, TieringPolicy::OptimizingAllowed);
+        let ring_slot = state.materialization_ring_cursor;
+        state.materialization_ring[ring_slot] = Some(record.clone());
+        state.materialization_ring_cursor = (ring_slot + 1) % MATERIALIZATION_RING_CAPACITY;
+        self.baseline_executable_materialization_count = self
+            .baseline_executable_materialization_count
+            .saturating_add(1);
         record
     }
 
@@ -2228,11 +2340,7 @@ impl VmTieringIntegration {
         artifact: &JitCodeArtifact,
         materialization: &BaselineExecutableMaterializationRecord,
     ) -> Result<BaselineEntryArtifact, BaselineExecutableMaterializationRejection> {
-        if !self
-            .baseline_executable_materializations
-            .iter()
-            .any(|record| record == materialization)
-        {
+        if !self.materialization_is_resident(owner, materialization) {
             return Err(
                 BaselineExecutableMaterializationRejection::RecordNotVmOwned {
                     ordinal: materialization.ordinal,
@@ -2347,22 +2455,37 @@ impl VmTieringIntegration {
             callable,
             outcome,
         };
-        // Redesign-audit telemetry Unit 1 SCOPE NOTE: `baseline_native_entry_readiness_records`
-        // was evaluated for the same owner-keyed bound as the other 4 fields
-        // and REJECTED by evidence: (1) `install_p6_x86_64_semantic_baseline_native_entry`
-        // (vm/mod.rs) legitimately records TWO readiness records for the SAME
-        // owner in one call (a disabled probe, then an enabled one) and finds
-        // the new one via `.get(readiness_count_before..)` -- an owner-keyed
-        // bound collapses both into one slot, so the length-based mark no
-        // longer isolates the fresh record and the call spuriously fails with
-        // `DisabledReadinessMissing`; (2) `p6_semantic_install_side_effect_counts`
-        // (vm/mod.rs, used by dozens of tests) reads `.len()` as a true
-        // cumulative "how many readiness records were created" counter, which
-        // an owner-keyed bound under-counts. Still unbounded, deferred
-        // pending a redesign that separates "current readiness for owner"
-        // from "how many readiness events occurred".
-        self.baseline_native_entry_readiness_records
-            .push(record.clone());
+        // Redesign-audit telemetry Unit R4 (ic-resident-provenance.md "§C.
+        // Materialization/readiness split", resolving the `6170b4c` SCOPE
+        // NOTE this replaces): was
+        // `self.baseline_native_entry_readiness_records.push(record.clone())`
+        // (VM-global unbounded log). C++ JSC never logs native-entry
+        // readiness either -- it checks "has this been compiled and is it
+        // callable" by identity, e.g. `CallLinkInfo::m_codeBlock`/
+        // `m_monomorphicCallDestination` being null vs. set
+        // (`bytecode/CallLinkInfo.h:310-311`). The P6
+        // baseline-native-entry install path
+        // (`install_p6_x86_64_semantic_baseline_native_entry_with_mode`,
+        // `vm/mod.rs`) legitimately produces exactly two readiness results
+        // per call -- a disabled probe, then an enabled one -- so this is
+        // the owner-keyed two-named-slot host `RuntimeTierState::
+        // last_disabled_readiness`/`last_enabled_readiness` (R0, `fbcd267`)
+        // rather than a sliceable Vec; the old length-based "mark" (snapshot
+        // `.len()` before the call, slice from there after) disappears
+        // because there is no shared Vec to mark a position in.
+        // `baseline_native_entry_readiness_count` keeps the monotonic "how
+        // many, ever" counter for callers that only wanted `.len()`.
+        let state = self.state_for_mut(owner, TieringPolicy::OptimizingAllowed);
+        match record.execution_policy {
+            BaselineNativeEntryExecutionPolicy::Disabled => {
+                state.last_disabled_readiness = Some(record.clone());
+            }
+            BaselineNativeEntryExecutionPolicy::Enabled => {
+                state.last_enabled_readiness = Some(record.clone());
+            }
+        }
+        self.baseline_native_entry_readiness_count =
+            self.baseline_native_entry_readiness_count.saturating_add(1);
         record
     }
 
@@ -6704,16 +6827,26 @@ impl VmTieringIntegration {
         })
     }
 
+    /// Redesign-audit telemetry Unit R4: `owner`-scoped replacement for the
+    /// deleted `baseline_native_entry_readiness_records` global reverse scan.
+    /// Only two candidates ever exist per owner now
+    /// (`last_disabled_readiness`/`last_enabled_readiness`), so this checks
+    /// both instead of scanning a log.
     pub(crate) fn baseline_native_entry_readiness_by_ordinal(
         &self,
+        owner: CodeBlockId,
         ordinal: u64,
     ) -> Option<&BaselineNativeEntryReadinessRecord> {
-        self.baseline_native_entry_readiness_records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.ordinal == ordinal && baseline_native_entry_readiness_is_ready(record)
-            })
+        let state = self.state_for(owner)?;
+        [
+            state.last_enabled_readiness.as_ref(),
+            state.last_disabled_readiness.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|record| {
+            record.ordinal == ordinal && baseline_native_entry_readiness_is_ready(record)
+        })
     }
 
     pub(crate) fn baseline_native_entry_readiness_for_gate(
@@ -6729,7 +6862,7 @@ impl VmTieringIntegration {
             return None;
         }
         let ordinal = gate.native_entry_readiness_ordinal?;
-        let record = self.baseline_native_entry_readiness_by_ordinal(ordinal)?;
+        let record = self.baseline_native_entry_readiness_by_ordinal(gate.owner, ordinal)?;
         if baseline_native_entry_readiness_matches_gate(record, gate) {
             Some(record)
         } else {
@@ -6737,14 +6870,27 @@ impl VmTieringIntegration {
         }
     }
 
+    /// Redesign-audit telemetry Unit R4: `artifact.owner`-scoped replacement
+    /// for the deleted `baseline_native_entry_readiness_records` global
+    /// reverse scan (the match predicate already required `record.owner ==
+    /// artifact.owner`, so this was always owner-scoped in effect; the ring/
+    /// Option host just makes that explicit). `max_by_key(ordinal)` picks
+    /// whichever of the two slots is more recent, matching the old
+    /// most-recent-first reverse scan regardless of which slot (disabled or
+    /// enabled) happens to be newer.
     fn baseline_native_entry_readiness_for_artifact(
         &self,
         artifact: BaselineEntryArtifact,
     ) -> Option<&BaselineNativeEntryReadinessRecord> {
-        self.baseline_native_entry_readiness_records
-            .iter()
-            .rev()
-            .find(|record| baseline_native_entry_readiness_matches_artifact(record, artifact))
+        let state = self.state_for(artifact.owner)?;
+        [
+            state.last_enabled_readiness.as_ref(),
+            state.last_disabled_readiness.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|record| baseline_native_entry_readiness_matches_artifact(record, artifact))
+        .max_by_key(|record| record.ordinal)
     }
 
     fn replace_baseline_entry_artifact(&mut self, artifact: BaselineEntryArtifact) {
@@ -7065,17 +7211,14 @@ impl VmTieringIntegration {
 // `state_for`/`state_for_mut`, which already hand out references, so this is
 // not a behavioral change for any caller.
 // R0 of docs/design/ic-resident-provenance.md ("§C. Materialization/readiness
-// split", Unit R4) adds `materialization_ring`/`materialization_ring_cursor`/
+// split", Unit R4) added `materialization_ring`/`materialization_ring_cursor`/
 // `last_disabled_readiness`/`last_enabled_readiness` below, to the SAME
 // owner-keyed state host Unit 1 (`6170b4c`) already established for
-// `last_entry_decision`. Additive only, unwired (`#[allow(dead_code)]`); Unit
-// R4 ports `validate_baseline_executable_materialization_for_install` and
-// `p6_semantic_install_side_effect_counts` (vm/mod.rs) against these fields
-// and deletes the VM-global `baseline_executable_materializations`/
-// `baseline_native_entry_readiness_records` Vecs (see the SCOPE NOTE comments
-// at this file's `record_baseline_executable_materialization`/
-// `record_baseline_native_entry_readiness`). Zero behavior change in this
-// commit.
+// `last_entry_decision`. Unit R4 (this batch) wires them:
+// `record_baseline_executable_materialization`/
+// `record_baseline_native_entry_readiness` write here instead of pushing to
+// the VM-global `baseline_executable_materializations`/
+// `baseline_native_entry_readiness_records` Vecs, which are DELETED.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTierState {
     pub owner: CodeBlockId,
@@ -7094,33 +7237,32 @@ pub struct RuntimeTierState {
     /// `baseline_materialization_rejects_descriptor_mismatches`, the test
     /// that forced the `6170b4c` revert of the naive latest-wins fold. Ring
     /// capacity RATIFIED at `MATERIALIZATION_RING_CAPACITY` by the
-    /// orchestrator (design doc "Open question 4"). Unread until Unit R4.
-    #[allow(dead_code)] // wired by Unit R4
+    /// orchestrator (design doc "Open question 4"). Wired by Unit R4 in
+    /// `record_baseline_executable_materialization`/
+    /// `validate_baseline_executable_materialization_for_install`.
     pub materialization_ring:
         [Option<BaselineExecutableMaterializationRecord>; MATERIALIZATION_RING_CAPACITY],
     /// Next `materialization_ring` slot to overwrite (wraps modulo
     /// `MATERIALIZATION_RING_CAPACITY`); port machinery for
-    /// `materialization_ring`, no C++ analog. Unread until Unit R4.
-    #[allow(dead_code)] // wired by Unit R4
+    /// `materialization_ring`, no C++ analog.
     pub materialization_ring_cursor: usize,
     /// C++ never logs native-entry readiness either: JSC checks "has this
     /// been compiled and is it callable" by identity, e.g.
     /// `CallLinkInfo::m_codeBlock`/`m_monomorphicCallDestination` being null
     /// vs. set (`bytecode/CallLinkInfo.h:310-311`). The P6
     /// baseline-native-entry install path
-    /// (`install_p6_x86_64_semantic_baseline_native_entry`, `vm/mod.rs`)
-    /// legitimately produces exactly two readiness results per call -- a
-    /// disabled probe, then an enabled one -- so this is modeled as two named
-    /// slots (design doc §C item 2) rather than a sliceable Vec. P6 itself is
-    /// a confirmed, already-scheduled-for-deletion divergence
-    /// (`docs/design/baseline-call-tier-divergence.md`, STEP 5); when it
-    /// goes, this degrades to "one slot instead of two," not a second
-    /// redesign. Unread until Unit R4.
-    #[allow(dead_code)] // wired by Unit R4
+    /// (`install_p6_x86_64_semantic_baseline_native_entry_with_mode`,
+    /// `vm/mod.rs`) legitimately produces exactly two readiness results per
+    /// call -- a disabled probe, then an enabled one -- so this is modeled
+    /// as two named slots (design doc §C item 2) rather than a sliceable
+    /// Vec. P6 itself is a confirmed, already-scheduled-for-deletion
+    /// divergence (`docs/design/baseline-call-tier-divergence.md`, STEP 5);
+    /// when it goes, this degrades to "one slot instead of two," not a
+    /// second redesign. Wired by Unit R4 in
+    /// `record_baseline_native_entry_readiness`.
     pub last_disabled_readiness: Option<BaselineNativeEntryReadinessRecord>,
     /// See `last_disabled_readiness`: the paired "execution enabled" probe
-    /// result from the same P6 install call. Unread until Unit R4.
-    #[allow(dead_code)] // wired by Unit R4
+    /// result from the same P6 install call.
     pub last_enabled_readiness: Option<BaselineNativeEntryReadinessRecord>,
 }
 
@@ -15307,11 +15449,7 @@ fn validate_baseline_native_entry_readiness(
     tiering: &VmTieringIntegration,
     request: &BaselineNativeEntryReadinessRequest<'_>,
 ) -> Result<BaselineNativeEntryDescriptor, BaselineNativeEntryReadinessRejection> {
-    if !tiering
-        .baseline_executable_materializations
-        .iter()
-        .any(|record| record == request.materialization)
-    {
+    if !tiering.materialization_is_resident(request.owner, request.materialization) {
         return Err(
             BaselineNativeEntryReadinessRejection::MaterializationRecordNotVmOwned {
                 ordinal: request.materialization.ordinal,
@@ -15513,11 +15651,7 @@ fn validate_baseline_machine_code_emission_provenance(
         }
     })?;
 
-    if !tiering
-        .baseline_executable_materializations
-        .iter()
-        .any(|record| record == request.materialization)
-    {
+    if !tiering.materialization_is_resident(request.owner, request.materialization) {
         return Err(
             BaselineMachineCodeEmissionProvenanceRejection::MaterializationRecordNotVmOwned {
                 ordinal: request.materialization.ordinal,
@@ -15535,11 +15669,7 @@ fn validate_baseline_machine_code_emission_provenance(
         );
     }
 
-    if !tiering
-        .baseline_native_entry_readiness_records
-        .iter()
-        .any(|record| record == request.native_entry_readiness)
-    {
+    if !tiering.native_entry_readiness_is_resident(request.owner, request.native_entry_readiness) {
         return Err(
             BaselineMachineCodeEmissionProvenanceRejection::NativeEntryReadinessRecordNotVmOwned {
                 ordinal: request.native_entry_readiness.ordinal,
@@ -20703,10 +20833,11 @@ mod tests {
     // and the owner-keyed replacement state. Exercises the 3 fields this
     // batch actually bounds (`entry_decisions`, `baseline_entry_auto_materializations`,
     // `baseline_generated_code_invalidations`). `baseline_executable_materializations`
-    // and `baseline_native_entry_readiness_records` are deliberately EXCLUDED
-    // from this batch -- see the SCOPE NOTE comments at their `record_*`
-    // writers for the evidence (real production/test breakage) that ruled out
-    // the same bound for them.
+    // and `baseline_native_entry_readiness_records` were deliberately EXCLUDED
+    // from Unit 1 -- see the (now superseded) SCOPE NOTE evidence recorded at
+    // their `record_*` writers -- and are bounded instead by Unit R4's own
+    // regression test, `telemetry_redesign_unit_r4_repeated_owner_materializations_and_readiness_stay_bounded`,
+    // below.
     #[test]
     fn telemetry_redesign_unit1_repeated_owner_entries_stay_o1() {
         let mut tiering = VmTieringIntegration::default();
@@ -20788,12 +20919,7 @@ mod tests {
     // R0 of docs/design/ic-resident-provenance.md ("§C. Materialization/
     // readiness split", Unit R4): pins a freshly created `RuntimeTierState`'s
     // new materialization-ring/readiness fields to their C++-derived initial
-    // "no history yet" values. C++ never logs either (see the design doc);
-    // both `baseline_executable_materializations`/
-    // `baseline_native_entry_readiness_records` (the VM-global logs these
-    // fields will eventually replace, Unit R4) still exist unmodified in this
-    // unit, so this test only proves the NEW fields' construction, not any
-    // wiring.
+    // "no history yet" values.
     #[test]
     fn fresh_runtime_tier_state_has_no_materialization_or_readiness_history() {
         let mut tiering = VmTieringIntegration::default();
@@ -20812,6 +20938,119 @@ mod tests {
     #[test]
     fn materialization_ring_capacity_is_ratified_at_eight() {
         assert_eq!(MATERIALIZATION_RING_CAPACITY, 8);
+    }
+
+    // Redesign-audit telemetry Unit R4 regression (ic-resident-provenance.md
+    // "§C. Materialization/readiness split"): N `record_baseline_executable_
+    // materialization` calls for the SAME owner must leave AT MOST
+    // `MATERIALIZATION_RING_CAPACITY` retained records (the bounded ring,
+    // not an unbounded log) plus a correct cumulative counter; N
+    // `record_baseline_native_entry_readiness` calls for the SAME owner must
+    // leave exactly the latest disabled/enabled pair (O(1), not a growing
+    // log) plus a correct cumulative counter. Fails against the pre-fix
+    // unbounded `Vec` push (which would retain all N records).
+    #[test]
+    fn telemetry_redesign_unit_r4_repeated_owner_materializations_and_readiness_stay_bounded() {
+        let mut tiering = VmTieringIntegration::default();
+        let owner = CodeBlockId(CellId(901));
+        let artifact = baseline_artifact(owner, 901);
+
+        // 3x `MATERIALIZATION_RING_CAPACITY` rejected attempts (missing link
+        // finalization is the cheapest reliably-rejected path) for the SAME
+        // owner: the ring must never exceed capacity, and the cumulative
+        // counter must still count every attempt.
+        let attempts = 3 * MATERIALIZATION_RING_CAPACITY as u64;
+        for i in 0..attempts {
+            let materialization = tiering.record_baseline_executable_materialization(
+                BaselineExecutableMaterializationRequest::from_artifact(
+                    owner,
+                    &artifact,
+                    Some(baseline_bytecode_snapshot(owner)),
+                    BaselineExecutableMaterializationAuthority::VmMainThread,
+                ),
+            );
+            assert_eq!(
+                materialization.outcome,
+                BaselineExecutableMaterializationOutcome::Rejected {
+                    reason: BaselineExecutableMaterializationRejection::LinkFinalizationMissing,
+                }
+            );
+            assert_eq!(tiering.baseline_executable_materialization_count(), i + 1);
+            // O(1) state slots: exactly one owner has ever attempted, so
+            // exactly one state slot exists regardless of attempt count.
+            assert_eq!(tiering.states.len(), 1);
+            let state = tiering
+                .state_for(owner)
+                .expect("owner state after materialization attempt");
+            assert!(
+                state
+                    .materialization_ring
+                    .iter()
+                    .filter(|slot| slot.is_some())
+                    .count()
+                    <= MATERIALIZATION_RING_CAPACITY
+            );
+        }
+        assert_eq!(
+            tiering.baseline_executable_materialization_count(),
+            attempts
+        );
+        let state = tiering
+            .state_for(owner)
+            .expect("owner state after materialization attempts");
+        assert_eq!(
+            state
+                .materialization_ring
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            MATERIALIZATION_RING_CAPACITY
+        );
+
+        // Repeated readiness records for the SAME owner: only the latest
+        // disabled/enabled pair is retained (O(1)), never a growing log.
+        let ready_artifact = baseline_artifact(owner, 902);
+        let materialization = accepted_materialization(&mut tiering, owner, &ready_artifact);
+        let install =
+            installed_native_entry(&mut tiering, owner, &ready_artifact, &materialization);
+        assert_eq!(
+            install.outcome,
+            BaselineInstallOutcome::InstalledButEntryDisabled
+        );
+        // `installed_native_entry` -> `record_baseline_install` already
+        // recorded one disabled readiness for `owner`; the loop below
+        // re-records more on top of it.
+        let readiness_count_before = tiering.baseline_native_entry_readiness_count();
+        let mut last_disabled_ordinal = None;
+        for _ in 0..(MATERIALIZATION_RING_CAPACITY as u64) {
+            let readiness = tiering.record_baseline_native_entry_readiness(
+                BaselineNativeEntryReadinessRequest {
+                    owner,
+                    materialization: &materialization,
+                    install: &install,
+                    execution_policy: BaselineNativeEntryExecutionPolicy::Disabled,
+                    callable: None,
+                },
+            );
+            assert_eq!(
+                readiness.outcome,
+                BaselineNativeEntryReadinessOutcome::ReadyButExecutionDisabled
+            );
+            last_disabled_ordinal = Some(readiness.ordinal);
+            assert_eq!(tiering.states.len(), 1);
+        }
+        assert_eq!(
+            tiering.baseline_native_entry_readiness_count(),
+            readiness_count_before + MATERIALIZATION_RING_CAPACITY as u64
+        );
+        let state = tiering
+            .state_for(owner)
+            .expect("owner state after readiness attempts");
+        assert_eq!(
+            state.last_disabled_readiness.as_ref().map(|r| r.ordinal),
+            last_disabled_ordinal
+        );
+        assert!(state.last_enabled_readiness.is_none());
     }
 
     fn baseline_artifact(owner: CodeBlockId, id: u64) -> JitCodeArtifact {
@@ -21285,8 +21524,7 @@ mod tests {
             BaselineInstallOutcome::InstalledButEntryDisabled
         );
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("ready-disabled native entry")
             .clone();
         assert_eq!(
@@ -34426,8 +34664,7 @@ mod tests {
             }
         );
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("native entry readiness record");
         let install_proof = install
             .eligibility_proof
@@ -34490,8 +34727,7 @@ mod tests {
         });
         let entry_artifact = install.artifact.expect("installed native artifact");
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("ready-disabled native entry")
             .clone();
         let gate = BaselineEntryGateRecord {
@@ -34505,7 +34741,7 @@ mod tests {
 
         assert_eq!(
             tiering
-                .baseline_native_entry_readiness_by_ordinal(readiness.ordinal)
+                .baseline_native_entry_readiness_by_ordinal(owner, readiness.ordinal)
                 .map(|record| record.ordinal),
             Some(readiness.ordinal)
         );
@@ -34545,7 +34781,7 @@ mod tests {
             BaselineNativeEntryReadinessOutcome::Rejected { .. }
         ));
         assert!(tiering
-            .baseline_native_entry_readiness_by_ordinal(rejected.ordinal)
+            .baseline_native_entry_readiness_by_ordinal(other_owner, rejected.ordinal)
             .is_none());
     }
 
@@ -35234,8 +35470,7 @@ mod tests {
         });
 
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("auto native entry readiness record");
         let descriptor = readiness
             .descriptor
@@ -35275,7 +35510,7 @@ mod tests {
                 owner,
                 &artifact,
             );
-        let readiness_before = tiering.baseline_native_entry_readiness_records().to_vec();
+        let readiness_count_before = tiering.baseline_native_entry_readiness_count();
 
         let record = tiering
             .record_baseline_machine_code_emission_provenance(
@@ -35324,8 +35559,8 @@ mod tests {
             std::slice::from_ref(&record)
         );
         assert_eq!(
-            tiering.baseline_native_entry_readiness_records(),
-            readiness_before.as_slice()
+            tiering.baseline_native_entry_readiness_count(),
+            readiness_count_before
         );
     }
 
@@ -35346,7 +35581,7 @@ mod tests {
         let provenance_count = tiering
             .baseline_machine_code_emission_provenance_records()
             .len();
-        let readiness_count = tiering.baseline_native_entry_readiness_records().len();
+        let readiness_count = tiering.baseline_native_entry_readiness_count();
         let next_ordinal = tiering.next_ordinal;
 
         let rejection = tiering
@@ -35374,7 +35609,7 @@ mod tests {
             provenance_count
         );
         assert_eq!(
-            tiering.baseline_native_entry_readiness_records().len(),
+            tiering.baseline_native_entry_readiness_count(),
             readiness_count
         );
         assert_eq!(tiering.next_ordinal, next_ordinal);
@@ -35406,8 +35641,7 @@ mod tests {
         );
         let install = installed_native_entry(&mut tiering, owner, &artifact, &materialization);
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("ready-disabled native entry")
             .clone();
         assert_eq!(
@@ -35454,8 +35688,7 @@ mod tests {
         let materialization = accepted_materialization(&mut tiering, owner, &artifact);
         let install = installed_native_entry(&mut tiering, owner, &artifact, &materialization);
         let readiness = tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("descriptor-only readiness");
 
         assert_eq!(
@@ -36123,8 +36356,7 @@ mod tests {
             BaselineInstallOutcome::InstalledButEntryDisabled
         );
         let readiness = installed_tiering
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(installed_owner)
             .expect("installed native entry readiness");
         let readiness_ordinal = readiness.ordinal;
         assert_eq!(

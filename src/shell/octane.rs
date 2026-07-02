@@ -511,7 +511,12 @@ impl OctaneTieringSummary {
             diagnostics: tiering.diagnostics().len(),
             baseline_installs: tiering.baseline_install_records().len(),
             baseline_entry_artifacts: tiering.baseline_entry_artifacts().len(),
-            baseline_materializations: tiering.baseline_executable_materializations().len(),
+            // Redesign-audit telemetry Unit R4: `.len()` on the deleted
+            // `baseline_executable_materializations`/
+            // `baseline_native_entry_readiness_records` VM-global logs
+            // becomes the monotonic cumulative counters, mirroring
+            // `entry_decisions` above (Unit 1).
+            baseline_materializations: tiering.baseline_executable_materialization_count() as usize,
             baseline_generated_code_artifacts: tiering.baseline_generated_code_artifacts().len(),
             baseline_generated_code_invalidations: tiering
                 .baseline_generated_code_invalidations()
@@ -533,9 +538,8 @@ impl OctaneTieringSummary {
             baseline_native_lowering_failures: tiering.baseline_native_lowering_failure_count(),
             baseline_native_semantic_byte_emission_failures: tiering
                 .baseline_native_semantic_byte_emission_failure_count(),
-            baseline_native_entry_readiness: tiering
-                .baseline_native_entry_readiness_records()
-                .len(),
+            baseline_native_entry_readiness: tiering.baseline_native_entry_readiness_count()
+                as usize,
             baseline_generated_execution_summaries: tiering
                 .baseline_generated_execution_summaries()
                 .to_vec(),

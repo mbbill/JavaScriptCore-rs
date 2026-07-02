@@ -5791,7 +5791,6 @@ impl Vm {
             );
         }
 
-        let readiness_count_before = self.tiering.baseline_native_entry_readiness_records().len();
         self.validate_current_p6_semantic_install_snapshot(owner, &eligibility_proof)?;
         let owner_liveness = BaselineInstallOwnerLiveness::Live;
         let artifact_has_valid_entry = true;
@@ -5827,15 +5826,19 @@ impl Vm {
                 },
             );
         }
+        // Redesign-audit telemetry Unit R4: the length-based "mark" (snapshot
+        // `.len()` before the call, slice from there after to isolate the
+        // fresh record) is replaced by a direct read of the owner-keyed
+        // `last_disabled_readiness` slot (`RuntimeTierState`, R0 `fbcd267`);
+        // `record_baseline_install` (inside `install_baseline_artifact_with_
+        // eligibility` above) just wrote it. The `install_ordinal` equality
+        // check is kept as the identity check that a new Vec slice used to
+        // provide.
         let disabled_readiness = self
             .tiering
-            .baseline_native_entry_readiness_records()
-            .get(readiness_count_before..)
-            .and_then(|records| {
-                records.iter().find(|record| {
-                    record.owner == owner && record.install_ordinal == install.ordinal
-                })
-            })
+            .state_for(owner)
+            .and_then(|state| state.last_disabled_readiness.as_ref())
+            .filter(|record| record.install_ordinal == install.ordinal)
             .cloned()
             .ok_or(
                 P6X86_64SemanticBaselineNativeEntryInstallError::DisabledReadinessMissing {
@@ -10688,11 +10691,15 @@ impl Vm {
         readiness: &BaselineNativeEntryReadinessRecord,
         descriptor: &BaselineNativeEntryDescriptor,
     ) -> Option<usize> {
+        // Redesign-audit telemetry Unit R4: owner-scoped ring lookup replaces
+        // the deleted `baseline_executable_materializations` VM-global
+        // reverse scan (see `RuntimeTierState::materialization_ring`'s doc).
         let materialization = self
             .tiering
-            .baseline_executable_materializations()
+            .state_for(descriptor.owner)?
+            .materialization_ring
             .iter()
-            .rev()
+            .filter_map(Option::as_ref)
             .find(|materialization| {
                 materialization.ordinal == readiness.materialization_ordinal
                     && materialization.owner == descriptor.owner
@@ -21143,16 +21150,19 @@ mod tests {
 
     fn p6_semantic_install_side_effect_counts(vm: &Vm) -> P6SemanticInstallSideEffectCounts {
         P6SemanticInstallSideEffectCounts {
+            // Redesign-audit telemetry Unit R4: `.len()` on the deleted
+            // `baseline_executable_materializations`/
+            // `baseline_native_entry_readiness_records` VM-global logs
+            // becomes the monotonic cumulative counters, mirroring Unit 1's
+            // `entry_decision_count` pattern.
             materializations: vm
                 .tiering_integration()
-                .baseline_executable_materializations()
-                .len(),
+                .baseline_executable_materialization_count() as usize,
             platform_residencies: vm.baseline_platform_executable_residencies.len(),
             installs: vm.tiering_integration().baseline_install_records().len(),
             readiness: vm
                 .tiering_integration()
-                .baseline_native_entry_readiness_records()
-                .len(),
+                .baseline_native_entry_readiness_count() as usize,
             provenance: vm
                 .tiering_integration()
                 .baseline_machine_code_emission_provenance_records()
@@ -36229,8 +36239,7 @@ mod tests {
         );
         assert_eq!(
             vm.tiering_integration()
-                .baseline_executable_materializations()
-                .last(),
+                .last_baseline_executable_materialization_for(owner),
             Some(&materialization)
         );
     }
@@ -36248,8 +36257,7 @@ mod tests {
 
         let materialization_count = vm
             .tiering_integration()
-            .baseline_executable_materializations()
-            .len();
+            .baseline_executable_materialization_count();
         let platform_residency_count = vm.baseline_platform_executable_residencies.len();
         let error = vm
             .materialize_baseline_platform_executable_artifact(
@@ -36266,8 +36274,7 @@ mod tests {
         ));
         assert_eq!(
             vm.tiering_integration()
-                .baseline_executable_materializations()
-                .len(),
+                .baseline_executable_materialization_count(),
             materialization_count
         );
         assert_eq!(
@@ -36308,8 +36315,7 @@ mod tests {
         assert!(vm.baseline_platform_executable_residencies.is_empty());
         assert_eq!(
             vm.tiering_integration()
-                .baseline_executable_materializations()
-                .last(),
+                .last_baseline_executable_materialization_for(mismatched_owner),
             Some(&materialization)
         );
     }
@@ -36432,8 +36438,8 @@ mod tests {
         );
         assert!(vm
             .tiering_integration()
-            .baseline_executable_materializations()
-            .is_empty());
+            .last_baseline_executable_materialization_for(owner)
+            .is_none());
         let registered = vm
             .code_blocks
             .get(owner)
@@ -43860,13 +43866,7 @@ mod tests {
         );
         let readiness = vm
             .tiering
-            .baseline_native_entry_readiness_records_mut_for_test()
-            .iter_mut()
-            .rev()
-            .find(|record| {
-                record.owner == callee_owner
-                    && record.execution_policy == BaselineNativeEntryExecutionPolicy::Enabled
-            })
+            .last_enabled_native_entry_readiness_mut_for_test(callee_owner)
             .expect("enabled P8b native readiness");
         assert_eq!(
             readiness
@@ -67630,8 +67630,7 @@ mod tests {
         let counts_after_first = p6_semantic_install_side_effect_counts(&vm);
         let readiness_after_first = vm
             .tiering_integration()
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("P15 auto readiness")
             .ordinal;
 
@@ -70371,8 +70370,7 @@ mod tests {
         let launch_descriptor_count_before = vm.entry_state().launch_descriptors().len();
         let readiness_count_before = vm
             .tiering_integration()
-            .baseline_native_entry_readiness_records()
-            .len();
+            .baseline_native_entry_readiness_count();
         let code_block_publication_count_before = vm
             .code_blocks
             .get(owner)
@@ -70426,8 +70424,7 @@ mod tests {
         );
         assert_eq!(
             vm.tiering_integration()
-                .baseline_native_entry_readiness_records()
-                .len(),
+                .baseline_native_entry_readiness_count(),
             readiness_count_before
         );
         assert_eq!(
@@ -70575,8 +70572,7 @@ mod tests {
         );
         let readiness = vm
             .tiering_integration()
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("native entry readiness after baseline install");
         let readiness_ordinal = readiness.ordinal;
         assert_eq!(
@@ -70993,8 +70989,7 @@ mod tests {
         );
         let readiness = vm
             .tiering_integration()
-            .baseline_native_entry_readiness_records()
-            .last()
+            .last_baseline_native_entry_readiness_for(owner)
             .expect("disabled native readiness");
         assert_eq!(
             readiness.outcome,
@@ -71191,10 +71186,9 @@ mod tests {
         ));
         assert!(vm
             .tiering_integration()
-            .baseline_native_entry_readiness_records()
-            .iter()
-            .all(|record| record.owner != owner
-                || record.execution_policy != BaselineNativeEntryExecutionPolicy::Enabled));
+            .state_for(owner)
+            .and_then(|state| state.last_enabled_readiness.as_ref())
+            .is_none());
     }
 
     #[test]
