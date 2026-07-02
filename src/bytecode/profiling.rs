@@ -80,6 +80,51 @@ impl Default for ValueProfileEmissionPolicy {
     }
 }
 
+/// Rust mirror of C++ JSC `ArgumentValueProfile : ValueProfileBase<1, 1>`
+/// (bytecode/ValueProfile.h:163-166). One entry per formal CALL-FRAME
+/// ARGUMENT INCLUDING `this` at index 0, stored in
+/// `CodeBlock::m_argumentValueProfiles` (bytecode/CodeBlock.h:1011,
+/// `FixedVector<ArgumentValueProfile>`, sized to `numParameters()` by
+/// `CodeBlock::setNumParameters`, CodeBlock.cpp:1121-1124). This table is a
+/// SEPARATE FixedVector from the per-bytecode `ValueProfileTable` above —
+/// `CodeBlock::valueProfileForArgument(argumentIndex)` (CodeBlock.h:430-435)
+/// addresses it purely by ARGUMENT INDEX, never by `BytecodeIndex` or a
+/// `profileOffset` into the metadata table, so it carries none of
+/// `ValueProfileTable`'s bytecode-keyed bucket/slot/JIT-storage addressing
+/// machinery (that machinery exists solely to map a bytecode-emitted
+/// `profileIndex` onto the per-`CodeBlock` metadata table's byte layout, which
+/// does not apply here).
+///
+/// Only the live-sample bucket (`ValueProfileBase::numberOfBuckets == 1`,
+/// `ValueProfileBucketKind::Argument` tags this concept in the per-bytecode
+/// table above) is modeled and written by this unit: the LLInt's
+/// `functionInitialization` macro (llint/LowLevelInterpreter.asm:1759-1794)
+/// stores the incoming argument value into it on every call/construct entry.
+/// The C++ type also carries one speculation-failure bucket
+/// (`numberOfSpecFailBuckets == 1`), written by DFG OSR-exit bailout — omitted
+/// here because there is no optimizing JIT yet to write it; add it back
+/// alongside OSR-exit support rather than inventing Rust-only OSR behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArgumentValueProfile {
+    pub sample: Option<EncodedJsValue>,
+    pub prediction: SpeculatedType,
+}
+
+impl ArgumentValueProfile {
+    /// C++ `ValueProfileBase::m_buckets[0]` write — the interpreter's per-call
+    /// sample store (`functionInitialization`'s `storeq`/`storei` into
+    /// `ValueProfile::m_buckets`, llint/LowLevelInterpreter.asm:1774-1776 /
+    /// 1780-1786). C++ does NOT merge into `m_prediction` at sample time —
+    /// that happens lazily via `computeUpdatedPrediction`, called only from
+    /// the DFG parser when it profiles/inlines an argument
+    /// (`DFGByteCodeParser.cpp:2249`) — so this overwrites only the raw
+    /// sample, exactly mirroring the asm store (one call's argument value
+    /// replaces the previous call's, with no history kept).
+    pub fn record_sample(&mut self, value: EncodedJsValue) {
+        self.sample = Some(value);
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ValueProfileTable {
     pub profiles: Vec<ValueProfile>,

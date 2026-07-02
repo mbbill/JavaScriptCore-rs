@@ -35842,6 +35842,209 @@ mod tests {
         assert!(construct_code_block_allocation.published);
     }
 
+    /// U8 -- ARGUMENT value profiles, population unit.
+    ///
+    /// C++ JSC: the LLInt's `functionInitialization(profileArgSkip=0)`
+    /// (llint/LowLevelInterpreter.asm:1759-1794, reached from
+    /// `llint_function_for_call_prologue`/`..._for_call_arity_check`,
+    /// :2378/:2394) stores EVERY incoming argument INCLUDING `this` into
+    /// `CodeBlock::m_argumentValueProfiles[argumentIndex]` on a plain call. This
+    /// pins that raw storage: after `add(20, 22)`, `add`'s CALL CodeBlock has the
+    /// `this`/`a`/`b` argument slots (indices 0..3) holding the exact raw
+    /// `EncodedJSValue` bits of what was passed, matching `CodeBlock::
+    /// valueProfileForArgument`'s FixedVector (CodeBlock.h:430-435) -- SEPARATE
+    /// from the per-bytecode `m_metadata` value profiles.
+    #[test]
+    fn interpreter_call_records_this_and_arguments_into_argument_value_profiles() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+        let completion = vm
+            .execute_source(source(
+                "'use strict'; function add(a, b) { return a + b; } add(20, 22);",
+            ))
+            .unwrap();
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(42))
+        );
+
+        let function_record = vm
+            .executable_registry()
+            .function_records()
+            .next()
+            .expect("the `add` function executable is registered");
+        let installed = function_record
+            .installed_call_code()
+            .expect("installed call code");
+        let code_block = vm
+            .code_blocks
+            .get(installed.code_block)
+            .expect("registered call code block")
+            .code_block();
+
+        assert_eq!(code_block.side_tables().argument_value_profiles().len(), 3);
+        // Index 0 (`this`): the plain-call receiver is `undefined` at the call
+        // site, but this-substitution (sloppy-mode global-object coercion / the
+        // engine's normalize-this step) may still rewrite it before the frame is
+        // built -- this test asserts only that `this` WAS profiled (a call, not a
+        // construct, always profiles index 0; see
+        // `interpreter_construct_does_not_profile_the_constructed_this` for the
+        // skip=1 construct case), not which exact value this-substitution
+        // produced. The deterministic "raw bits match" proof is indices 1/2
+        // below, the primitive `a`/`b` arguments, which are exactly what the
+        // caller passed with no substitution in play.
+        assert!(
+            code_block
+                .argument_value_profile(0)
+                .unwrap()
+                .sample
+                .is_some(),
+            "index 0 (`this`) must be profiled on a CALL entry"
+        );
+        assert_eq!(
+            code_block.argument_value_profile(1).unwrap().sample,
+            Some(RuntimeValue::from_i32(20).encoded()),
+            "index 1 (`a`)"
+        );
+        assert_eq!(
+            code_block.argument_value_profile(2).unwrap().sample,
+            Some(RuntimeValue::from_i32(22).encoded()),
+            "index 2 (`b`)"
+        );
+    }
+
+    /// U8 test (b): each call OVERWRITES the previous call's sample -- C++
+    /// `ValueProfileBase` has exactly one live-sample bucket per argument (no
+    /// history), so the profile after two calls reflects only the LATEST call's
+    /// arguments, proving the record path fires on every entry, not just the
+    /// first.
+    #[test]
+    fn interpreter_repeated_calls_update_argument_value_profile_samples() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+        let completion = vm
+            .execute_source(source(
+                "'use strict'; function add(a, b) { return a + b; } add(1, 2); add(3, 4);",
+            ))
+            .unwrap();
+        assert_eq!(
+            completion,
+            ExecutionCompletion::Returned(RuntimeValue::from_i32(7))
+        );
+
+        let function_record = vm
+            .executable_registry()
+            .function_records()
+            .next()
+            .expect("the `add` function executable is registered");
+        let installed = function_record
+            .installed_call_code()
+            .expect("installed call code");
+        let code_block = vm
+            .code_blocks
+            .get(installed.code_block)
+            .expect("registered call code block")
+            .code_block();
+
+        assert_eq!(
+            code_block.argument_value_profile(1).unwrap().sample,
+            Some(RuntimeValue::from_i32(3).encoded()),
+            "the second call's `a` overwrote the first call's sample"
+        );
+        assert_eq!(
+            code_block.argument_value_profile(2).unwrap().sample,
+            Some(RuntimeValue::from_i32(4).encoded()),
+            "the second call's `b` overwrote the first call's sample"
+        );
+    }
+
+    /// U8 test (d), the risk edge: `functionArityCheck`'s slow path
+    /// (llint/LowLevelInterpreter64.asm:709-820) pads a missing trailing
+    /// argument with `ValueUndefined` on the stack BEFORE falling through to
+    /// `functionInitialization` (both prologue variants call
+    /// `functionArityCheck` then fall through to the SAME
+    /// `functionInitialization` call, LowLevelInterpreter.asm:2394-2402), so a
+    /// missing argument is profiled as `undefined` -- never left unsampled.
+    #[test]
+    fn interpreter_arity_mismatch_call_profiles_missing_argument_as_undefined() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+        // `add` takes two formal parameters; called with only one.
+        let completion = vm
+            .execute_source(source(
+                "'use strict'; function add(a, b) { return [a, b]; } add(5);",
+            ))
+            .unwrap();
+        assert!(matches!(completion, ExecutionCompletion::Returned(_)));
+
+        let function_record = vm
+            .executable_registry()
+            .function_records()
+            .next()
+            .expect("the `add` function executable is registered");
+        let installed = function_record
+            .installed_call_code()
+            .expect("installed call code");
+        let code_block = vm
+            .code_blocks
+            .get(installed.code_block)
+            .expect("registered call code block")
+            .code_block();
+
+        assert_eq!(
+            code_block.argument_value_profile(1).unwrap().sample,
+            Some(RuntimeValue::from_i32(5).encoded()),
+            "index 1 (`a`), the caller-supplied argument"
+        );
+        assert_eq!(
+            code_block.argument_value_profile(2).unwrap().sample,
+            Some(RuntimeValue::undefined().encoded()),
+            "index 2 (`b`), the missing argument, is profiled as `undefined` -- not left unsampled"
+        );
+    }
+
+    /// C++ JSC: `llint_function_for_construct_prologue`/`..._for_construct_arity_check`
+    /// call `functionInitialization(profileArgSkip=1)` (LowLevelInterpreter.asm:
+    /// 2385/2402), which skips index 0 -- the constructed `this` is not a
+    /// caller-supplied value at entry and is deliberately not sampled. This pins
+    /// that skip: after `new C(9)`, the CONSTRUCT CodeBlock's index-1 argument
+    /// profile holds the constructor argument, but index 0 stays unwritten.
+    #[test]
+    fn interpreter_construct_does_not_profile_the_constructed_this() {
+        let mut vm = Vm::new(VmConfig::interpreter_only());
+        let completion = vm
+            .execute_source(source(
+                "'use strict'; function C(x) { this.x = x; } new C(9);",
+            ))
+            .unwrap();
+        assert!(matches!(completion, ExecutionCompletion::Returned(_)));
+
+        let function_record = vm
+            .executable_registry()
+            .function_records()
+            .next()
+            .expect("the `C` function executable is registered");
+        let installed_construct = function_record
+            .installed_construct_code()
+            .expect("installed construct code");
+        let code_block = vm
+            .code_blocks
+            .get(installed_construct.code_block)
+            .expect("registered construct code block")
+            .code_block();
+
+        assert!(
+            code_block
+                .argument_value_profile(0)
+                .unwrap()
+                .sample
+                .is_none(),
+            "index 0 (`this`) is never profiled on a construct entry"
+        );
+        assert_eq!(
+            code_block.argument_value_profile(1).unwrap().sample,
+            Some(RuntimeValue::from_i32(9).encoded()),
+            "index 1 (`x`), the caller-supplied constructor argument"
+        );
+    }
+
     #[test]
     fn vm_code_block_owner_liveness_requires_registry_and_published_code_block_cell() {
         let mut vm = Vm::new(VmConfig::default());

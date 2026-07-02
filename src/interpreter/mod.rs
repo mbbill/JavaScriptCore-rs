@@ -10777,6 +10777,45 @@ impl CoreOpcodeDispatchHost {
         );
     }
 
+    // C++ JSC: the LLInt `functionInitialization(profileArgSkip)` macro
+    // (llint/LowLevelInterpreter.asm:1759-1794) profiles the callee's incoming
+    // arguments once the frame is fully materialized. It is reached ONLY from
+    // the function call/construct LLInt prologues -- `llint_function_for_call_prologue`
+    // / `..._for_call_arity_check` pass `profileArgSkip=0`;
+    // `llint_function_for_construct_prologue` / `..._for_construct_arity_check` pass
+    // `profileArgSkip=1` (LowLevelInterpreter.asm:2378-2402) -- NEVER from
+    // `llint_program_prologue`/`llint_eval_prologue`/`llint_module_program_prologue`,
+    // so top-level Program/Eval/Module entries carry an allocated-but-never-written
+    // `m_argumentValueProfiles` (the table is sized unconditionally at CodeBlock
+    // construction, CodeBlock.cpp:378-379, but only these two prologues populate it).
+    // `profileArgSkip=1` (construct) skips index 0: the constructed `this` is not a
+    // caller-supplied value at entry, and C++ deliberately does not sample it here.
+    //
+    // `functionArityCheck`'s slow path (llint/LowLevelInterpreter64.asm:709-820) pads
+    // missing trailing arguments with `ValueUndefined` on the stack BEFORE falling
+    // through to `functionInitialization` (both prologue variants call
+    // `functionArityCheck` then fall through to the SAME `functionInitialization`
+    // call, LowLevelInterpreter.asm:2394-2402), so a missing argument is profiled as
+    // `undefined`, never left unsampled. Every call site below builds
+    // `argument_values` as `[this, args..., undefined-fill to the formal arity]`
+    // before reaching this helper, so that ordering already matches.
+    fn record_argument_value_profiles_at_function_entry(
+        code_block: &CodeBlock,
+        argument_values: &[RuntimeValue],
+        profile_arg_skip: usize,
+    ) {
+        if code_block.unlinked().kind() != CodeKind::Function {
+            return;
+        }
+        for (argument_index, value) in argument_values.iter().enumerate().skip(profile_arg_skip) {
+            let _ = code_block.record_argument_value_profile(
+                crate::bytecode::code_block::CodeBlockMutationAuthority::default(),
+                argument_index,
+                *value,
+            );
+        }
+    }
+
     fn get_property_value(
         &mut self,
         state: &mut DispatchState<'_>,
@@ -13071,6 +13110,11 @@ impl CoreOpcodeDispatchHost {
         {
             argument_values.push(RuntimeValue::undefined());
         }
+        Self::record_argument_value_profiles_at_function_entry(
+            &function_block,
+            &argument_values,
+            0,
+        );
 
         let code_block_id = function_entry.id;
         if state.function_value_call_handling == FunctionValueCallHandling::DeferToVm {
@@ -13781,6 +13825,7 @@ impl CoreOpcodeDispatchHost {
         {
             argument_values.push(RuntimeValue::undefined());
         }
+        Self::record_argument_value_profiles_at_function_entry(&code_block, &argument_values, 1);
         // Push the constructor frame + run it to completion in a nested interpreter
         // loop (the op_call shim's `execute_function_value_with_completion` shape).
         let frame = state
@@ -14030,6 +14075,11 @@ impl CoreOpcodeDispatchHost {
                     {
                         argument_values.push(RuntimeValue::undefined());
                     }
+                    Self::record_argument_value_profiles_at_function_entry(
+                        &construct_code_block,
+                        &argument_values,
+                        1,
+                    );
                     let outcome = DispatchOutcome::OrdinaryBytecodeConstruct(Box::new(
                         OrdinaryBytecodeConstructRequest {
                             continuation,
@@ -14554,6 +14604,11 @@ impl CoreOpcodeDispatchHost {
         {
             argument_values.push(RuntimeValue::undefined());
         }
+        Self::record_argument_value_profiles_at_function_entry(
+            request.construct_code_block,
+            &argument_values,
+            1,
+        );
         Ok(argument_values)
     }
 
@@ -14900,6 +14955,21 @@ impl CoreOpcodeDispatchHost {
         {
             argument_values.push(RuntimeValue::undefined());
         }
+        // `constructor_this.is_some()` means this dispatch is invoking a
+        // (super)constructor's FunctionCode body with an already-allocated `this`
+        // (the `dispatch_construct_super` delegation above) -- still construct
+        // semantics, so `this` at index 0 is skipped exactly like the other
+        // construct call sites (`profileArgSkip=1`).
+        let profile_arg_skip = if request.constructor_this.is_some() {
+            1
+        } else {
+            0
+        };
+        Self::record_argument_value_profiles_at_function_entry(
+            &function_block,
+            &argument_values,
+            profile_arg_skip,
+        );
 
         let code_block_id = function_entry.id;
         if state.ordinary_bytecode_call_handling == OrdinaryBytecodeCallHandling::DeferToVm {

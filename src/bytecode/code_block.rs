@@ -43,10 +43,10 @@ use crate::bytecode::metadata::{InstructionMetadataPlan, MetadataLayout, Metadat
 use crate::bytecode::opcode::{CoreOpcode, MetadataFieldSpec, Opcode, OpcodeSchemaVersion};
 use crate::bytecode::origin::{CodeOrigin, CodeOriginTable, SourceNoteLookup};
 use crate::bytecode::profiling::{
-    ArrayProfile, BinaryArithProfile, ProfileUpdatePolicy, ProfilingCounterSet, UnaryArithProfile,
-    UnlinkedValueProfile, ValueProfile, ValueProfileBucket, ValueProfileBucketKind,
-    ValueProfileBucketSample, ValueProfileEmissionCapability, ValueProfileEmissionPolicy,
-    ValueProfileSampleError, ValueProfileTable,
+    ArgumentValueProfile, ArrayProfile, BinaryArithProfile, ProfileUpdatePolicy,
+    ProfilingCounterSet, UnaryArithProfile, UnlinkedValueProfile, ValueProfile, ValueProfileBucket,
+    ValueProfileBucketKind, ValueProfileBucketSample, ValueProfileEmissionCapability,
+    ValueProfileEmissionPolicy, ValueProfileSampleError, ValueProfileTable,
 };
 use crate::bytecode::register::{RegisterFrameShape, SpecialRegisters, VirtualRegister};
 use crate::bytecode::speculated_type::SPEC_NONE;
@@ -1299,6 +1299,47 @@ impl CodeBlock {
                 actual,
             }),
         }
+    }
+
+    // C++ JSC: the LLInt `functionInitialization` macro (llint/LowLevelInterpreter.asm
+    // :1759-1794) stores the incoming argument value into
+    // `CodeBlock::m_argumentValueProfiles[argumentIndex]` on every call/construct
+    // entry (`storeq`/`storei` into `ValueProfile::m_buckets`, :1774-1786), mutating
+    // the shared `CodeBlock*` in place — SEPARATE from the per-bytecode `m_metadata`
+    // value profiles (`record_value_profile_sample` above). `argument_index` is a raw
+    // index into that FixedVector (0 == `this`), never a `BytecodeIndex`. Returns
+    // `Ok(None)` when the CodeBlock has not linked its argument-value-profile table
+    // (empty vec — an unlinked/pre-link CodeBlock) or `argument_index` is out of
+    // range for this CodeBlock's arity — never an error, matching C++'s
+    // unconditional raw write through `CodeBlock*` (there is no failure mode to
+    // report here either; the `.argumentProfileDone` early-out in the asm when
+    // `m_argumentValueProfiles` is empty is the same "silently do nothing" shape).
+    pub fn record_argument_value_profile(
+        &self,
+        authority: CodeBlockMutationAuthority,
+        argument_index: usize,
+        value: JsValue,
+    ) -> Result<Option<ArgumentValueProfile>, CodeBlockMutationError> {
+        self.check_profile_mutation_authority(authority)?;
+        let mut profiles = self.side_tables.argument_value_profiles.borrow_mut();
+        let Some(profile) = profiles.get_mut(argument_index) else {
+            return Ok(None);
+        };
+        profile.record_sample(value.encoded());
+        Ok(Some(*profile))
+    }
+
+    /// Read the current argument-value-profile entry at `argument_index` — the
+    /// Rust mirror of C++ `CodeBlock::valueProfileForArgument` (CodeBlock.h:
+    /// 430-435). `None` when unlinked or out of range. Used by tests today and,
+    /// later, by the DFG parser's argument-prediction seeding
+    /// (`DFGByteCodeParser.cpp:2249`, not yet ported).
+    pub fn argument_value_profile(&self, argument_index: usize) -> Option<ArgumentValueProfile> {
+        self.side_tables
+            .argument_value_profiles
+            .borrow()
+            .get(argument_index)
+            .copied()
     }
 
     // C++ JSC: the binary arith slow paths fetch the site's profile through the
@@ -3587,8 +3628,21 @@ fn linked_side_tables_from_unlinked(unlinked: &UnlinkedCodeBlock) -> LinkedSideT
         )),
         binary_arith_profiles: RefCell::new(derive_binary_arith_profiles(unlinked)),
         unary_arith_profiles: RefCell::new(derive_unary_arith_profiles(unlinked)),
+        argument_value_profiles: RefCell::new(derive_argument_value_profiles(unlinked)),
         ..LinkedSideTables::default()
     }
+}
+
+/// One default-initialized `ArgumentValueProfile` per formal parameter
+/// INCLUDING `this` at index 0 — the Rust link-time analog of C++
+/// `CodeBlock::setNumParameters(unsigned, bool allocateArgumentValueProfiles)`
+/// (CodeBlock.cpp:1121-1124), sizing `m_argumentValueProfiles` to
+/// `unlinkedCodeBlock->numParameters()`. C++ additionally gates allocation on
+/// `Options::useJIT()`; Rust has no such flag on `CodeBlock` yet (the other
+/// derived profile tables above are unconditional too), so this always
+/// allocates the full table.
+fn derive_argument_value_profiles(unlinked: &UnlinkedCodeBlock) -> Vec<ArgumentValueProfile> {
+    vec![ArgumentValueProfile::default(); unlinked.frame().num_parameters_including_this as usize]
 }
 
 fn derive_property_inline_caches(unlinked: &UnlinkedCodeBlock) -> Vec<PropertyInlineCache> {
@@ -4474,6 +4528,16 @@ pub struct LinkedSideTables {
     // reason as `array_profiles`/`value_profiles` above.
     pub binary_arith_profiles: RefCell<Vec<BinaryArithProfileSlot>>,
     pub unary_arith_profiles: RefCell<Vec<UnaryArithProfileSlot>>,
+    // C++ JSC: `CodeBlock::m_argumentValueProfiles`, a `FixedVector<ArgumentValueProfile>`
+    // allocated at CodeBlock construction time by `setNumParameters` (CodeBlock.cpp:
+    // 1121-1124, `allocateArgumentValueProfiles = true` in the base `CodeBlock`
+    // constructor, CodeBlock.cpp:378-379) — SEPARATE from `m_metadata`'s per-bytecode
+    // value profiles. Sized to `numParameters()` (INCLUDING `this` at index 0) at link
+    // time by `derive_argument_value_profiles`, then populated by the interpreter's
+    // function-entry path (the `functionInitialization` analog) and later read by the
+    // DFG parser (`valueProfileForArgument`, not yet ported). Interior-mutable for the
+    // same shared-`Rc<CodeBlock>` reason as `array_profiles`/`value_profiles` above.
+    pub argument_value_profiles: RefCell<Vec<ArgumentValueProfile>>,
     pub root_maps: Vec<BytecodeRootMap>,
     pub direct_eval_cache: Option<DirectEvalCacheRef>,
     pub catch_liveness: Vec<CatchLivenessRecord>,
@@ -4507,6 +4571,7 @@ impl PartialEq for LinkedSideTables {
             && *self.value_profiles.borrow() == *other.value_profiles.borrow()
             && *self.binary_arith_profiles.borrow() == *other.binary_arith_profiles.borrow()
             && *self.unary_arith_profiles.borrow() == *other.unary_arith_profiles.borrow()
+            && *self.argument_value_profiles.borrow() == *other.argument_value_profiles.borrow()
             && self.root_maps == other.root_maps
             && self.direct_eval_cache == other.direct_eval_cache
             && self.catch_liveness == other.catch_liveness
@@ -4566,6 +4631,17 @@ impl LinkedSideTables {
     /// Exclusive borrow of the interior-mutable unary-arith-profile table.
     pub fn unary_arith_profiles_mut(&self) -> std::cell::RefMut<'_, Vec<UnaryArithProfileSlot>> {
         self.unary_arith_profiles.borrow_mut()
+    }
+
+    /// Shared read borrow of the interior-mutable argument-value-profile table
+    /// (C++ `CodeBlock::m_argumentValueProfiles`; see the field doc above).
+    pub fn argument_value_profiles(&self) -> std::cell::Ref<'_, Vec<ArgumentValueProfile>> {
+        self.argument_value_profiles.borrow()
+    }
+
+    /// Exclusive borrow of the interior-mutable argument-value-profile table.
+    pub fn argument_value_profiles_mut(&self) -> std::cell::RefMut<'_, Vec<ArgumentValueProfile>> {
+        self.argument_value_profiles.borrow_mut()
     }
 }
 
@@ -4938,6 +5014,29 @@ mod tests {
         builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
         let instructions = builder.finalize();
         let unlinked = UnlinkedCodeBlock::new(CodeKind::Program, instructions)
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+
+        CodeBlock::from_unlinked(unlinked, LinkContext::default())
+            .with_entrypoints(CodeBlockEntrypoints {
+                interpreter: Some(InterpreterEntrySlot(7)),
+                ..CodeBlockEntrypoints::default()
+            })
+            .with_lifecycle(CodeBlockLifecycleState::LinkedInterpreter)
+    }
+
+    /// Like `linked_interpreter_code_block`, but a `CodeKind::Function` block with
+    /// `num_parameters_including_this` formal parameter slots (`this` at index 0),
+    /// for exercising `CodeBlock::record_argument_value_profile` /
+    /// `argument_value_profile`.
+    fn linked_interpreter_function_code_block(num_parameters_including_this: u32) -> CodeBlock {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
+        let instructions = builder.finalize();
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Function, instructions)
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this,
+                ..RegisterFrameShape::default()
+            })
             .with_phase(UnlinkedCodeBlockPhase::Finalized);
 
         CodeBlock::from_unlinked(unlinked, LinkContext::default())
@@ -7781,6 +7880,147 @@ mod tests {
             code_block.lifecycle(),
             CodeBlockLifecycleState::BaselineInstalled
         );
+    }
+
+    /// C++ `CodeBlock::setNumParameters` (CodeBlock.cpp:1121-1124) sizes
+    /// `m_argumentValueProfiles` to `numParameters()` (INCLUDING `this`) at link
+    /// time. Every derived entry starts unwritten (C++'s default-constructed
+    /// `ArgumentValueProfile`, an empty `m_buckets[0]`).
+    #[test]
+    fn linked_function_code_block_sizes_argument_value_profiles_to_num_parameters() {
+        let code_block = linked_interpreter_function_code_block(3);
+
+        let profiles = code_block.side_tables().argument_value_profiles().clone();
+        assert_eq!(profiles.len(), 3);
+        assert!(
+            profiles.iter().all(|profile| profile.sample.is_none()),
+            "freshly linked argument-value profiles start unwritten"
+        );
+        assert!(code_block.argument_value_profile(3).is_none());
+    }
+
+    #[test]
+    fn record_argument_value_profile_writes_raw_sample_and_returns_it() {
+        let code_block = linked_interpreter_function_code_block(3);
+        let this_value = JsValue::default();
+        let arg0 = JsValue::from_encoded(crate::value::EncodedJsValue(20));
+        let arg1 = JsValue::from_encoded(crate::value::EncodedJsValue(22));
+
+        for (argument_index, value) in [this_value, arg0, arg1].into_iter().enumerate() {
+            let result = code_block
+                .record_argument_value_profile(
+                    CodeBlockMutationAuthority::VmMainThread,
+                    argument_index,
+                    value,
+                )
+                .expect("VM authority may record");
+            assert_eq!(
+                result.map(|profile| profile.sample),
+                Some(Some(value.encoded()))
+            );
+        }
+
+        for (argument_index, value) in [this_value, arg0, arg1].into_iter().enumerate() {
+            assert_eq!(
+                code_block
+                    .argument_value_profile(argument_index)
+                    .unwrap()
+                    .sample,
+                Some(value.encoded()),
+                "argument_index {argument_index}: raw bits must match the recorded value"
+            );
+        }
+    }
+
+    #[test]
+    fn record_argument_value_profile_rejects_wrong_authority() {
+        let code_block = linked_interpreter_function_code_block(2);
+
+        let error = code_block
+            .record_argument_value_profile(
+                CodeBlockMutationAuthority::ReadOnlyObserver,
+                0,
+                JsValue::default(),
+            )
+            .expect_err("wrong authority must fail");
+
+        assert_eq!(
+            error,
+            CodeBlockMutationError::InvalidMutationAuthority {
+                expected: CodeBlockMutationAuthority::VmMainThread,
+                actual: CodeBlockMutationAuthority::ReadOnlyObserver,
+            }
+        );
+        assert!(code_block
+            .argument_value_profile(0)
+            .unwrap()
+            .sample
+            .is_none());
+    }
+
+    // U8 test (c): a CodeBlock that has not progressed past `Linking` (i.e. not
+    // yet `LinkedInterpreter`/`BaselineInstalled`) is what this codebase treats
+    // as "unlinked" for the record-API authority/lifecycle gate (the same gate
+    // every other `record_*` profile API shares, `check_profile_mutation_authority`
+    // above) — it records nothing, exactly like the other profile record APIs
+    // reject a stale/pre-link lifecycle.
+    #[test]
+    fn record_argument_value_profile_on_unlinked_code_block_records_nothing() {
+        let mut builder = InstructionBuilder::new();
+        builder.declare_instruction(Opcode::Reserved, OperandWidth::Narrow, Vec::new());
+        let instructions = builder.finalize();
+        let unlinked = UnlinkedCodeBlock::new(CodeKind::Function, instructions)
+            .with_frame(RegisterFrameShape {
+                num_parameters_including_this: 3,
+                ..RegisterFrameShape::default()
+            })
+            .with_phase(UnlinkedCodeBlockPhase::Finalized);
+        // `from_unlinked` alone leaves `lifecycle == Linking` (never bumped to
+        // `LinkedInterpreter`) -- the pre-link state.
+        let code_block = CodeBlock::from_unlinked(unlinked, LinkContext::default());
+        assert_eq!(code_block.lifecycle(), CodeBlockLifecycleState::Linking);
+        // The table is still sized (C++ allocates `m_argumentValueProfiles`
+        // unconditionally at construction; only *writing* it is gated).
+        assert_eq!(code_block.side_tables().argument_value_profiles().len(), 3);
+
+        let error = code_block
+            .record_argument_value_profile(
+                CodeBlockMutationAuthority::VmMainThread,
+                1,
+                JsValue::from_encoded(crate::value::EncodedJsValue(99)),
+            )
+            .expect_err("an unlinked (pre-link) CodeBlock must reject the write");
+
+        assert_eq!(
+            error,
+            CodeBlockMutationError::InvalidLifecycle {
+                expected: CodeBlockLifecycleState::LinkedInterpreter,
+                actual: CodeBlockLifecycleState::Linking,
+            }
+        );
+        assert!(
+            code_block
+                .side_tables()
+                .argument_value_profiles()
+                .iter()
+                .all(|profile| profile.sample.is_none()),
+            "the unlinked CodeBlock records nothing"
+        );
+    }
+
+    #[test]
+    fn record_argument_value_profile_out_of_range_argument_index_is_a_noop() {
+        let code_block = linked_interpreter_function_code_block(2);
+
+        let result = code_block
+            .record_argument_value_profile(
+                CodeBlockMutationAuthority::VmMainThread,
+                5,
+                JsValue::from_encoded(crate::value::EncodedJsValue(7)),
+            )
+            .expect("out-of-range index is not an error");
+        assert_eq!(result, None);
+        assert!(code_block.argument_value_profile(5).is_none());
     }
 
     /// `CodeBlock::setConstantRegisters` (CodeBlock.cpp:1044-1101) places
